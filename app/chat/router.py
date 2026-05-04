@@ -16,10 +16,16 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import desc, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel, Field
 
 from app.auth.hmac import verify_hmac
+from app.chat.schemas import ChatRequest, ChatResponse, MessageOut
+from app.db.models import ChatSession, Message
+from app.db.session import get_db
+from app.providers.llm import LLMProvider, get_llm_provider
 
 router = APIRouter()
 
@@ -39,6 +45,87 @@ class EchoResponse(BaseModel):
     course_id: int
     user_id: int
     note: str = "HMAC verificado correctamente. Esto es un mock — Sprint 2 conecta el LLM real."
+
+
+async def _get_or_create_session(
+    db: AsyncSession,
+    payload: ChatRequest,
+) -> ChatSession:
+    if payload.session_id is not None:
+        result = await db.execute(
+            select(ChatSession).where(ChatSession.id == payload.session_id)
+        )
+        session = result.scalar_one_or_none()
+        if session is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+        return session
+
+    session = ChatSession(user_id=payload.user_id, course_id=payload.course_id)
+    db.add(session)
+    await db.flush()
+    return session
+
+
+@router.post("/messages", response_model=ChatResponse)
+async def messages(
+    payload: ChatRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+    llm: LLMProvider = Depends(get_llm_provider),
+) -> ChatResponse:
+    session = await _get_or_create_session(db, payload)
+
+    user_message = Message(session_id=session.id, role="user", content=payload.question)
+    db.add(user_message)
+    await db.flush()
+    await db.commit()
+
+    history_result = await db.execute(
+        select(Message)
+        .where(Message.session_id == session.id)
+        .order_by(desc(Message.created_at), desc(Message.id))
+        .limit(10)
+    )
+    recent_messages = list(reversed(history_result.scalars().all()))
+
+    llm_messages = [
+        {
+            "role": "system",
+            "content": "Sos un asistente académico. Respondé en el mismo idioma que el alumno.",
+        },
+    ]
+
+    for message in recent_messages:
+        if message.id == user_message.id:
+            continue
+        llm_messages.append({"role": message.role, "content": message.content})
+
+    llm_messages.append({"role": "user", "content": payload.question})
+
+    try:
+        answer = await llm.chat_completion(llm_messages)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="El asistente no está disponible",
+        ) from exc
+
+    assistant_message = Message(session_id=session.id, role="assistant", content=answer)
+    db.add(assistant_message)
+    await db.commit()
+
+    messages_result = await db.execute(
+        select(Message)
+        .where(Message.session_id == session.id)
+        .order_by(Message.created_at, Message.id)
+    )
+    session_messages = messages_result.scalars().all()
+
+    return ChatResponse(
+        session_id=session.id,
+        answer=answer,
+        messages=[MessageOut.model_validate(message) for message in session_messages],
+    )
 
 
 @router.post("/echo", response_model=EchoResponse)
