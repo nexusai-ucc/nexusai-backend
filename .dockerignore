@@ -1,0 +1,51 @@
+# Archivos que NO van a la imagen Docker.
+# Hace builds más rápidos y evita filtraciones accidentales.
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+.tox/
+
+# Virtualenvs locales (la imagen tiene su propia venv)
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# CI / dev tooling
+.github/
+
+# Tests (se corren afuera, no necesitamos en runtime)
+tests/
+
+# Datos locales de dev (PDFs, exports, dumps)
+data/
+*.dump
+*.sql.gz
+
+# Secrets
+.env
+.env.local
+.env.*.local
