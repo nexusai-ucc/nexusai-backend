@@ -70,6 +70,10 @@ RUN groupadd --system --gid 1001 nexusai \
 WORKDIR /app
 COPY --chown=nexusai:nexusai app/ ./app/
 COPY --chown=nexusai:nexusai migrations/ ./migrations/
+# alembic.ini DEBE estar en el WORKDIR para que `alembic upgrade head` lo
+# encuentre. Sin esto, los comandos alembic dentro del container fallan con
+# "No config file 'alembic.ini' found".
+COPY --chown=nexusai:nexusai alembic.ini ./alembic.ini
 
 USER nexusai
 

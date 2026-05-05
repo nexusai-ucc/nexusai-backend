@@ -105,6 +105,12 @@ async def messages(
     try:
         answer = await llm.chat_completion(llm_messages)
     except Exception as exc:
+        # Log el error real para debugging — sin esto, el 503 oculta la causa.
+        # En producción esto debería ir a un logger estructurado, pero por
+        # ahora print() basta para que aparezca en `docker compose logs api`.
+        import traceback
+        print(f"[NexusAI] LLM call failed: {type(exc).__name__}: {exc}", flush=True)
+        traceback.print_exc()
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="El asistente no está disponible",
