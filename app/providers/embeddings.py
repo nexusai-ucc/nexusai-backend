@@ -77,9 +77,14 @@ class EmbeddingProvider:
         if not text or not text.strip():
             raise ValueError("Cannot embed empty text")
 
+        # Pasamos `dimensions` explícito para activar Matryoshka en
+        # gemini-embedding-001 (default es 3072). Con 768 mantenemos
+        # compatibilidad con la columna Vector(768) y el índice HNSW
+        # de pgvector (que no soporta >2000 dims).
         response = await self.client.embeddings.create(
             model=self.model,
             input=text,
+            dimensions=self.dimensions,
         )
         vector = response.data[0].embedding
 
@@ -116,6 +121,7 @@ class EmbeddingProvider:
         response = await self.client.embeddings.create(
             model=self.model,
             input=texts,
+            dimensions=self.dimensions,
         )
 
         # El SDK devuelve los embeddings ordenados por índice. La doc lo
