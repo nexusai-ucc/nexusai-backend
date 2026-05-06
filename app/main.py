@@ -72,8 +72,10 @@ if settings.env == "development":
 # Cada feature (chat, documents, analytics) registra su router acá.
 
 from app.chat.router import router as chat_router  # noqa: E402
+from app.documents.router import router as documents_router  # noqa: E402
 
 app.include_router(chat_router, prefix="/api/v1/chat", tags=["chat"])
+app.include_router(documents_router, prefix="/api/v1/documents", tags=["documents"])
 
 
 # ============================================================

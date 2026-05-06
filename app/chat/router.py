@@ -25,6 +25,8 @@ from app.auth.hmac import verify_hmac
 from app.chat.schemas import ChatRequest, ChatResponse, MessageOut
 from app.db.models import ChatSession, Message
 from app.db.session import get_db
+from app.documents.retriever import format_context_for_prompt, retrieve_context
+from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
 
 router = APIRouter()
@@ -66,12 +68,52 @@ async def _get_or_create_session(
     return session
 
 
+def _build_system_prompt(retrieved_context: str) -> str:
+    """Arma el system prompt con (o sin) contexto del material del curso.
+
+    Si hay chunks relevantes, los inyecta y le pide al LLM que cite la fuente.
+    Si NO hay (curso sin material indexado, o pregunta no relacionada con el
+    material), le decimos al LLM que sea honesto: "no tengo esa info en el
+    material" en lugar de inventar una respuesta.
+    """
+    base_instructions = (
+        "Sos un asistente académico de NexusAI. Respondé en el mismo idioma "
+        "que el alumno (español o inglés)."
+    )
+
+    if retrieved_context:
+        return (
+            base_instructions
+            + "\n\n"
+            + "Tenés acceso a fragmentos del material del curso del alumno. "
+            "Usá esos fragmentos como tu fuente principal de información. "
+            "Cuando los uses, citá explícitamente el archivo del que vienen "
+            '(ej: "según apunte-derivadas.pdf..."). '
+            "Si la pregunta NO se puede responder con los fragmentos disponibles, "
+            "decilo explícitamente — no inventes."
+            + "\n\n--- MATERIAL DEL CURSO ---\n\n"
+            + retrieved_context
+            + "\n\n--- FIN DEL MATERIAL ---"
+        )
+
+    return (
+        base_instructions
+        + "\n\n"
+        + "El curso del alumno todavía no tiene material indexado. "
+        "Si la pregunta requiere conocimiento específico del curso, decile "
+        "que su docente todavía no subió el material y que pueden contactarlo. "
+        "Para preguntas generales (saludo, ayuda sobre cómo usar el asistente, "
+        "definiciones de conceptos amplios), respondé normalmente."
+    )
+
+
 @router.post("/messages", response_model=ChatResponse)
 async def messages(
     payload: ChatRequest,
     _body: Annotated[bytes, Depends(verify_hmac)],
     db: AsyncSession = Depends(get_db),
     llm: LLMProvider = Depends(get_llm_provider),
+    embeddings: EmbeddingProvider = Depends(get_embedding_provider),
 ) -> ChatResponse:
     session = await _get_or_create_session(db, payload)
 
@@ -80,6 +122,28 @@ async def messages(
     await db.flush()
     await db.commit()
 
+    # ----- RETRIEVAL RAG -----
+    # Buscar los top-5 chunks del material del curso que matcheen con la pregunta.
+    # Si falla (Redis caído, embeddings cuota, etc.), seguimos sin contexto en
+    # lugar de tirar 503: el chat sigue siendo útil, solo pierde la calidad RAG.
+    try:
+        retrieved_chunks = await retrieve_context(
+            question=payload.question,
+            course_id=payload.course_id,
+            db=db,
+            embeddings=embeddings,
+            top_k=5,
+            min_similarity=0.3,
+        )
+        context_text = format_context_for_prompt(retrieved_chunks)
+    except Exception as exc:
+        import traceback
+        print(f"[NexusAI] Retrieval failed (continuing without context): {type(exc).__name__}: {exc}", flush=True)
+        traceback.print_exc()
+        retrieved_chunks = []
+        context_text = ""
+
+    # ----- HISTORIAL Y PROMPT -----
     history_result = await db.execute(
         select(Message)
         .where(Message.session_id == session.id)
@@ -89,10 +153,7 @@ async def messages(
     recent_messages = list(reversed(history_result.scalars().all()))
 
     llm_messages = [
-        {
-            "role": "system",
-            "content": "Sos un asistente académico. Respondé en el mismo idioma que el alumno.",
-        },
+        {"role": "system", "content": _build_system_prompt(context_text)},
     ]
 
     for message in recent_messages:
@@ -106,8 +167,6 @@ async def messages(
         answer = await llm.chat_completion(llm_messages)
     except Exception as exc:
         # Log el error real para debugging — sin esto, el 503 oculta la causa.
-        # En producción esto debería ir a un logger estructurado, pero por
-        # ahora print() basta para que aparezca en `docker compose logs api`.
         import traceback
         print(f"[NexusAI] LLM call failed: {type(exc).__name__}: {exc}", flush=True)
         traceback.print_exc()
