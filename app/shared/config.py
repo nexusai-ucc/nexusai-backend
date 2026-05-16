@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     # Embeddings
     embedding_api_key: str
     embedding_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
-    embedding_model: str = "models/text-embedding-004"
+    embedding_model: str = "gemini-embedding-001"
     embedding_dimensions: int = 768
 
     # Database
@@ -29,6 +29,7 @@ class Settings(BaseSettings):
 
     # Rate limiting
     rate_limit_per_user_daily: int = 50
+    rate_limit_per_user_minute: int = 20
 
     # API
     api_port: int = 8001

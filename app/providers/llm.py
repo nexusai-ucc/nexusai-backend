@@ -1,5 +1,5 @@
 """
-LLMProvider — abstracción para chat completions.
+LLMProvider — abstracción para chat completions con retry automático.
 
 Soporta cualquier proveedor compatible con el SDK de OpenAI cambiando
 `LLM_BASE_URL` en el .env:
@@ -8,23 +8,34 @@ Soporta cualquier proveedor compatible con el SDK de OpenAI cambiando
   - OpenAI (prod):            https://api.openai.com/v1
   - Ollama local (dev):       http://localhost:11434/v1
   - Groq:                     https://api.groq.com/openai/v1
-  - Anthropic vía proxy:      depende del proxy
 
-Métodos públicos:
-  - `chat_completion(messages, **kwargs)` → respuesta completa, una sola string.
-  - `chat_stream(messages, **kwargs)`     → AsyncIterator de chunks (para SSE).
+Retry: 3 intentos con backoff 1s → 2s para errores transitorios
+(RateLimitError, Timeout, ConnectionError, InternalServerError).
+Los errores definitivos (AuthenticationError, BadRequestError) propagan de inmediato.
 
 Ver ADR-003 (decisión multi-provider) y ADR-004 (Gemini MVP / OpenAI prod).
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, AsyncIterator, Optional
 
 from openai import AsyncOpenAI
 
 from app.shared.config import get_settings
+from app.shared.retry import async_retry
+
+
+@dataclass
+class CompletionResult:
+    """Resultado de una chat completion con texto y métricas de tokens."""
+
+    text: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
 
 
 class LLMProvider:
@@ -41,53 +52,54 @@ class LLMProvider:
         base_url: Optional[str] = None,
         model: Optional[str] = None,
     ) -> None:
-        """
-        Si los args vienen None, se leen de env vars (Settings). Útil para tests:
-        se puede instanciar con valores explícitos sin tocar el global.
-        """
         settings = get_settings()
         self.model: str = model or settings.llm_model
         self.client: AsyncOpenAI = AsyncOpenAI(
             api_key=api_key or settings.llm_api_key,
             base_url=base_url or settings.llm_base_url,
-            # Timeout generoso porque las respuestas LLM pueden tardar.
-            # Si el LLM cuelga > 120s, mejor abortar y devolver error al usuario.
             timeout=120.0,
-            max_retries=2,
+            max_retries=0,  # Retries manejados por async_retry, no por el SDK.
         )
 
     async def chat_completion(
         self,
         messages: list[dict[str, str]],
         **kwargs: Any,
-    ) -> str:
+    ) -> CompletionResult:
         """
-        Devuelve la respuesta como string única (sin streaming).
+        Devuelve la respuesta completa del LLM junto con el conteo de tokens.
 
-        Útil para flows que NO son chat (ej. resumen, generación de quiz),
-        o si el cliente no soporta SSE. Para el chat normal con UX fluida,
-        usar `chat_stream()`.
+        Reintenta automáticamente hasta 3 veces en errores transitorios
+        (rate limit, timeout, servidor caído). Propaga inmediatamente en errores
+        definitivos (auth inválida, bad request, etc.).
 
         Args:
             messages: lista en formato ChatML
                 [{"role": "system|user|assistant", "content": "..."}, ...]
-            **kwargs: cualquier param adicional del SDK (temperature, max_tokens,
-                top_p, response_format, etc.). Se pasa tal cual al cliente.
+            **kwargs: parámetros adicionales del SDK (temperature, max_tokens, etc.)
 
         Returns:
-            El texto de la respuesta.
+            CompletionResult con el texto de respuesta y los token counts del LLM.
 
         Raises:
-            openai.* — errores del SDK (rate limit, auth, etc.) suben sin atrapar.
-                El caller decide cómo manejarlos.
+            openai.* — errores no-retryables o tras agotar todos los intentos.
         """
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            stream=False,
-            **kwargs,
+        response = await async_retry(
+            lambda: self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                stream=False,
+                **kwargs,
+            )
         )
-        return response.choices[0].message.content or ""
+        text = response.choices[0].message.content or ""
+        usage = response.usage
+        return CompletionResult(
+            text=text,
+            prompt_tokens=usage.prompt_tokens if usage else 0,
+            completion_tokens=usage.completion_tokens if usage else 0,
+            total_tokens=usage.total_tokens if usage else 0,
+        )
 
     async def chat_stream(
         self,
@@ -97,19 +109,13 @@ class LLMProvider:
         """
         Streaming de chunks de texto (útil para SSE hacia el frontend).
 
-        Cada yield devuelve solo el delta de texto (no el JSON crudo del chunk).
-        Quien consume puede emitir SSE así:
-
-            async for delta in llm.chat_stream(messages):
-                yield f"data: {json.dumps({'delta': delta})}\\n\\n"
-
-        Args:
-            messages: igual que `chat_completion`.
-            **kwargs: igual que `chat_completion`.
+        El streaming no se reintenta automáticamente: si la conexión se corta
+        a mitad del stream, el error propaga al caller. Para el chat MVP
+        (no-streaming), usar `chat_completion`.
 
         Yields:
             Strings con incrementos de texto. Algunos chunks pueden ser "" —
-            el caller debe ignorar los vacíos si arma SSE.
+            el caller debe ignorarlos al armar SSE.
         """
         stream = await self.client.chat.completions.create(
             model=self.model,
@@ -119,7 +125,6 @@ class LLMProvider:
         )
 
         async for chunk in stream:
-            # Defensive: algunos providers (no OpenAI) mandan chunks sin choices.
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
@@ -133,7 +138,6 @@ class LLMProvider:
 
 @lru_cache(maxsize=1)
 def _cached_provider() -> LLMProvider:
-    """Instancia cacheada — un solo client por proceso."""
     return LLMProvider()
 
 
@@ -150,9 +154,9 @@ def get_llm_provider() -> LLMProvider:
             payload: ChatRequest,
             llm: LLMProvider = Depends(get_llm_provider),
         ):
-            answer = await llm.chat_completion([
+            result = await llm.chat_completion([
                 {"role": "user", "content": payload.question}
             ])
-            return {"answer": answer}
+            return {"answer": result.text, "tokens": result.total_tokens}
     """
     return _cached_provider()

@@ -100,6 +100,10 @@ class Message(Base):
     )
     role: Mapped[str] = mapped_column(String(20), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    # Token counts — solo mensajes role='assistant' los populan (migración 003).
+    # NULL en mensajes de usuario y en mensajes anteriores a la migración.
+    token_count_prompt: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    token_count_completion: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

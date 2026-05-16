@@ -1,48 +1,57 @@
 """
-Chat endpoints.
+Chat endpoints — Sprint 2 + Sprint 3 (BACK-11, BACK-12, BACK-13, BACK-14).
 
-En esta etapa (Sprint 1) solo tiene `/echo` — un endpoint mock que verifica
-el HMAC del cliente y devuelve eco de la pregunta. Sirve para que Marcos pueda
-probar el flujo end-to-end Moodle → PHP → FastAPI → respuesta sin esperar a
-que estén listos los providers de LLM y el pipeline RAG.
-
-Sprint 2 va a agregar:
-  - POST /messages    →  chat real con RAG + LLM (Gemini/OpenAI)
-  - GET  /sessions    →  historial de conversaciones del usuario
-  - DELETE /sessions/{id} → borrar conversación
+Sprint 3 additions:
+  - BACK-11: retry con backoff ya está en LLMProvider/EmbeddingProvider.
+             Si LLM falla tras retries → 503. Si embeddings falla → chat sin RAG.
+  - BACK-12: persiste token counts (prompt + completion) en cada mensaje del LLM.
+             Devuelve los tokens en ChatResponse para monitoreo en tiempo real.
+  - BACK-13: validación explícita de material indexado en el sistema prompt.
+             El retrieval filtra por course_id (aislamiento multi-curso verificado).
+  - BACK-14: rate limiting por user_id (20 req/min), logging estructurado JSON
+             con request_id + course_id + user_id + tokens + latencia.
 """
 
 from __future__ import annotations
 
+import json
+import logging
+import time
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel, Field
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from pydantic import BaseModel, Field
 
 from app.auth.hmac import verify_hmac
 from app.chat.schemas import ChatRequest, ChatResponse, MessageOut
 from app.db.models import ChatSession, Message
 from app.db.session import get_db
 from app.documents.retriever import format_context_for_prompt, retrieve_context
+from app.infrastructure.redis_client import get_redis
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
+from app.shared.config import get_settings
+from app.shared.rate_limit import check_rate_limit
+
+import redis.asyncio as redis_async
 
 router = APIRouter()
+logger = logging.getLogger("nexusai.chat")
 
+
+# ============================================================
+# Helpers internos
+# ============================================================
 
 class EchoRequest(BaseModel):
-    """Payload que envía el plugin Moodle (firmado con HMAC)."""
-
     question: str = Field(..., min_length=1, max_length=2000)
     course_id: int = Field(..., gt=0)
     user_id: int = Field(..., gt=0)
 
 
 class EchoResponse(BaseModel):
-    """Respuesta mock — devuelve los datos como llegaron, validados."""
-
     echo: str
     course_id: int
     user_id: int
@@ -72,9 +81,8 @@ def _build_system_prompt(retrieved_context: str) -> str:
     """Arma el system prompt con (o sin) contexto del material del curso.
 
     Si hay chunks relevantes, los inyecta y le pide al LLM que cite la fuente.
-    Si NO hay (curso sin material indexado, o pregunta no relacionada con el
-    material), le decimos al LLM que sea honesto: "no tengo esa info en el
-    material" en lugar de inventar una respuesta.
+    Si NO hay (curso sin material indexado, o pregunta no relacionada), le
+    indicamos al LLM que sea honesto en lugar de inventar una respuesta.
     """
     base_instructions = (
         "Sos un asistente académico de NexusAI. Respondé en el mismo idioma "
@@ -99,22 +107,41 @@ def _build_system_prompt(retrieved_context: str) -> str:
     return (
         base_instructions
         + "\n\n"
-        + "El curso del alumno todavía no tiene material indexado. "
-        "Si la pregunta requiere conocimiento específico del curso, decile "
-        "que su docente todavía no subió el material y que pueden contactarlo. "
-        "Para preguntas generales (saludo, ayuda sobre cómo usar el asistente, "
-        "definiciones de conceptos amplios), respondé normalmente."
+        + "El curso del alumno todavía no tiene material indexado en NexusAI. "
+        "Si la pregunta requiere conocimiento específico del curso (contenido de "
+        "clases, apuntes, trabajos prácticos), decile al alumno que su docente "
+        "todavía no subió el material y que puede contactarlo para pedírselo. "
+        "Para preguntas generales (saludo, cómo usar el asistente, conceptos "
+        "amplios que no dependen del material del curso), respondé normalmente."
     )
 
 
+# ============================================================
+# Endpoint principal: POST /messages
+# ============================================================
+
 @router.post("/messages", response_model=ChatResponse)
 async def messages(
+    request: Request,
     payload: ChatRequest,
     _body: Annotated[bytes, Depends(verify_hmac)],
     db: AsyncSession = Depends(get_db),
     llm: LLMProvider = Depends(get_llm_provider),
     embeddings: EmbeddingProvider = Depends(get_embedding_provider),
+    redis: redis_async.Redis = Depends(get_redis),
 ) -> ChatResponse:
+    settings = get_settings()
+    start_time = time.perf_counter()
+    request_id = getattr(request.state, "request_id", "-")
+
+    # ----- BACK-14: Rate limiting por user_id -----
+    await check_rate_limit(
+        user_id=payload.user_id,
+        redis=redis,
+        limit=settings.rate_limit_per_user_minute,
+        window_sec=60,
+    )
+
     session = await _get_or_create_session(db, payload)
 
     user_message = Message(session_id=session.id, role="user", content=payload.question)
@@ -122,10 +149,9 @@ async def messages(
     await db.flush()
     await db.commit()
 
-    # ----- RETRIEVAL RAG -----
-    # Buscar los top-5 chunks del material del curso que matcheen con la pregunta.
-    # Si falla (Redis caído, embeddings cuota, etc.), seguimos sin contexto en
-    # lugar de tirar 503: el chat sigue siendo útil, solo pierde la calidad RAG.
+    # ----- BACK-11 + BACK-13: Retrieval RAG -----
+    # Si falla (embeddings caídos, cuota agotada, etc.), continúa SIN contexto.
+    # El chat sigue siendo útil aunque pierda calidad RAG.
     try:
         retrieved_chunks = await retrieve_context(
             question=payload.question,
@@ -138,12 +164,16 @@ async def messages(
         context_text = format_context_for_prompt(retrieved_chunks)
     except Exception as exc:
         import traceback
-        print(f"[NexusAI] Retrieval failed (continuing without context): {type(exc).__name__}: {exc}", flush=True)
+        print(
+            f"[NexusAI] Retrieval failed (continuing without context): "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
         traceback.print_exc()
         retrieved_chunks = []
         context_text = ""
 
-    # ----- HISTORIAL Y PROMPT -----
+    # ----- Historial y construcción del prompt -----
     history_result = await db.execute(
         select(Message)
         .where(Message.session_id == session.id)
@@ -155,27 +185,32 @@ async def messages(
     llm_messages = [
         {"role": "system", "content": _build_system_prompt(context_text)},
     ]
-
     for message in recent_messages:
         if message.id == user_message.id:
             continue
         llm_messages.append({"role": message.role, "content": message.content})
-
     llm_messages.append({"role": "user", "content": payload.question})
 
+    # ----- BACK-11: Llamada al LLM (con retry interno en LLMProvider) -----
     try:
-        answer = await llm.chat_completion(llm_messages)
+        result = await llm.chat_completion(llm_messages)
     except Exception as exc:
-        # Log el error real para debugging — sin esto, el 503 oculta la causa.
         import traceback
         print(f"[NexusAI] LLM call failed: {type(exc).__name__}: {exc}", flush=True)
         traceback.print_exc()
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="El asistente no está disponible",
+            detail="El asistente no está disponible temporalmente",
         ) from exc
 
-    assistant_message = Message(session_id=session.id, role="assistant", content=answer)
+    # ----- BACK-12: Persistir mensaje del asistente con token counts -----
+    assistant_message = Message(
+        session_id=session.id,
+        role="assistant",
+        content=result.text,
+        token_count_prompt=result.prompt_tokens,
+        token_count_completion=result.completion_tokens,
+    )
     db.add(assistant_message)
     await db.commit()
 
@@ -186,30 +221,49 @@ async def messages(
     )
     session_messages = messages_result.scalars().all()
 
-    return ChatResponse(
-        session_id=session.id,
-        answer=answer,
-        messages=[MessageOut.model_validate(message) for message in session_messages],
+    # ----- BACK-14: Logging estructurado JSON -----
+    latency_ms = round((time.perf_counter() - start_time) * 1000, 1)
+    logger.info(
+        json.dumps(
+            {
+                "event": "chat_message",
+                "request_id": request_id,
+                "course_id": payload.course_id,
+                "user_id": payload.user_id,
+                "session_id": str(session.id),
+                "chunks_retrieved": len(retrieved_chunks),
+                "prompt_tokens": result.prompt_tokens,
+                "completion_tokens": result.completion_tokens,
+                "total_tokens": result.total_tokens,
+                "latency_ms": latency_ms,
+            },
+            ensure_ascii=False,
+        )
     )
 
+    return ChatResponse(
+        session_id=session.id,
+        answer=result.text,
+        messages=[MessageOut.model_validate(m) for m in session_messages],
+        prompt_tokens=result.prompt_tokens,
+        completion_tokens=result.completion_tokens,
+        total_tokens=result.total_tokens,
+    )
+
+
+# ============================================================
+# Endpoint de smoke test: POST /echo
+# ============================================================
 
 @router.post("/echo", response_model=EchoResponse)
 async def echo(
     payload: EchoRequest,
     _body: Annotated[bytes, Depends(verify_hmac)],
 ) -> EchoResponse:
-    """
-    Endpoint mock que valida HMAC y devuelve eco.
+    """Endpoint mock que valida HMAC y devuelve eco.
 
-    Útil para:
-      - Smoke test del HMAC desde el cliente PHP de Moodle.
-      - Probar la cadena completa React → Moodle PHP → FastAPI sin LLM.
-      - Diagnosticar drift de clock entre el server PHP y el server Python
-        (si tira "Request expired", hay un problema de NTP).
-
-    El parámetro `_body` no se usa — está acá solo para activar el
-    Depends(verify_hmac). Si la firma no valida, FastAPI corta la request
-    con 401 antes de llegar a esta función.
+    Útil para smoke test del HMAC desde el cliente PHP de Moodle.
+    Si la firma no valida, FastAPI corta la request con 401 antes de llegar acá.
     """
     return EchoResponse(
         echo=payload.question,

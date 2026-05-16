@@ -1,31 +1,25 @@
 """
-Document upload + status endpoints.
+Document upload + status endpoints — CONT-03: soporte PDF, DOCX y TXT.
 
 Flujo:
-  1. El docente desde Moodle sube un PDF (vía External Function PHP).
+  1. El docente desde Moodle sube un archivo (vía External Function PHP).
   2. PHP baja el archivo del file API de Moodle, lo encodea en base64, y POSTea
-     un JSON al backend (más simple que multipart con HMAC, ver decisión abajo).
+     un JSON al backend (más simple que multipart con HMAC).
   3. Este endpoint crea el row `documents` con status='pending', dispara la
      indexación con BackgroundTasks (no bloquea la respuesta), y devuelve el
      document_id al cliente para que pueda hacer polling de estado.
   4. El docente ve el progreso (pending → indexing → indexed | error) en la UI.
 
-Decisión: JSON+base64 vs multipart/form-data:
-  - Multipart con HMAC requiere generar manualmente el body con boundary fija
-    en PHP, calcular HMAC sobre el body completo, y enviar con cURL. Frágil:
-    cualquier diferencia de line ending (LF vs CRLF) o whitespace rompe la
-    firma.
-  - JSON con base64 tiene 33% overhead, pero el body es predictible (mismo
-    string que se firma y que se envía). Para MVP con PDFs <10MB es aceptable.
-  - Cuando lleguemos a archivos grandes (>50MB) en producción, evaluar
-    pre-signed URLs a S3/storage + metadata en JSON.
+Tipos soportados (CONT-03):
+  - application/pdf              → magic bytes %PDF-
+  - application/vnd...docx       → magic bytes PK (ZIP)
+  - text/plain                   → sin magic bytes (confiar en mime + extensión)
 
-Por qué BackgroundTasks (FastAPI nativo) y no Celery:
-  - Indexar 1 PDF de 50 pág tarda 30-60 s. BackgroundTasks corre en el mismo
-    event loop pero después de devolver la response, así que el cliente no
-    espera.
-  - Para volúmenes serios (cientos de PDFs simultáneos), conviene Celery con
-    worker pool. Eso es post-MVP — ver ADR-001 (monolito modular).
+Por qué JSON+base64 y no multipart:
+  Multipart con HMAC requiere generar manualmente el boundary en PHP y calcular
+  HMAC sobre el body completo. Cualquier diferencia de line ending rompe la firma.
+  JSON con base64 tiene 33% overhead pero el body es predecible. Para archivos
+  <20MB es aceptable. Cuando escale a >50MB, evaluar pre-signed URLs a S3.
 """
 
 from __future__ import annotations
@@ -42,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.hmac import verify_hmac
 from app.db.models import Document
 from app.db.session import get_db, get_session_factory
+from app.documents.extractor import SUPPORTED_MIME_TYPES
 from app.documents.pipeline import index_document
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 
@@ -49,13 +44,22 @@ router = APIRouter()
 
 
 # ============================================================
-# Schemas
+# Constantes
 # ============================================================
 
-# Límite de tamaño para el upload. PDFs típicos universitarios pesan 1-5 MB.
-# Permitimos hasta 20 MB → en base64 son ~27 MB en el JSON, manejable.
-MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
 
+# Magic bytes por mime type. None = sin verificación (ej. text/plain).
+_MAGIC_BYTES: dict[str, bytes | None] = {
+    "application/pdf": b"%PDF-",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": b"PK",
+    "text/plain": None,
+}
+
+
+# ============================================================
+# Schemas
+# ============================================================
 
 class DocumentUploadRequest(BaseModel):
     """Payload de upload firmado con HMAC."""
@@ -121,8 +125,6 @@ async def _index_document_task(
                 embeddings=embeddings,
             )
         except Exception as exc:
-            # El pipeline ya marca el document como 'error' en la DB y commitea
-            # antes de re-raise. Solo logueamos acá.
             import traceback
             print(
                 f"[NexusAI] Indexing failed for document {document_id}: "
@@ -147,20 +149,18 @@ async def upload_document(
     """
     Sube un documento y dispara la indexación en background.
 
-    Devuelve 202 Accepted con el document_id para que el cliente haga polling
-    al endpoint GET /documents/{id} y vea cuando termine.
-
-    Aceptamos solo PDF en MVP. DOCX y TXT en Sprint 3.
+    Tipos aceptados: PDF, DOCX, TXT (máx 20 MB).
+    Devuelve 202 Accepted con el document_id para polling.
     """
-    # Validación de mime_type. Soft check: confiamos en el header del cliente
-    # pero rechazamos si claramente no es PDF.
-    if payload.mime_type != "application/pdf":
+    if payload.mime_type not in SUPPORTED_MIME_TYPES:
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail=f"Only PDF is supported in MVP. Got: {payload.mime_type}",
+            detail=(
+                f"Tipo de archivo no soportado: {payload.mime_type!r}. "
+                f"Tipos aceptados: {sorted(SUPPORTED_MIME_TYPES)}"
+            ),
         )
 
-    # Decodear base64. Si está corrupto, rechazamos con 400.
     try:
         file_bytes = base64.b64decode(payload.content_b64, validate=True)
     except (ValueError, base64.binascii.Error) as exc:
@@ -181,15 +181,18 @@ async def upload_document(
             detail=f"File too large: {len(file_bytes)} bytes (max {MAX_UPLOAD_BYTES})",
         )
 
-    # Sanity check del header magic bytes — los PDFs empiezan con "%PDF-".
-    # Defensa adicional contra archivos mal labelados.
-    if not file_bytes.startswith(b"%PDF-"):
+    # Verificación de magic bytes por tipo de archivo.
+    # TXT no tiene magic bytes → None = skip check.
+    expected_magic = _MAGIC_BYTES.get(payload.mime_type)
+    if expected_magic is not None and not file_bytes.startswith(expected_magic):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="File does not look like a valid PDF (magic bytes mismatch)",
+            detail=(
+                f"El archivo no parece ser del tipo declarado ({payload.mime_type!r}): "
+                "los primeros bytes no coinciden con el formato esperado."
+            ),
         )
 
-    # Crear el row en la DB con status='pending'.
     document = Document(
         course_id=payload.course_id,
         uploader_id=payload.uploader_id,
@@ -201,7 +204,6 @@ async def upload_document(
     await db.commit()
     await db.refresh(document)
 
-    # Disparar la indexación async — la response sale antes de que termine.
     background_tasks.add_task(
         _index_document_task,
         document_id=document.id,
@@ -218,8 +220,7 @@ async def get_document_status(
     _body: Annotated[bytes, Depends(verify_hmac)],
     db: AsyncSession = Depends(get_db),
 ) -> DocumentOut:
-    """
-    Estado actual de un documento. Útil para polling desde la UI docente.
+    """Estado actual de un documento. Útil para polling desde la UI docente.
 
     Estados posibles: pending, indexing, indexed, error.
     Cuando es 'error', `error_message` tiene el detalle.
@@ -237,9 +238,7 @@ async def list_documents_by_course(
     _body: Annotated[bytes, Depends(verify_hmac)],
     db: AsyncSession = Depends(get_db),
 ) -> list[DocumentOut]:
-    """
-    Lista todos los documentos de un curso. Para mostrar la tabla en la vista docente.
-    """
+    """Lista todos los documentos de un curso. Para la tabla en la vista docente."""
     if course_id <= 0:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="course_id must be positive")
 
@@ -253,17 +252,16 @@ async def list_documents_by_course(
 @router.delete(
     "/{document_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    response_class=Response,  # FastAPI quirk: 204 + tipo None requiere response_class explícita
+    response_class=Response,
 )
 async def delete_document(
     document_id: UUID,
     _body: Annotated[bytes, Depends(verify_hmac)],
     db: AsyncSession = Depends(get_db),
 ) -> Response:
-    """
-    Borra un documento + cascada en chunks (gracias al ON DELETE CASCADE en el FK).
+    """Borra un documento + cascada en chunks (ON DELETE CASCADE en FK).
 
-    Devuelve 204 No Content sin body — convención REST para deletes exitosos.
+    Devuelve 204 No Content sin body.
     """
     result = await db.execute(select(Document).where(Document.id == document_id))
     document = result.scalar_one_or_none()
