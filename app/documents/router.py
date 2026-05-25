@@ -187,6 +187,25 @@ async def upload_document(
         response.status_code = status.HTTP_200_OK
         return DocumentOut.from_orm(existing)
 
+    # Detectar colisión de nombre: mismo course_id + filename, estado activo.
+    # Se excluye 'error' porque un intento fallido no debe bloquear re-subida.
+    collision_result = await db.execute(
+        select(Document).where(
+            Document.course_id == payload.course_id,
+            Document.filename == payload.filename,
+            Document.status.in_(["pending", "indexing", "indexed"]),
+        )
+    )
+    if collision_result.scalar_one_or_none() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Ya existe un documento con el nombre '{payload.filename}' "
+                f"en el curso {payload.course_id}. "
+                "Eliminá el archivo existente antes de subir uno nuevo."
+            ),
+        )
+
     try:
         file_bytes = base64.b64decode(payload.content_b64, validate=True)
     except (ValueError, base64.binascii.Error) as exc:

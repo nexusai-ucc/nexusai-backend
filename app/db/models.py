@@ -35,7 +35,11 @@ class Document(Base):
     )
 
     chunks: Mapped[List["Chunk"]] = relationship(
-        back_populates="document", lazy="selectin", order_by="Chunk.chunk_index"
+        back_populates="document",
+        lazy="selectin",
+        order_by="Chunk.chunk_index",
+        cascade="all, delete-orphan",  # marca hijos como "deleted" cuando el padre se borra
+        passive_deletes=True,          # no emite SQL para los hijos; confía en ON DELETE CASCADE
     )
 
 
