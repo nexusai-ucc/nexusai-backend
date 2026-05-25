@@ -179,13 +179,10 @@ async def messages(
         )
         context_text = format_context_for_prompt(retrieved_chunks)
     except Exception as exc:
-        import traceback
-        print(
-            f"[NexusAI] Retrieval failed (continuing without context): "
-            f"{type(exc).__name__}: {exc}",
-            flush=True,
+        logger.warning(
+            "Retrieval failed, continuing without context",
+            extra={"error": str(exc), "type": type(exc).__name__},
         )
-        traceback.print_exc()
         retrieved_chunks = []
         context_text = ""
 
@@ -211,9 +208,10 @@ async def messages(
     try:
         result = await llm.chat_completion(llm_messages)
     except Exception as exc:
-        import traceback
-        print(f"[NexusAI] LLM call failed: {type(exc).__name__}: {exc}", flush=True)
-        traceback.print_exc()
+        logger.error(
+            "LLM call failed",
+            extra={"error": str(exc), "type": type(exc).__name__},
+        )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="El asistente no está disponible temporalmente",
