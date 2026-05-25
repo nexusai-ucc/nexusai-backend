@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Chunk as ChunkModel
@@ -48,6 +48,18 @@ async def index_document(
     document = result.scalar_one_or_none()
     if document is None:
         raise ValueError(f"Document {document_id} not found")
+
+    # CONT-04: si el documento ya tiene chunks (re-encola de un intento previo
+    # parcialmente exitoso), salteamos la indexación completa.
+    chunk_count_result = await db.execute(
+        select(func.count(ChunkModel.id)).where(ChunkModel.document_id == document_id)
+    )
+    if chunk_count_result.scalar_one() > 0:
+        document.status = "indexed"
+        document.error_message = None
+        await db.commit()
+        await db.refresh(document)
+        return document
 
     document.status = "indexing"
     document.error_message = None

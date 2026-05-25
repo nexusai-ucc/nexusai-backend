@@ -21,8 +21,11 @@ from app.providers.llm import LLMProvider
 
 @pytest.mark.asyncio
 async def test_chat_completion_returns_message_content(fake_openai_chat_response):
-    """chat_completion debería extraer el .content del primer choice."""
+    """chat_completion devuelve CompletionResult con .text y token counts."""
     provider = LLMProvider()
+    fake_openai_chat_response.usage.prompt_tokens = 10
+    fake_openai_chat_response.usage.completion_tokens = 5
+    fake_openai_chat_response.usage.total_tokens = 15
     provider.client.chat.completions.create = AsyncMock(
         return_value=fake_openai_chat_response
     )
@@ -30,23 +33,29 @@ async def test_chat_completion_returns_message_content(fake_openai_chat_response
     result = await provider.chat_completion(
         messages=[{"role": "user", "content": "hola"}]
     )
-    assert result == "respuesta mockeada"
+    assert result.text == "respuesta mockeada"
+    assert result.prompt_tokens == 10
+    assert result.completion_tokens == 5
+    assert result.total_tokens == 15
 
 
 @pytest.mark.asyncio
 async def test_chat_completion_empty_content_returns_empty_string():
-    """Si el LLM devuelve content=None, devolvemos '' (no None)."""
+    """Si el LLM devuelve content=None, .text es '' (no None)."""
     provider = LLMProvider()
     response = MagicMock()
     choice = MagicMock()
     choice.message.content = None
     response.choices = [choice]
+    response.usage = None  # sin usage → tokens en 0
     provider.client.chat.completions.create = AsyncMock(return_value=response)
 
     result = await provider.chat_completion(
         messages=[{"role": "user", "content": "hola"}]
     )
-    assert result == ""
+    assert result.text == ""
+    assert result.prompt_tokens == 0
+    assert result.completion_tokens == 0
 
 
 # ============================================================
