@@ -1,0 +1,43 @@
+# fly.toml app configuration file generated for nexusai-api-ucc on 2026-05-25T16:19:45-03:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'nexusai-api-ucc'
+primary_region = 'gru'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[env]
+  APP_VERSION = '0.3.0'
+  EMBEDDING_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/openai/'
+  EMBEDDING_DIMENSIONS = '768'
+  EMBEDDING_MODEL = 'gemini-embedding-001'
+  ENV = 'production'
+  HMAC_REPLAY_WINDOW_SEC = '300'
+  LLM_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/openai/'
+  LLM_MODEL = 'gemini-2.0-flash'
+  RATE_LIMIT_PER_USER_DAILY = '50'
+  RATE_LIMIT_PER_USER_MINUTE = '20'
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
+  [[http_service.checks]]
+    interval = '30s'
+    timeout = '10s'
+    grace_period = '30s'
+    method = 'GET'
+    path = '/health'
+
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '512mb'
+  cpus = 1
+  memory_mb = 512
