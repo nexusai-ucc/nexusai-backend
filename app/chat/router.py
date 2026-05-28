@@ -103,8 +103,8 @@ def _build_system_prompt(retrieved_context: str, is_multicourse: bool = False) -
     if retrieved_context:
         source_label = "de tus materias" if is_multicourse else "del curso del alumno"
         multicourse_hint = (
-            "Cuando el fragmento viene de una materia específica, mencionala "
-            '(ej: "en Cálculo I, según apunte.pdf..."). '
+            "Cuando un fragmento venga de una materia específica, mencionala "
+            "indicando el nombre real de la materia tal como aparece en el bloque. "
             if is_multicourse
             else ""
         )
@@ -113,8 +113,10 @@ def _build_system_prompt(retrieved_context: str, is_multicourse: bool = False) -
             + "\n\n"
             + f"Tenés acceso a fragmentos del material {source_label}. "
             "Usá esos fragmentos como tu fuente principal de información. "
-            "Cuando los uses, citá explícitamente el archivo del que vienen "
-            '(ej: "según apunte-derivadas.pdf..."). '
+            "Cuando uses información de un fragmento, citá el archivo "
+            "exactamente como aparece entre comillas en el bloque del material "
+            "(la línea que dice FRAGMENTO N (de \"...\")). "
+            "NUNCA inventes ni copies nombres de archivo de ejemplos previos. "
             + multicourse_hint
             + "Si la pregunta NO se puede responder con los fragmentos disponibles, "
             "decilo explícitamente — no inventes."
