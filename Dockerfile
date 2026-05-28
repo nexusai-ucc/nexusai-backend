@@ -74,6 +74,10 @@ COPY --chown=nexusai:nexusai migrations/ ./migrations/
 # encuentre. Sin esto, los comandos alembic dentro del container fallan con
 # "No config file 'alembic.ini' found".
 COPY --chown=nexusai:nexusai alembic.ini ./alembic.ini
+# entrypoint corre `alembic upgrade head` antes de levantar uvicorn.
+# Tiene que copiarse antes de cambiar a USER nexusai para poder hacer chmod.
+COPY entrypoint.sh ./entrypoint.sh
+RUN chmod +x ./entrypoint.sh && chown nexusai:nexusai ./entrypoint.sh
 
 USER nexusai
 
@@ -85,14 +89,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Uvicorn directo, sin gunicorn — para dev/MVP es suficiente.
-# En producción evaluar gunicorn + uvicorn workers (4-8 workers) si hay
-# suficiente tráfico que justifique más concurrencia.
-#
-# --proxy-headers: respeta los X-Forwarded-* de Moodle (que está delante)
-# --forwarded-allow-ips=*: confía en cualquier proxy en la red interna
-CMD ["uvicorn", "app.main:app", \
-     "--host", "0.0.0.0", \
-     "--port", "8000", \
-     "--proxy-headers", \
-     "--forwarded-allow-ips", "*"]
+# Entrypoint: corre migraciones y luego levanta uvicorn.
+CMD ["./entrypoint.sh"]

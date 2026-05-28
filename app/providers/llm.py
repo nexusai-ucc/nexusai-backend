@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Optional, Union
 
 from openai import AsyncOpenAI
 
@@ -36,6 +36,25 @@ class CompletionResult:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+
+
+@dataclass(frozen=True)
+class StreamToken:
+    """Un chunk de texto del LLM en modo streaming."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class StreamUsage:
+    """Conteo final de tokens del stream (último chunk cuando include_usage=True)."""
+
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+StreamChunk = Union[StreamToken, StreamUsage]
 
 
 class LLMProvider:
@@ -130,6 +149,40 @@ class LLMProvider:
             delta = chunk.choices[0].delta
             if delta and delta.content:
                 yield delta.content
+
+    async def chat_completion_stream(
+        self,
+        messages: list[dict[str, str]],
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        """Streaming con conteo de tokens al final.
+
+        Yieldea StreamToken por cada chunk de texto. Cuando el provider lo soporta
+        (Gemini compat OpenAI / OpenAI nativo), al final del stream yieldea un
+        único StreamUsage con los token counts del prompt + completion. Útil para
+        persistir métricas en la DB después del streaming.
+        """
+        stream = await self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            stream=True,
+            stream_options={"include_usage": True},
+            **kwargs,
+        )
+
+        async for chunk in stream:
+            if chunk.choices:
+                delta = chunk.choices[0].delta
+                if delta and delta.content:
+                    yield StreamToken(text=delta.content)
+            # En el último chunk con include_usage=True, viene el usage poblado.
+            if getattr(chunk, "usage", None):
+                u = chunk.usage
+                yield StreamUsage(
+                    prompt_tokens=u.prompt_tokens or 0,
+                    completion_tokens=u.completion_tokens or 0,
+                    total_tokens=u.total_tokens or 0,
+                )
 
 
 # ============================================================

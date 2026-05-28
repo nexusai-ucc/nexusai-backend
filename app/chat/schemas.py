@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -14,6 +14,11 @@ class ChatRequest(BaseModel):
     course_id: int = Field(gt=0)
     user_id: int = Field(gt=0)
     session_id: Optional[UUID] = None
+    # Feature B — chat multi-curso. Si viene poblada, el retriever busca en
+    # todos los cursos de la lista en lugar de solo en course_id.
+    course_ids: Optional[List[int]] = None
+    # Mapa {str(course_id): nombre} para que el LLM cite la materia en multi-curso.
+    course_names: Optional[Dict[str, str]] = None
 
 
 class MessageOut(BaseModel):

@@ -37,6 +37,7 @@ class RetrievedChunk:
     document_filename: str
     chunk_index: int
     distance: float  # 0.0 = idéntico semánticamente, 2.0 = opuesto
+    course_id: int = 0
 
     @property
     def similarity(self) -> float:
@@ -53,6 +54,7 @@ async def retrieve_context(
     embeddings: EmbeddingProvider,
     top_k: int = 5,
     min_similarity: float = 0.3,
+    course_ids: list[int] | None = None,
 ) -> List[RetrievedChunk]:
     """Devuelve los top_k chunks más similares a la pregunta, filtrados por curso.
 
@@ -81,6 +83,13 @@ async def retrieve_context(
     if top_k <= 0:
         raise ValueError("top_k must be positive")
 
+    # Resolver qué course_ids usar: si vino la lista, tiene prioridad sobre
+    # course_id (Feature B — chat multi-curso). Filtramos ids inválidos.
+    ids_to_query = course_ids if course_ids else [course_id]
+    ids_to_query = [i for i in ids_to_query if i > 0]
+    if not ids_to_query:
+        return []
+
     # 1. Vectorizar la pregunta.
     question_vector = await embeddings.embed(question)
 
@@ -93,10 +102,11 @@ async def retrieve_context(
             Chunk.content,
             Chunk.chunk_index,
             Document.filename,
+            Document.course_id,
             Chunk.embedding.cosine_distance(question_vector).label("distance"),
         )
         .join(Document, Chunk.document_id == Document.id)
-        .where(Document.course_id == course_id)
+        .where(Document.course_id.in_(ids_to_query))
         .where(Document.status == "indexed")
         .where(Chunk.embedding.is_not(None))
         .order_by("distance")
@@ -113,30 +123,29 @@ async def retrieve_context(
             document_filename=row.filename,
             chunk_index=row.chunk_index,
             distance=float(row.distance),
+            course_id=int(row.course_id),
         )
         for row in rows
     ]
     return [c for c in chunks if c.similarity >= min_similarity]
 
 
-def format_context_for_prompt(chunks: List[RetrievedChunk]) -> str:
+def format_context_for_prompt(
+    chunks: List[RetrievedChunk],
+    course_names: dict[int, str] | None = None,
+) -> str:
     """Formatea los chunks recuperados para inyectarlos al system prompt.
 
-    Output ejemplo:
-
-        FRAGMENTO 1 (de "apunte-derivadas.pdf"):
-        Una derivada mide la tasa instantánea de cambio...
-
-        FRAGMENTO 2 (de "teorema-fundamental.pdf"):
-        El teorema fundamental del cálculo...
+    Si se pasa `course_names` (modo multi-curso), cada fragmento incluye la
+    materia de la que vino para que el LLM pueda citarla en la respuesta.
 
     Args:
         chunks: lista de RetrievedChunk (puede estar vacía).
+        course_names: opcional, {course_id: nombre} para anotar la materia.
 
     Returns:
         String formateado, listo para concatenar al system prompt. Si la lista
-        está vacía, devuelve string vacío (el endpoint detecta este caso y
-        agrega una nota al system prompt: "no hay material disponible").
+        está vacía, devuelve string vacío.
     """
     if not chunks:
         return ""
@@ -149,8 +158,14 @@ def format_context_for_prompt(chunks: List[RetrievedChunk]) -> str:
         content = chunk.content.strip()
         if len(content) > 800:
             content = content[:800] + "..."
+
+        course_label = ""
+        if course_names and chunk.course_id in course_names:
+            course_label = f", materia: {course_names[chunk.course_id]}"
+
         parts.append(
-            f'FRAGMENTO {i} (de "{chunk.document_filename}", chunk #{chunk.chunk_index}):\n{content}'
+            f'FRAGMENTO {i} (de "{chunk.document_filename}"{course_label}, '
+            f'chunk #{chunk.chunk_index}):\n{content}'
         )
 
     return "\n\n".join(parts)
