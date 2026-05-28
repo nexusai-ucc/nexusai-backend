@@ -20,6 +20,7 @@ import time
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,11 +28,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.hmac import verify_hmac
 from app.chat.schemas import ChatRequest, ChatResponse, MessageOut
 from app.db.models import ChatSession, Message
-from app.db.session import get_db
+from app.db.session import get_db, get_session_factory
 from app.documents.retriever import format_context_for_prompt, retrieve_context
 from app.infrastructure.redis_client import get_redis
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
-from app.providers.llm import LLMProvider, get_llm_provider
+from app.providers.llm import LLMProvider, StreamToken, StreamUsage, get_llm_provider
 from app.shared.config import get_settings
 from app.shared.rate_limit import check_rate_limit
 
@@ -280,6 +281,187 @@ async def messages(
         prompt_tokens=result.prompt_tokens,
         completion_tokens=result.completion_tokens,
         total_tokens=result.total_tokens,
+    )
+
+
+# ============================================================
+# Endpoint streaming: POST /stream — Server-Sent Events
+# ============================================================
+
+@router.post("/stream")
+async def messages_stream(
+    request: Request,
+    payload: ChatRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    llm: LLMProvider = Depends(get_llm_provider),
+    embeddings: EmbeddingProvider = Depends(get_embedding_provider),
+    redis: redis_async.Redis = Depends(get_redis),
+) -> StreamingResponse:
+    """Versión streaming de /messages — devuelve tokens del LLM con SSE.
+
+    Eventos emitidos (line-delimited JSON con prefijo `data: `):
+      - {"type":"meta","session_id":"...","chunks":N}  primero, una sola vez
+      - {"type":"token","content":"hola"}              N veces
+      - {"type":"done","prompt_tokens":N,"completion_tokens":N,"total_tokens":N}
+      - {"type":"error","detail":"..."}                si falla algo
+
+    El cliente PHP forwardea estos eventos al browser sin tocarlos.
+
+    No usa el Depends(get_db) regular porque queremos controlar la sesión de DB
+    nosotros mismos a lo largo del stream (FastAPI cerraría la sesión al
+    retornar el objeto StreamingResponse, antes de que termine el async generator).
+    """
+    settings = get_settings()
+    request_id = getattr(request.state, "request_id", "-")
+
+    await check_rate_limit(
+        user_id=payload.user_id,
+        redis=redis,
+        limit=settings.rate_limit_per_user_minute,
+        window_sec=60,
+    )
+
+    is_multicourse = bool(payload.course_ids and len(payload.course_ids) > 1)
+    course_names_int: dict[int, str] = {}
+    if payload.course_names:
+        for k, v in payload.course_names.items():
+            try:
+                course_names_int[int(k)] = str(v)
+            except (ValueError, TypeError):
+                pass
+
+    async def event_stream():
+        start_time = time.perf_counter()
+        SessionFactory = get_session_factory()
+
+        async with SessionFactory() as db:
+            try:
+                session = await _get_or_create_session(db, payload)
+                user_message = Message(session_id=session.id, role="user", content=payload.question)
+                db.add(user_message)
+                await db.flush()
+                await db.commit()
+
+                # Retrieval RAG (tolera fallos como el endpoint sync).
+                try:
+                    retrieved_chunks = await retrieve_context(
+                        question=payload.question,
+                        course_id=payload.course_id,
+                        course_ids=payload.course_ids,
+                        db=db,
+                        embeddings=embeddings,
+                        top_k=5,
+                        min_similarity=0.3,
+                    )
+                    context_text = format_context_for_prompt(
+                        retrieved_chunks,
+                        course_names=course_names_int if is_multicourse else None,
+                    )
+                except Exception as exc:
+                    print(f"[NexusAI] Retrieval failed in stream: {exc}", flush=True)
+                    retrieved_chunks = []
+                    context_text = ""
+
+                # Evento meta — el cliente lo usa para saber el session_id sin
+                # esperar al primer token.
+                yield (
+                    "data: " + json.dumps({
+                        "type": "meta",
+                        "session_id": str(session.id),
+                        "chunks": len(retrieved_chunks),
+                    }) + "\n\n"
+                )
+
+                # Historial.
+                history_result = await db.execute(
+                    select(Message)
+                    .where(Message.session_id == session.id)
+                    .order_by(desc(Message.created_at), desc(Message.id))
+                    .limit(10)
+                )
+                recent_messages = list(reversed(history_result.scalars().all()))
+
+                llm_messages = [
+                    {"role": "system", "content": _build_system_prompt(context_text, is_multicourse=is_multicourse)},
+                ]
+                for message in recent_messages:
+                    if message.id == user_message.id:
+                        continue
+                    llm_messages.append({"role": message.role, "content": message.content})
+                llm_messages.append({"role": "user", "content": payload.question})
+
+                # Stream del LLM.
+                full_text_parts: list[str] = []
+                usage_seen: StreamUsage | None = None
+
+                async for chunk in llm.chat_completion_stream(llm_messages):
+                    if isinstance(chunk, StreamToken):
+                        full_text_parts.append(chunk.text)
+                        yield (
+                            "data: " + json.dumps({
+                                "type": "token",
+                                "content": chunk.text,
+                            }, ensure_ascii=False) + "\n\n"
+                        )
+                    elif isinstance(chunk, StreamUsage):
+                        usage_seen = chunk
+
+                full_text = "".join(full_text_parts)
+
+                # Persistir el mensaje completo del asistente.
+                assistant_message = Message(
+                    session_id=session.id,
+                    role="assistant",
+                    content=full_text,
+                    token_count_prompt=usage_seen.prompt_tokens if usage_seen else 0,
+                    token_count_completion=usage_seen.completion_tokens if usage_seen else 0,
+                )
+                db.add(assistant_message)
+                await db.commit()
+
+                latency_ms = round((time.perf_counter() - start_time) * 1000, 1)
+                logger.info(
+                    json.dumps({
+                        "event": "chat_stream",
+                        "request_id": request_id,
+                        "course_id": payload.course_id,
+                        "user_id": payload.user_id,
+                        "session_id": str(session.id),
+                        "chunks_retrieved": len(retrieved_chunks),
+                        "prompt_tokens": usage_seen.prompt_tokens if usage_seen else 0,
+                        "completion_tokens": usage_seen.completion_tokens if usage_seen else 0,
+                        "latency_ms": latency_ms,
+                    }, ensure_ascii=False)
+                )
+
+                yield (
+                    "data: " + json.dumps({
+                        "type": "done",
+                        "prompt_tokens": usage_seen.prompt_tokens if usage_seen else 0,
+                        "completion_tokens": usage_seen.completion_tokens if usage_seen else 0,
+                        "total_tokens": usage_seen.total_tokens if usage_seen else 0,
+                    }) + "\n\n"
+                )
+
+            except Exception as exc:
+                import traceback
+                print(f"[NexusAI] Stream failed: {type(exc).__name__}: {exc}", flush=True)
+                traceback.print_exc()
+                yield (
+                    "data: " + json.dumps({
+                        "type": "error",
+                        "detail": "El asistente no está disponible temporalmente",
+                    }) + "\n\n"
+                )
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable nginx buffering si está delante
+            "Connection": "keep-alive",
+        },
     )
 
 
