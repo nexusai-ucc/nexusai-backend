@@ -32,6 +32,7 @@ from app.chat.schemas import ChatRequest, ChatResponse, MessageOut
 from app.db.models import ChatSession, Message
 from app.db.session import get_db, get_session_factory
 from app.documents.retriever import format_context_for_prompt, retrieve_context
+from app.gaps.recorder import record_gap_if_needed
 from app.infrastructure.redis_client import get_redis
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, StreamToken, StreamUsage, get_llm_provider
@@ -223,6 +224,11 @@ async def messages(
         retrieved_chunks = []
         context_text = ""
 
+    # Feature G nota: el gap se evalúa DESPUÉS del LLM (más abajo), para
+    # combinar la señal del retrieval con la respuesta efectiva del modelo.
+    # Aquí solo memoizamos max_sim para usarlo después.
+    max_sim_for_gap = max((c.similarity for c in retrieved_chunks), default=None)
+
     # ----- Historial y construcción del prompt -----
     history_result = await db.execute(
         select(Message)
@@ -263,6 +269,20 @@ async def messages(
         token_count_completion=result.completion_tokens,
     )
     db.add(assistant_message)
+
+    # Feature G: registrar gap si retrieval no encontró nada O el LLM dijo
+    # que no podía responder con el material. Solo single-curso.
+    if not is_multicourse:
+        await record_gap_if_needed(
+            db,
+            course_id=payload.course_id,
+            user_id=payload.user_id,
+            question=payload.question,
+            chunks_count=len(retrieved_chunks),
+            max_similarity=max_sim_for_gap,
+            llm_answer=result.text,
+        )
+
     await db.commit()
 
     messages_result = await db.execute(
@@ -380,6 +400,9 @@ async def messages_stream(
                     retrieved_chunks = []
                     context_text = ""
 
+                # Memoizamos max similarity para la evaluación de gap post-LLM.
+                max_sim_stream = max((c.similarity for c in retrieved_chunks), default=None)
+
                 # Evento meta — el cliente lo usa para saber el session_id sin
                 # esperar al primer token. Incluye los chunks reales (no solo el
                 # contador) para que el frontend pueda renderizar citas clickeables
@@ -448,6 +471,19 @@ async def messages_stream(
                     token_count_completion=usage_seen.completion_tokens if usage_seen else 0,
                 )
                 db.add(assistant_message)
+
+                # Feature G: evaluar gap con señal combinada (retrieval + respuesta LLM).
+                if not is_multicourse:
+                    await record_gap_if_needed(
+                        db,
+                        course_id=payload.course_id,
+                        user_id=payload.user_id,
+                        question=payload.question,
+                        chunks_count=len(retrieved_chunks),
+                        max_similarity=max_sim_stream,
+                        llm_answer=full_text,
+                    )
+
                 await db.commit()
 
                 latency_ms = round((time.perf_counter() - start_time) * 1000, 1)

@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import List, Optional
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -114,3 +114,30 @@ class Message(Base):
     )
 
     session: Mapped["ChatSession"] = relationship(back_populates="messages")
+
+
+class UnansweredQuestion(Base):
+    """Preguntas del alumno que el material del curso no pudo responder bien.
+
+    Se registran cuando el retrieval no devuelve chunks o devuelve chunks con
+    similarity baja. El docente consulta esta tabla para descubrir qué temas
+    le faltan al material (Feature G — detección de gaps).
+    """
+    __tablename__ = "unanswered_questions"
+    __table_args__ = (
+        Index("ix_unanswered_questions_course_id_created_at", "course_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    course_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    # Mejor similarity entre los chunks recuperados (0..1). NULL si chunks=0.
+    max_similarity: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # Cantidad de chunks que se llegaron a recuperar (0 = nada matcheó).
+    chunks_retrieved: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
