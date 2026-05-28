@@ -363,13 +363,26 @@ async def messages_stream(
                     context_text = ""
 
                 # Evento meta — el cliente lo usa para saber el session_id sin
-                # esperar al primer token.
+                # esperar al primer token. Incluye los chunks reales (no solo el
+                # contador) para que el frontend pueda renderizar citas clickeables
+                # que muestren el fragmento exacto usado.
+                sources_payload = [
+                    {
+                        "document_filename": c.document_filename,
+                        "chunk_index":       c.chunk_index,
+                        "content":           c.content[:400].strip(),
+                        "similarity":        round(c.similarity, 3),
+                        "course_id":         c.course_id,
+                    }
+                    for c in retrieved_chunks
+                ]
                 yield (
                     "data: " + json.dumps({
-                        "type": "meta",
+                        "type":       "meta",
                         "session_id": str(session.id),
-                        "chunks": len(retrieved_chunks),
-                    }) + "\n\n"
+                        "chunks":     len(retrieved_chunks),
+                        "sources":    sources_payload,
+                    }, ensure_ascii=False) + "\n\n"
                 )
 
                 # Historial.
