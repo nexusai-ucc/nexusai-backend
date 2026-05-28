@@ -17,12 +17,14 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Annotated
+from datetime import datetime
+from typing import Annotated, Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.hmac import verify_hmac
@@ -477,6 +479,124 @@ async def messages_stream(
             "X-Accel-Buffering": "no",  # disable nginx buffering si está delante
             "Connection": "keep-alive",
         },
+    )
+
+
+# ============================================================
+# Endpoints de historial — listar sesiones + leer mensajes
+# ============================================================
+
+class SessionSummary(BaseModel):
+    id: str
+    course_id: int
+    created_at: datetime
+    updated_at: datetime
+    last_message_preview: Optional[str] = None
+    message_count: int = 0
+
+
+class SessionsList(BaseModel):
+    sessions: list[SessionSummary]
+
+
+class SessionsListRequest(BaseModel):
+    user_id: int = Field(gt=0)
+    course_id: Optional[int] = None  # None = todas las del user
+    limit: int = Field(default=20, ge=1, le=100)
+
+
+class SessionMessagesRequest(BaseModel):
+    user_id: int = Field(gt=0)
+    session_id: UUID
+
+
+class SessionMessages(BaseModel):
+    session_id: UUID
+    messages: list[MessageOut]
+
+
+@router.post("/sessions/list", response_model=SessionsList)
+async def sessions_list(
+    payload: SessionsListRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+) -> SessionsList:
+    """Lista las sesiones del usuario, ordenadas por updated_at descendente.
+
+    POST en lugar de GET porque queremos firmar el body con HMAC
+    (consistente con el resto de endpoints del plugin).
+    """
+    stmt = (
+        select(ChatSession)
+        .where(ChatSession.user_id == payload.user_id)
+        .order_by(desc(ChatSession.updated_at))
+        .limit(payload.limit)
+    )
+    if payload.course_id is not None and payload.course_id > 0:
+        stmt = stmt.where(ChatSession.course_id == payload.course_id)
+
+    result = await db.execute(stmt)
+    sessions = result.scalars().all()
+
+    out: list[SessionSummary] = []
+    for s in sessions:
+        # Preview = primer mensaje de usuario, truncado.
+        msg_stmt = (
+            select(Message)
+            .where(Message.session_id == s.id, Message.role == "user")
+            .order_by(Message.created_at)
+            .limit(1)
+        )
+        first_msg_res = await db.execute(msg_stmt)
+        first_msg = first_msg_res.scalar_one_or_none()
+        preview = (first_msg.content[:80].strip() + "…") if first_msg and len(first_msg.content) > 80 else (first_msg.content if first_msg else None)
+
+        count_stmt = select(func.count()).select_from(Message).where(Message.session_id == s.id)
+        count_res = await db.execute(count_stmt)
+        count = int(count_res.scalar_one() or 0)
+
+        out.append(SessionSummary(
+            id=str(s.id),
+            course_id=s.course_id,
+            created_at=s.created_at,
+            updated_at=s.updated_at,
+            last_message_preview=preview,
+            message_count=count,
+        ))
+
+    return SessionsList(sessions=out)
+
+
+@router.post("/sessions/messages", response_model=SessionMessages)
+async def session_messages(
+    payload: SessionMessagesRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+) -> SessionMessages:
+    """Devuelve los mensajes completos de una sesión.
+
+    Valida que la sesión pertenezca al user_id de la request — evita que
+    un alumno con sesión válida lea conversaciones ajenas (auth a nivel app).
+    """
+    session_stmt = select(ChatSession).where(ChatSession.id == payload.session_id)
+    res = await db.execute(session_stmt)
+    session = res.scalar_one_or_none()
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+    if session.user_id != payload.user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Session does not belong to user")
+
+    msg_stmt = (
+        select(Message)
+        .where(Message.session_id == session.id)
+        .order_by(Message.created_at, Message.id)
+    )
+    msg_res = await db.execute(msg_stmt)
+    msgs = msg_res.scalars().all()
+
+    return SessionMessages(
+        session_id=session.id,
+        messages=[MessageOut.model_validate(m) for m in msgs],
     )
 
 
