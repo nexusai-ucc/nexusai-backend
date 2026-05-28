@@ -71,18 +71,28 @@ async def _get_or_create_session(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
         return session
 
-    session = ChatSession(user_id=payload.user_id, course_id=payload.course_id)
+    # Feature B: si el chat está en modo multi-curso (course_ids con >1 item),
+    # la sesión se crea con course_id=0 (sesión global, no atada a una materia).
+    session_course_id = (
+        0
+        if (payload.course_ids and len(payload.course_ids) > 1)
+        else payload.course_id
+    )
+    session = ChatSession(user_id=payload.user_id, course_id=session_course_id)
     db.add(session)
     await db.flush()
     return session
 
 
-def _build_system_prompt(retrieved_context: str) -> str:
+def _build_system_prompt(retrieved_context: str, is_multicourse: bool = False) -> str:
     """Arma el system prompt con (o sin) contexto del material del curso.
 
     Si hay chunks relevantes, los inyecta y le pide al LLM que cite la fuente.
     Si NO hay (curso sin material indexado, o pregunta no relacionada), le
     indicamos al LLM que sea honesto en lugar de inventar una respuesta.
+
+    Cuando is_multicourse=True, los fragmentos vienen de varios cursos a la
+    vez y el LLM debe citar también la materia.
     """
     base_instructions = (
         "Sos un asistente académico de NexusAI. Respondé en el mismo idioma "
@@ -90,14 +100,22 @@ def _build_system_prompt(retrieved_context: str) -> str:
     )
 
     if retrieved_context:
+        source_label = "de tus materias" if is_multicourse else "del curso del alumno"
+        multicourse_hint = (
+            "Cuando el fragmento viene de una materia específica, mencionala "
+            '(ej: "en Cálculo I, según apunte.pdf..."). '
+            if is_multicourse
+            else ""
+        )
         return (
             base_instructions
             + "\n\n"
-            + "Tenés acceso a fragmentos del material del curso del alumno. "
+            + f"Tenés acceso a fragmentos del material {source_label}. "
             "Usá esos fragmentos como tu fuente principal de información. "
             "Cuando los uses, citá explícitamente el archivo del que vienen "
             '(ej: "según apunte-derivadas.pdf..."). '
-            "Si la pregunta NO se puede responder con los fragmentos disponibles, "
+            + multicourse_hint
+            + "Si la pregunta NO se puede responder con los fragmentos disponibles, "
             "decilo explícitamente — no inventes."
             + "\n\n--- MATERIAL DEL CURSO ---\n\n"
             + retrieved_context
@@ -149,19 +167,33 @@ async def messages(
     await db.flush()
     await db.commit()
 
-    # ----- BACK-11 + BACK-13: Retrieval RAG -----
+    # ----- BACK-11 + BACK-13: Retrieval RAG (Feature B: multi-curso opcional) -----
     # Si falla (embeddings caídos, cuota agotada, etc.), continúa SIN contexto.
     # El chat sigue siendo útil aunque pierda calidad RAG.
+    is_multicourse = bool(payload.course_ids and len(payload.course_ids) > 1)
+    # Parsear course_names: el payload trae {str(id): nombre}, lo pasamos a {int: str}.
+    course_names_int: dict[int, str] = {}
+    if payload.course_names:
+        for k, v in payload.course_names.items():
+            try:
+                course_names_int[int(k)] = str(v)
+            except (ValueError, TypeError):
+                pass
+
     try:
         retrieved_chunks = await retrieve_context(
             question=payload.question,
             course_id=payload.course_id,
+            course_ids=payload.course_ids,
             db=db,
             embeddings=embeddings,
             top_k=5,
             min_similarity=0.3,
         )
-        context_text = format_context_for_prompt(retrieved_chunks)
+        context_text = format_context_for_prompt(
+            retrieved_chunks,
+            course_names=course_names_int if is_multicourse else None,
+        )
     except Exception as exc:
         import traceback
         print(
@@ -183,7 +215,7 @@ async def messages(
     recent_messages = list(reversed(history_result.scalars().all()))
 
     llm_messages = [
-        {"role": "system", "content": _build_system_prompt(context_text)},
+        {"role": "system", "content": _build_system_prompt(context_text, is_multicourse=is_multicourse)},
     ]
     for message in recent_messages:
         if message.id == user_message.id:
