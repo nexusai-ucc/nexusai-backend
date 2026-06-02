@@ -118,8 +118,11 @@ def _build_system_prompt(retrieved_context: str, is_multicourse: bool = False) -
     if retrieved_context:
         source_label = "de tus materias" if is_multicourse else "del curso del alumno"
         multicourse_hint = (
+            "Estás en modo multi-curso: el alumno consulta material de varias materias a la vez. "
             "Cuando un fragmento venga de una materia específica, mencionala "
-            "indicando el nombre real de la materia tal como aparece en el bloque. "
+            "indicando el nombre real de la materia tal como aparece en el bloque (campo 'materia:'). "
+            "Si la pregunta del alumno es general sobre sus materias (ej: '¿de qué tratan mis cursos?'), "
+            "organizá la respuesta agrupando por materia — un párrafo por cada una usando su nombre real. "
             if is_multicourse
             else ""
         )
@@ -417,13 +420,20 @@ async def messages_stream(
                     }
                     for c in retrieved_chunks
                 ]
+                # En multi-curso, propagamos el mapa course_id → nombre al frontend
+                # para que las pills puedan mostrar de qué materia viene cada fuente.
+                meta_payload = {
+                    "type":       "meta",
+                    "session_id": str(session.id),
+                    "chunks":     len(retrieved_chunks),
+                    "sources":    sources_payload,
+                }
+                if is_multicourse and course_names_int:
+                    meta_payload["course_names"] = {
+                        str(k): v for k, v in course_names_int.items()
+                    }
                 yield (
-                    "data: " + json.dumps({
-                        "type":       "meta",
-                        "session_id": str(session.id),
-                        "chunks":     len(retrieved_chunks),
-                        "sources":    sources_payload,
-                    }, ensure_ascii=False) + "\n\n"
+                    "data: " + json.dumps(meta_payload, ensure_ascii=False) + "\n\n"
                 )
 
                 # Historial.

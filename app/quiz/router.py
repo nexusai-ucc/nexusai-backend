@@ -171,7 +171,14 @@ async def generate_quiz(
     Si el LLM devuelve JSON inválido o falla → 503.
     """
     # 1) Conseguir material para el quiz.
-    if payload.topic and payload.topic.strip():
+    has_topic = bool(payload.topic and payload.topic.strip())
+
+    if has_topic:
+        # Modo dirigido: el alumno pidió un tema específico.
+        # Si el retrieval NO encuentra material razonablemente relevante,
+        # devolvemos 404 — NO caemos a sampling aleatorio porque eso engaña
+        # al alumno (le decimos "quiz sobre derivadas" pero le damos cualquier
+        # cosa indexada del curso).
         try:
             retrieved = await retrieve_context(
                 question=payload.topic,
@@ -179,15 +186,29 @@ async def generate_quiz(
                 db=db,
                 embeddings=embeddings,
                 top_k=10,
-                min_similarity=0.2,
+                min_similarity=0.35,
             )
-            chunks = [(c.document_filename, c.content) for c in retrieved]
-        except Exception:
-            chunks = []
-        # Si embeddings fallaron o no hubo matches, caer al sampling aleatorio.
-        if not chunks:
-            chunks = await _sample_chunks_for_quiz(db, payload.course_id, limit=12)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="No se pudo procesar el tema en este momento. Intentá de nuevo.",
+            ) from exc
+
+        # Umbral de "material suficiente para hacer quiz sobre el tema":
+        # al menos 3 chunks Y max similarity > 0.4.
+        max_sim = max((c.similarity for c in retrieved), default=0.0)
+        if len(retrieved) < 3 or max_sim < 0.4:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=(
+                    f"No encontré material en el curso sobre \"{payload.topic.strip()}\". "
+                    "Probá con otro tema, o dejá el campo vacío para que el quiz cubra "
+                    "varios temas del material disponible."
+                ),
+            )
+        chunks = [(c.document_filename, c.content) for c in retrieved]
     else:
+        # Modo variedad: sampling aleatorio del material del curso.
         chunks = await _sample_chunks_for_quiz(db, payload.course_id, limit=12)
 
     if not chunks:
