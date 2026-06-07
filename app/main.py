@@ -21,8 +21,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 
-from app.db.session import dispose_engine
+from app.db.session import dispose_engine, get_session_factory
 from app.infrastructure.redis_client import close_redis
 from app.shared.config import get_settings
 from app.shared.middleware import RequestIDMiddleware
@@ -35,15 +36,47 @@ logging.basicConfig(
 )
 
 
+logger = logging.getLogger("nexusai.startup")
+
+
+async def _recover_interrupted_documents() -> None:
+    """Marca como 'error' los documentos que quedaron en 'pending' o 'indexing'.
+
+    Las background tasks de indexación se pierden cuando el container se reinicia.
+    Sin esta limpieza, esos registros bloquean re-subidas (collision check) y
+    aparecen como "EN COLA" para siempre en la UI docente.
+    """
+    try:
+        factory = get_session_factory()
+        async with factory() as db:
+            result = await db.execute(
+                text("""
+                    UPDATE documents
+                    SET status        = 'error',
+                        error_message = 'Indexación interrumpida al reiniciar el servidor. Eliminá y volvé a subir el archivo.'
+                    WHERE status IN ('pending', 'indexing')
+                """)
+            )
+            await db.commit()
+            if result.rowcount:
+                logger.info(
+                    "Startup recovery: %d documento(s) con indexación interrumpida → error",
+                    result.rowcount,
+                )
+    except Exception as exc:
+        logger.warning("Startup recovery failed (non-fatal): %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print(f"NexusAI API v{settings.app_version} starting...")
-    print(f"ENV: {settings.env}")
-    print(f"LLM model: {settings.llm_model}")
+    logger.info("NexusAI API v%s starting (%s)", settings.app_version, settings.env)
+    logger.info("LLM model: %s", settings.llm_model)
+
+    await _recover_interrupted_documents()
 
     yield
 
-    print("NexusAI API shutting down...")
+    logger.info("NexusAI API shutting down...")
     await close_redis()
     await dispose_engine()
 

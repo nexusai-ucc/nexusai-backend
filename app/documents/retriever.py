@@ -20,7 +20,8 @@ indexados o de documents en estado 'error'.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
+from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -38,6 +39,7 @@ class RetrievedChunk:
     chunk_index: int
     distance: float  # 0.0 = idéntico semánticamente, 2.0 = opuesto
     course_id: int = 0
+    document_id: Optional[UUID] = None
 
     @property
     def similarity(self) -> float:
@@ -101,6 +103,7 @@ async def retrieve_context(
         select(
             Chunk.content,
             Chunk.chunk_index,
+            Document.id.label("document_id"),
             Document.filename,
             Document.course_id,
             Chunk.embedding.cosine_distance(question_vector).label("distance"),
@@ -124,6 +127,7 @@ async def retrieve_context(
             chunk_index=row.chunk_index,
             distance=float(row.distance),
             course_id=int(row.course_id),
+            document_id=row.document_id,
         )
         for row in rows
     ]
@@ -164,8 +168,7 @@ def format_context_for_prompt(
             course_label = f", materia: {course_names[chunk.course_id]}"
 
         parts.append(
-            f'FRAGMENTO {i} (de "{chunk.document_filename}"{course_label}, '
-            f'chunk #{chunk.chunk_index}):\n{content}'
+            f'[Fuente: "{chunk.document_filename}"{course_label}]\n{content}'
         )
 
     return "\n\n".join(parts)

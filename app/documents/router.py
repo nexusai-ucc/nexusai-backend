@@ -24,13 +24,17 @@ Por qué JSON+base64 y no multipart:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
+import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -41,6 +45,10 @@ from app.db.session import get_db, get_session_factory
 from app.documents.extractor import SUPPORTED_MIME_TYPES
 from app.documents.pipeline import index_document
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
+
+logger = logging.getLogger("nexusai.documents")
+
+UPLOADS_DIR = Path("/app/uploads")
 
 router = APIRouter()
 
@@ -131,13 +139,12 @@ async def _index_document_task(
                 embeddings=embeddings,
             )
         except Exception as exc:
-            import traceback
-            print(
-                f"[NexusAI] Indexing failed for document {document_id}: "
-                f"{type(exc).__name__}: {exc}",
-                flush=True,
+            logger.error(
+                "Indexing failed for document %s",
+                document_id,
+                extra={"error": str(exc), "type": type(exc).__name__},
+                exc_info=True,
             )
-            traceback.print_exc()
 
 
 # ============================================================
@@ -147,7 +154,6 @@ async def _index_document_task(
 @router.post("", response_model=DocumentOut, status_code=status.HTTP_202_ACCEPTED)
 async def upload_document(
     payload: DocumentUploadRequest,
-    background_tasks: BackgroundTasks,
     _body: Annotated[bytes, Depends(verify_hmac)],
     response: Response,
     db: AsyncSession = Depends(get_db),
@@ -250,11 +256,27 @@ async def upload_document(
     await db.commit()
     await db.refresh(document)
 
-    background_tasks.add_task(
-        _index_document_task,
-        document_id=document.id,
-        file_bytes=file_bytes,
-        embeddings=embeddings,
+    # Persist original file bytes so the download endpoint can serve them.
+    # Filename is sanitized to avoid path traversal: only the basename is used.
+    safe_name = Path(payload.filename).name or "file"
+    storage_name = f"{document.id}_{safe_name}"
+    try:
+        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        (UPLOADS_DIR / storage_name).write_bytes(file_bytes)
+        document.storage_path = storage_name
+        await db.commit()
+    except Exception as exc:
+        logger.warning(
+            "Could not save file to disk for document %s: %s",
+            document.id, exc,
+        )
+
+    asyncio.create_task(
+        _index_document_task(
+            document_id=document.id,
+            file_bytes=file_bytes,
+            embeddings=embeddings,
+        )
     )
 
     return DocumentOut.from_orm(document)
@@ -295,6 +317,37 @@ async def list_documents_by_course(
     return [DocumentOut.from_orm(d) for d in documents]
 
 
+@router.get("/{document_id}/download")
+async def download_document(
+    document_id: UUID,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+) -> FileResponse:
+    """Sirve el archivo original de un documento indexado.
+
+    Requiere HMAC — el PHP proxy firma la request antes de reenviarla.
+    El browser abre el PHP proxy en una nueva pestaña; el PHP llama acá.
+    """
+    result = await db.execute(select(Document).where(Document.id == document_id))
+    document = result.scalar_one_or_none()
+    if document is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    if not document.storage_path:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Original file not available for this document",
+        )
+    file_path = UPLOADS_DIR / document.storage_path
+    if not file_path.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found on disk")
+
+    return FileResponse(
+        path=str(file_path),
+        filename=document.filename,
+        media_type=document.mime_type,
+    )
+
+
 @router.delete(
     "/{document_id}",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -313,6 +366,17 @@ async def delete_document(
     document = result.scalar_one_or_none()
     if document is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    # Eliminar el archivo del disco antes de borrar el registro.
+    # Nunca propagar: un fallo de disco no debe bloquear el borrado en DB.
+    try:
+        if document.storage_path:
+            try:
+                (UPLOADS_DIR / document.storage_path).unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("Could not delete file %s: %s", document.storage_path, exc)
+    except Exception:
+        pass
 
     await db.delete(document)
     await db.commit()

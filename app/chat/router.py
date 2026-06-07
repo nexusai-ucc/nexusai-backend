@@ -32,7 +32,7 @@ from app.chat.schemas import ChatRequest, ChatResponse, MessageOut
 from app.db.models import ChatSession, Message
 from app.db.session import get_db, get_session_factory
 from app.documents.retriever import format_context_for_prompt, retrieve_context
-from app.gaps.recorder import record_gap_if_needed
+from app.gaps.recorder import WEAK_MATCH_THRESHOLD, record_gap_if_needed
 from app.infrastructure.redis_client import get_redis
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, StreamToken, StreamUsage, get_llm_provider
@@ -131,9 +131,8 @@ def _build_system_prompt(retrieved_context: str, is_multicourse: bool = False) -
             + "\n\n"
             + f"Tenés acceso a fragmentos del material {source_label}. "
             "Usá esos fragmentos como tu fuente principal de información. "
-            "Cuando uses información de un fragmento, citá el archivo "
-            "exactamente como aparece entre comillas en el bloque del material "
-            "(la línea que dice FRAGMENTO N (de \"...\")). "
+            "Cuando uses información de un fragmento, podés citar el nombre del archivo "
+            "que aparece entre comillas en su encabezado [Fuente: \"...\"]. "
             "NUNCA inventes ni copies nombres de archivo de ejemplos previos. "
             + multicourse_hint
             + "Si la pregunta NO se puede responder con los fragmentos disponibles, "
@@ -399,12 +398,25 @@ async def messages_stream(
                         course_names=course_names_int if is_multicourse else None,
                     )
                 except Exception as exc:
-                    print(f"[NexusAI] Retrieval failed in stream: {exc}", flush=True)
+                    logger.warning(
+                        "Retrieval failed in stream, continuing without context",
+                        extra={"error": str(exc), "type": type(exc).__name__},
+                    )
                     retrieved_chunks = []
                     context_text = ""
 
                 # Memoizamos max similarity para la evaluación de gap post-LLM.
                 max_sim_stream = max((c.similarity for c in retrieved_chunks), default=None)
+
+                # has_relevant_context: True sólo si el retrieval encontró chunks
+                # con similarity suficientemente alta (≥ umbral de gaps). Cuando es
+                # False, el frontend omite la sección "Fuentes:" para no confundir
+                # al alumno con referencias poco relevantes.
+                has_relevant_context = bool(
+                    retrieved_chunks
+                    and max_sim_stream is not None
+                    and max_sim_stream >= WEAK_MATCH_THRESHOLD
+                )
 
                 # Evento meta — el cliente lo usa para saber el session_id sin
                 # esperar al primer token. Incluye los chunks reales (no solo el
@@ -413,6 +425,7 @@ async def messages_stream(
                 sources_payload = [
                     {
                         "document_filename": c.document_filename,
+                        "document_id":       str(c.document_id) if c.document_id else None,
                         "chunk_index":       c.chunk_index,
                         "content":           c.content[:400].strip(),
                         "similarity":        round(c.similarity, 3),
@@ -423,10 +436,11 @@ async def messages_stream(
                 # En multi-curso, propagamos el mapa course_id → nombre al frontend
                 # para que las pills puedan mostrar de qué materia viene cada fuente.
                 meta_payload = {
-                    "type":       "meta",
-                    "session_id": str(session.id),
-                    "chunks":     len(retrieved_chunks),
-                    "sources":    sources_payload,
+                    "type":                 "meta",
+                    "session_id":           str(session.id),
+                    "chunks":               len(retrieved_chunks),
+                    "sources":              sources_payload,
+                    "has_relevant_context": has_relevant_context,
                 }
                 if is_multicourse and course_names_int:
                     meta_payload["course_names"] = {
@@ -483,8 +497,11 @@ async def messages_stream(
                 db.add(assistant_message)
 
                 # Feature G: evaluar gap con señal combinada (retrieval + respuesta LLM).
+                # La señal `grounded` indica si el LLM respondió desde el material
+                # del curso. Se emite en el evento answer_meta para que el frontend
+                # oculte las fuentes cuando la respuesta no está fundamentada.
                 if not is_multicourse:
-                    await record_gap_if_needed(
+                    gap_recorded = await record_gap_if_needed(
                         db,
                         course_id=payload.course_id,
                         user_id=payload.user_id,
@@ -493,6 +510,11 @@ async def messages_stream(
                         max_similarity=max_sim_stream,
                         llm_answer=full_text,
                     )
+                    grounded = not gap_recorded
+                else:
+                    # En multi-curso no se registran gaps; usamos la señal de
+                    # retrieval que ya se calculó para el evento meta.
+                    grounded = has_relevant_context
 
                 await db.commit()
 
@@ -513,6 +535,13 @@ async def messages_stream(
 
                 yield (
                     "data: " + json.dumps({
+                        "type": "answer_meta",
+                        "grounded": grounded,
+                    }) + "\n\n"
+                )
+
+                yield (
+                    "data: " + json.dumps({
                         "type": "done",
                         "prompt_tokens": usage_seen.prompt_tokens if usage_seen else 0,
                         "completion_tokens": usage_seen.completion_tokens if usage_seen else 0,
@@ -521,9 +550,11 @@ async def messages_stream(
                 )
 
             except Exception as exc:
-                import traceback
-                print(f"[NexusAI] Stream failed: {type(exc).__name__}: {exc}", flush=True)
-                traceback.print_exc()
+                logger.error(
+                    "Stream failed",
+                    extra={"error": str(exc), "type": type(exc).__name__},
+                    exc_info=True,
+                )
                 yield (
                     "data: " + json.dumps({
                         "type": "error",

@@ -32,6 +32,7 @@ from app.auth.hmac import verify_hmac
 from app.db.models import Chunk, Document
 from app.db.session import get_db
 from app.documents.retriever import retrieve_context
+from app.gaps.recorder import WEAK_MATCH_THRESHOLD
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
 
@@ -197,13 +198,12 @@ async def generate_quiz(
         # Umbral de "material suficiente para hacer quiz sobre el tema":
         # al menos 3 chunks Y max similarity > 0.4.
         max_sim = max((c.similarity for c in retrieved), default=0.0)
-        if len(retrieved) < 3 or max_sim < 0.4:
+        if max_sim < WEAK_MATCH_THRESHOLD:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=(
-                    f"No encontré material en el curso sobre \"{payload.topic.strip()}\". "
-                    "Probá con otro tema, o dejá el campo vacío para que el quiz cubra "
-                    "varios temas del material disponible."
+                    "No encontré material sobre ese tema en el curso. "
+                    "Probá con un tema que esté en los archivos indexados."
                 ),
             )
         chunks = [(c.document_filename, c.content) for c in retrieved]
