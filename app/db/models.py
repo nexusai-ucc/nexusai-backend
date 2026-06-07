@@ -3,8 +3,8 @@ from datetime import datetime
 from typing import List, Optional
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import Computed, DateTime, Float, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy.dialects.postgresql import TSVECTOR, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.session import Base
@@ -61,6 +61,11 @@ class Chunk(Base):
     token_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     embedding: Mapped[Optional[List[float]]] = mapped_column(
         Vector(get_settings().embedding_dimensions), nullable=True
+    )
+    content_tsv: Mapped[Optional[str]] = mapped_column(
+        TSVECTOR,
+        Computed("to_tsvector('simple', content)", persisted=True),
+        nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

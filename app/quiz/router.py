@@ -20,6 +20,7 @@ Uso del LLM:
 from __future__ import annotations
 
 import json
+import logging
 import random
 from typing import Annotated, List, Optional
 
@@ -35,6 +36,12 @@ from app.documents.retriever import retrieve_context
 from app.gaps.recorder import WEAK_MATCH_THRESHOLD
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
+
+logger = logging.getLogger("nexusai.quiz")
+
+# Minimum cosine similarity for a chunk to count as covering a topic.
+# Higher than WEAK_MATCH_THRESHOLD (0.4) to reject spurious cross-lingual matches.
+QUIZ_TOPIC_MIN_SIMILARITY = 0.5
 
 router = APIRouter()
 
@@ -109,6 +116,8 @@ def _build_quiz_prompt(
         '    }\n'
         '  ]\n'
         '}\n'
+        "O, si el material no contiene suficiente contenido directo sobre el tema:\n"
+        '{"error": "insufficient_content", "detail": "El material del curso no contiene suficiente contenido sobre este tema para generar preguntas."}\n'
     )
 
     rules = (
@@ -137,7 +146,15 @@ def _build_quiz_prompt(
     system = (
         "Sos un generador de quizzes académicos de NexusAI. "
         "Producís preguntas de opción múltiple en español, basadas estrictamente "
-        "en el material académico del curso del alumno. Tu salida es JSON."
+        "en el material académico del curso del alumno. Tu salida es JSON.\n\n"
+        "REGLA CRÍTICA: Solo podés generar preguntas sobre contenido que esté "
+        "explícita y directamente presente en el material entregado.\n"
+        "- NO generes preguntas sobre la ausencia de un tema.\n"
+        "- NO generes preguntas del tipo \"¿Qué información sobre X se puede encontrar?\", "
+        "\"¿Se menciona X en el material?\" o \"¿Dónde se habla de X?\".\n"
+        f"- Si el material no contiene suficiente contenido directo sobre el tema pedido "
+        f"para formar {num_questions} preguntas legítimas, respondé con el objeto de error "
+        "descripto en el formato de salida en lugar del array de preguntas."
     )
 
     user_msg = (
@@ -176,18 +193,16 @@ async def generate_quiz(
 
     if has_topic:
         # Modo dirigido: el alumno pidió un tema específico.
-        # Si el retrieval NO encuentra material razonablemente relevante,
-        # devolvemos 404 — NO caemos a sampling aleatorio porque eso engaña
-        # al alumno (le decimos "quiz sobre derivadas" pero le damos cualquier
-        # cosa indexada del curso).
+        # Validación en dos pasos para evitar falsos positivos por similitud
+        # semántica cruzada (ej. "derivadas" matchea débilmente contra cualquier PDF).
         try:
             retrieved = await retrieve_context(
                 question=payload.topic,
                 course_id=payload.course_id,
                 db=db,
                 embeddings=embeddings,
-                top_k=10,
-                min_similarity=0.35,
+                top_k=5,
+                min_similarity=QUIZ_TOPIC_MIN_SIMILARITY,
             )
         except Exception as exc:
             raise HTTPException(
@@ -195,17 +210,60 @@ async def generate_quiz(
                 detail="No se pudo procesar el tema en este momento. Intentá de nuevo.",
             ) from exc
 
-        # Umbral de "material suficiente para hacer quiz sobre el tema":
-        # al menos 3 chunks Y max similarity > 0.4.
+        # Step 1: rechazo semántico — ningún chunk superó el umbral mínimo.
         max_sim = max((c.similarity for c in retrieved), default=0.0)
-        if max_sim < WEAK_MATCH_THRESHOLD:
+        if max_sim < QUIZ_TOPIC_MIN_SIMILARITY:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=(
                     "No encontré material sobre ese tema en el curso. "
-                    "Probá con un tema que esté en los archivos indexados."
+                    "Intentá con un tema que esté cubierto en los archivos indexados."
                 ),
             )
+
+        # Step 2: verificación LLM — confirma que los chunks realmente cubren el tema.
+        # Previene falsos positivos donde la similitud semántica pasa el umbral
+        # pero el contenido no tiene relación directa con el topic pedido.
+        excerpts = "\n---\n".join(c.content[:200].strip() for c in retrieved)
+        relevance_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an academic content relevance checker. Answer only YES or NO."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Topic: {payload.topic.strip()}\n\n"
+                    f"Course material excerpts:\n{excerpts}\n\n"
+                    f"Is '{payload.topic.strip()}' meaningfully present in this course material — "
+                    "either as a main subject, a key concept explained, or a named entity directly discussed?\n"
+                    "Answer NO only if the topic has no real presence in the excerpts at all.\n"
+                    "Answer only YES or NO."
+                ),
+            },
+        ]
+        try:
+            relevance_result = await llm.chat_completion(
+                relevance_messages,
+                max_tokens=5,
+                temperature=0.0,
+            )
+            answer = relevance_result.text.strip().upper()
+        except Exception as exc:
+            logger.warning("LLM relevance check failed, proceeding with generation: %s", exc)
+            answer = "YES"
+
+        if not answer.startswith("YES"):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"No encontré material sobre '{payload.topic.strip()}' en los archivos del curso. "
+                    "Intentá con un tema que esté cubierto en los archivos indexados."
+                ),
+            )
+
         chunks = [(c.document_filename, c.content) for c in retrieved]
     else:
         # Modo variedad: sampling aleatorio del material del curso.
@@ -226,9 +284,7 @@ async def generate_quiz(
             temperature=0.6,
         )
     except Exception as exc:
-        import traceback
-        print(f"[NexusAI] Quiz LLM call failed: {type(exc).__name__}: {exc}", flush=True)
-        traceback.print_exc()
+        logger.error("Quiz LLM call failed: %s: %s", type(exc).__name__, exc, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="No se pudo generar el quiz en este momento. Intentá de nuevo.",
@@ -244,11 +300,20 @@ async def generate_quiz(
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
-        print(f"[NexusAI] Quiz JSON parse failed. Raw response:\n{raw[:500]}", flush=True)
+        logger.error("Quiz JSON parse failed. Raw response: %.500s", raw)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="El generador devolvió una respuesta inválida. Intentá de nuevo.",
         ) from exc
+
+    if isinstance(parsed, dict) and "error" in parsed:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=parsed.get(
+                "detail",
+                "El material del curso no contiene suficiente contenido sobre este tema para generar preguntas.",
+            ),
+        )
 
     questions_raw = parsed.get("questions") if isinstance(parsed, dict) else None
     if not isinstance(questions_raw, list) or not questions_raw:
