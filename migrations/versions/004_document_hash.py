@@ -1,7 +1,7 @@
 """Add file_hash to documents for incremental indexing — CONT-04
 
 Revision ID: 004_document_hash
-Revises: 004_unanswered_questions
+Revises: 003_message_token_counts
 Create Date: 2026-05-25 00:00:00.000000
 
 Agrega file_hash (SHA-256 del contenido base64 recibido) a la tabla documents.
@@ -19,7 +19,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "004_document_hash"
-down_revision = "004_unanswered_questions"
+down_revision = "003_message_token_counts"
 branch_labels = None
 depends_on = None
 

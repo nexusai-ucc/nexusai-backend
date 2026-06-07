@@ -16,7 +16,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "005_document_storage_path"
-down_revision = ("004_document_hash", "004_unanswered_questions")
+down_revision = "004_document_hash"
 branch_labels = None
 depends_on = None
 

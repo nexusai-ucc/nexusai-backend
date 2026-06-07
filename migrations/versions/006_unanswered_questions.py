@@ -1,7 +1,7 @@
 """Add unanswered_questions table — Feature G (gaps detection)
 
-Revision ID: 004_unanswered_questions
-Revises: 003_message_token_counts
+Revision ID: 006_unanswered_questions
+Revises: 005_document_storage_path
 Create Date: 2026-05-28 19:00:00.000000
 
 Tabla que registra preguntas del alumno que el material del curso no pudo
@@ -16,8 +16,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision = "004_unanswered_questions"
-down_revision = "003_message_token_counts"
+revision = "006_unanswered_questions"
+down_revision = "005_document_storage_path"
 branch_labels = None
 depends_on = None
 
