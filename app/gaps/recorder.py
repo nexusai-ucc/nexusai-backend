@@ -47,9 +47,16 @@ LLM_NO_ANSWER_PATTERNS = re.compile(
     r"|fuera\s+del\s+alcance\s+del\s+material"
     r"|el\s+material\s+(del\s+curso\s+)?no\s+(lo\s+)?cubre"
     r"|the\s+(course\s+)?material\s+does\s+not\s+(cover|contain|mention)"
-    r"|i\s+don['’]?t\s+have\s+(that\s+)?information"
+    r"|i\s+don[‘’]?t\s+have\s+(that\s+)?information"
     r"|i\s+cannot\s+answer"
     r"|not\s+(found|covered)\s+in\s+the\s+material"
+    # Respuestas de meta-guard (capability probing / prompt injection)
+    r"|solo\s+puedo\s+ayudarte\s+con\s+consultas\s+sobre\s+el\s+material"
+    r"|only\s+(help|assist)\s+you\s+with\s+(questions|queries)\s+about.*?(course\s+)?material"
+    # Variantes adicionales de "no está en el material"
+    r"|no\s+est[aá]\s+disponible\s+en\s+el\s+material"
+    r"|no\s+forma\s+parte\s+del\s+material"
+    r"|no\s+est[aá]\s+cubierta?\s+en\s+(el|los)\s+(material|fragmento|apunte)"
     r")",
     re.IGNORECASE,
 )
