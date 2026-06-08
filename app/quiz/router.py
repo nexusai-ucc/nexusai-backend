@@ -55,6 +55,7 @@ class QuizRequest(BaseModel):
     user_id: int = Field(gt=0)
     topic: Optional[str] = Field(default=None, max_length=200)
     num_questions: int = Field(default=5, ge=1, le=10)
+    course_ids: Optional[List[int]] = Field(default=None)
 
 
 class QuizQuestion(BaseModel):
@@ -79,16 +80,18 @@ async def _sample_chunks_for_quiz(
     db: AsyncSession,
     course_id: int,
     limit: int = 12,
+    course_ids: list[int] | None = None,
 ) -> list[tuple[str, str]]:
-    """Devuelve [(filename, content)] de chunks aleatorios indexed del curso.
+    """Devuelve [(filename, content)] de chunks aleatorios indexed del/los curso/s.
 
     No usa embeddings — random sample. Útil cuando el alumno NO especifica
     topic y queremos variedad de temas en el quiz.
     """
+    ids = [i for i in (course_ids or [course_id]) if i > 0] or [course_id]
     stmt = (
         select(Document.filename, Chunk.content)
         .join(Document, Chunk.document_id == Document.id)
-        .where(Document.course_id == course_id)
+        .where(Document.course_id.in_(ids))
         .where(Document.status == "indexed")
         .order_by(func.random())
         .limit(limit)
@@ -191,6 +194,11 @@ async def generate_quiz(
     # 1) Conseguir material para el quiz.
     has_topic = bool(payload.topic and payload.topic.strip())
 
+    # Resolver qué cursos usar (multi-curso si viene course_ids).
+    effective_course_ids: list[int] | None = None
+    if payload.course_ids:
+        effective_course_ids = [i for i in payload.course_ids if i > 0] or None
+
     if has_topic:
         # Modo dirigido: el alumno pidió un tema específico.
         # Validación en dos pasos para evitar falsos positivos por similitud
@@ -203,6 +211,7 @@ async def generate_quiz(
                 embeddings=embeddings,
                 top_k=5,
                 min_similarity=QUIZ_TOPIC_MIN_SIMILARITY,
+                course_ids=effective_course_ids,
             )
         except Exception as exc:
             raise HTTPException(
@@ -266,8 +275,8 @@ async def generate_quiz(
 
         chunks = [(c.document_filename, c.content) for c in retrieved]
     else:
-        # Modo variedad: sampling aleatorio del material del curso.
-        chunks = await _sample_chunks_for_quiz(db, payload.course_id, limit=12)
+        # Modo variedad: sampling aleatorio del material del/los curso/s.
+        chunks = await _sample_chunks_for_quiz(db, payload.course_id, limit=12, course_ids=effective_course_ids)
 
     if not chunks:
         raise HTTPException(

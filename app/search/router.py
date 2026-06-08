@@ -35,6 +35,7 @@ _HYBRID_SQL = text("""
         c.chunk_index,
         d.filename        AS document_filename,
         d.course_id,
+        (d.storage_path IS NOT NULL AND d.storage_path != '') AS has_file,
         1 - (c.embedding <=> CAST(:query_embedding AS vector))                          AS semantic_score,
         COALESCE(ts_rank(c.content_tsv, plainto_tsquery('simple', :query_text)), 0)    AS lexical_score,
         (
@@ -72,6 +73,7 @@ class SearchResult(BaseModel):
     chunk_index: int
     content: str
     similarity: float
+    has_file: bool = False
 
 
 class SearchResponse(BaseModel):
@@ -132,6 +134,7 @@ async def search(
             chunk_index=row.chunk_index,
             content=row.content[:400].strip(),
             similarity=round(float(row.combined_score), 3),
+            has_file=bool(row.has_file),
         )
         for row in deduped
     ]
