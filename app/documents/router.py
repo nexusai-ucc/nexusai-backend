@@ -271,6 +271,9 @@ async def upload_document(
             document.id, exc,
         )
 
+    await db.refresh(document)
+    doc_data = DocumentOut.from_orm(document)
+
     asyncio.create_task(
         _index_document_task(
             document_id=document.id,
@@ -279,7 +282,7 @@ async def upload_document(
         )
     )
 
-    return DocumentOut.from_orm(document)
+    return doc_data
 
 
 @router.get("/{document_id}", response_model=DocumentOut)
