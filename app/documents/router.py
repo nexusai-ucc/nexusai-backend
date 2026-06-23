@@ -60,10 +60,16 @@ router = APIRouter()
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
 
 # Magic bytes por mime type. None = sin verificación (ej. text/plain).
+# PPTX y XLSX son ZIP igual que DOCX, así que comparten la firma "PK".
 _MAGIC_BYTES: dict[str, bytes | None] = {
     "application/pdf": b"%PDF-",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": b"PK",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": b"PK",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": b"PK",
     "text/plain": None,
+    "text/csv": None,
+    "text/markdown": None,
+    "text/html": None,
 }
 
 
@@ -162,7 +168,7 @@ async def upload_document(
     """
     Sube un documento y dispara la indexación en background.
 
-    Tipos aceptados: PDF, DOCX, TXT (máx 20 MB).
+    Tipos aceptados: PDF, DOCX, TXT, PPTX, XLSX, CSV, MD, HTML (máx 20 MB).
     Devuelve 202 Accepted con el document_id para polling.
     Si el mismo archivo ya está indexado (mismo course_id + filename + hash),
     devuelve 200 con el documento existente sin re-indexar (CONT-04).
