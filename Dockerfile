@@ -54,9 +54,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH"
 
 # Solo lo mínimo para runtime: libpq (cliente Postgres) + curl para healthcheck.
+# tesseract-ocr (+ paquete de idioma español) y poppler-utils habilitan el
+# fallback de OCR para PDFs escaneados y slides PPTX que son solo imagen.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libpq5 \
         curl \
+        tesseract-ocr \
+        tesseract-ocr-spa \
+        poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Copiar la venv ya construida (sin headers ni gcc, pesa mucho menos).
