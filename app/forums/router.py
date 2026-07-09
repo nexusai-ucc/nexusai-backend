@@ -17,12 +17,20 @@ Endpoints:
     en el mismo curso que sean semánticamente similares.
     Usado por el frontend para avisar al alumno antes de publicar.
 
+  POST /api/v1/forums/summarize-thread
+    Recibe los posts de una discusión (enviados por PHP desde Moodle DB) y
+    devuelve un resumen estructurado generado por el LLM. No usa pgvector —
+    es generación pura a partir del texto del hilo. Detecta si la pregunta
+    original fue resuelta en el hilo.
+
 Todos los endpoints llevan verify_hmac — contrato de seguridad invariante.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json as _json
+import re as _re
 import uuid
 from typing import Annotated, List, Optional
 
@@ -35,6 +43,7 @@ from app.auth.hmac import verify_hmac
 from app.db.models import ForumPostEmbedding
 from app.db.session import get_db
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
+from app.providers.llm import LLMProvider, get_llm_provider
 from app.shared.config import get_settings
 
 router = APIRouter()
@@ -231,4 +240,140 @@ async def similar_posts(
     return SimilarPostsResponse(
         similar_posts=similar,
         threshold_used=payload.threshold,
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# F-04 — Schemas
+# ─────────────────────────────────────────────────────────────
+
+# Máximo de posts que se incluyen en el prompt del LLM.
+# Los que exceden se truncan para no superar el context window.
+_MAX_POSTS_IN_PROMPT = 30
+# Máximo de caracteres por post incluido en el prompt.
+_MAX_CHARS_PER_POST = 1_000
+
+
+class ThreadPost(BaseModel):
+    post_id: int = Field(gt=0)
+    author: str = Field(max_length=200)
+    content: str = Field(min_length=1, max_length=10_000)
+
+
+class SummarizeThreadRequest(BaseModel):
+    discussion_id: int = Field(gt=0)
+    course_id: int = Field(gt=0)
+    posts: List[ThreadPost] = Field(min_length=1, max_length=50)
+
+
+class SummarizeThreadResponse(BaseModel):
+    summary: str
+    key_points: List[str]
+    resolved: bool
+    posts_used: int
+    posts_truncated: bool
+
+
+# ─────────────────────────────────────────────────────────────
+# F-04 — Helpers
+# ─────────────────────────────────────────────────────────────
+
+def _build_summarize_prompt(posts: List[ThreadPost]) -> tuple[str, int, bool]:
+    """Construye el bloque de texto del hilo para el prompt del LLM.
+
+    Trunca a _MAX_POSTS_IN_PROMPT posts y a _MAX_CHARS_PER_POST chars por post
+    para no superar el context window del LLM. Devuelve (texto, posts_usados, truncado).
+    """
+    selected = posts[:_MAX_POSTS_IN_PROMPT]
+    truncated = len(posts) > _MAX_POSTS_IN_PROMPT
+
+    lines: list[str] = []
+    for i, p in enumerate(selected, 1):
+        content = p.content[:_MAX_CHARS_PER_POST]
+        if len(p.content) > _MAX_CHARS_PER_POST:
+            content += "…"
+            truncated = True
+        lines.append(f"[Post {i} — {p.author}]\n{content}")
+
+    return "\n\n".join(lines), len(selected), truncated
+
+
+_SUMMARIZE_SYSTEM = """\
+Sos un asistente académico que resume discusiones de foro universitario.
+Respondé siempre en el mismo idioma que los posts del hilo (español o inglés).
+Sé conciso y objetivo — no agregues información que no esté en los posts.
+"""
+
+_SUMMARIZE_USER_TMPL = """\
+Resumí el siguiente hilo de foro académico.
+
+HILO:
+{thread_text}
+
+Respondé con un JSON válido con exactamente estas claves (sin texto antes ni después):
+{{
+  "summary": "<resumen del hilo en 2-4 oraciones>",
+  "key_points": ["<punto clave 1>", "<punto clave 2>"],
+  "resolved": <true si la pregunta principal quedó respondida, false si no>
+}}
+"""
+
+
+# ─────────────────────────────────────────────────────────────
+# F-04 — Endpoint
+# ─────────────────────────────────────────────────────────────
+
+@router.post("/summarize-thread", response_model=SummarizeThreadResponse)
+async def summarize_thread(
+    payload: SummarizeThreadRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    llm: LLMProvider = Depends(get_llm_provider),
+) -> SummarizeThreadResponse:
+    """Resume un hilo de foro usando el LLM.
+
+    PHP envía los posts ya leídos desde Moodle DB. El endpoint construye
+    un prompt estructurado, llama al LLM y parsea la respuesta JSON.
+    No escribe en DB ni usa pgvector — es stateless.
+    """
+    thread_text, posts_used, posts_truncated = _build_summarize_prompt(payload.posts)
+
+    messages = [
+        {"role": "system", "content": _SUMMARIZE_SYSTEM},
+        {"role": "user",   "content": _SUMMARIZE_USER_TMPL.format(thread_text=thread_text)},
+    ]
+
+    try:
+        result = await llm.chat_completion(messages)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="El LLM no está disponible temporalmente",
+        ) from exc
+
+    # El LLM devuelve JSON puro según el prompt. Lo parseamos con tolerancia:
+    # si falla el parse, devolvemos el texto crudo como summary.
+    raw = result.text.strip()
+    # Extraer bloque JSON aunque el LLM añada markdown (```json ... ```)
+    json_match = _re.search(r'\{.*\}', raw, _re.DOTALL)
+    parsed: dict = {}
+    if json_match:
+        try:
+            parsed = _json.loads(json_match.group())
+        except _json.JSONDecodeError:
+            pass
+
+    summary    = str(parsed.get("summary",    raw))
+    key_points = parsed.get("key_points", [])
+    resolved   = bool(parsed.get("resolved",  False))
+
+    if not isinstance(key_points, list):
+        key_points = []
+    key_points = [str(kp) for kp in key_points if kp]
+
+    return SummarizeThreadResponse(
+        summary=summary,
+        key_points=key_points,
+        resolved=resolved,
+        posts_used=posts_used,
+        posts_truncated=posts_truncated,
     )
