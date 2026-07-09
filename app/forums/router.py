@@ -28,7 +28,7 @@ from typing import Annotated, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Path, status
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.hmac import verify_hmac
@@ -93,10 +93,6 @@ class SimilarPostsResponse(BaseModel):
 
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def _embedding_to_pg_literal(vector: List[float]) -> str:
-    return "[" + ",".join(str(x) for x in vector) + "]"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -192,35 +188,29 @@ async def similar_posts(
             detail="No se pudo vectorizar la consulta",
         ) from exc
 
-    embedding_literal = _embedding_to_pg_literal(vector)
+    # Usar SQLAlchemy ORM con pgvector (igual que retrieve_context) para evitar
+    # problemas de tipos con asyncpg al pasar embeddings como raw SQL params.
+    distance_expr = ForumPostEmbedding.embedding.cosine_distance(vector)
+    similarity_expr = (1 - distance_expr).label("similarity")
 
-    sql = text("""
-        SELECT
-            fpe.forum_post_id,
-            fpe.discussion_id,
-            fpe.content,
-            1 - (fpe.embedding <=> CAST(:query_embedding AS vector)) AS similarity
-        FROM forum_post_embeddings fpe
-        WHERE
-            fpe.course_id = :course_id
-            AND fpe.embedding IS NOT NULL
-            AND (:exclude_post_id IS NULL OR fpe.forum_post_id != :exclude_post_id)
-            AND 1 - (fpe.embedding <=> CAST(:query_embedding AS vector)) >= :threshold
-        ORDER BY fpe.embedding <=> CAST(:query_embedding AS vector)
-        LIMIT :top_k
-    """)
+    stmt = (
+        select(
+            ForumPostEmbedding.forum_post_id,
+            ForumPostEmbedding.discussion_id,
+            ForumPostEmbedding.content,
+            similarity_expr,
+        )
+        .where(ForumPostEmbedding.course_id == payload.course_id)
+        .where(ForumPostEmbedding.embedding.is_not(None))
+        .where((1 - distance_expr) >= payload.threshold)
+        .order_by(distance_expr)
+        .limit(payload.top_k)
+    )
+    if payload.exclude_post_id is not None:
+        stmt = stmt.where(ForumPostEmbedding.forum_post_id != payload.exclude_post_id)
 
     try:
-        result = await db.execute(
-            sql,
-            {
-                "query_embedding": embedding_literal,
-                "course_id": payload.course_id,
-                "exclude_post_id": payload.exclude_post_id,
-                "threshold": payload.threshold,
-                "top_k": payload.top_k,
-            },
-        )
+        result = await db.execute(stmt)
         rows = result.all()
     except Exception as exc:
         raise HTTPException(
