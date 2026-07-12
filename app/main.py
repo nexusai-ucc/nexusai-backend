@@ -111,6 +111,7 @@ if settings.env == "development":
 # ============================================================
 
 from app.admin.router import router as admin_router          # noqa: E402
+from app.analytics.router import router as analytics_router  # noqa: E402
 from app.chat.router import router as chat_router            # noqa: E402
 from app.courses.router import router as courses_router      # noqa: E402
 from app.documents.router import router as documents_router  # noqa: E402
@@ -119,6 +120,7 @@ from app.gaps.router import router as gaps_router            # noqa: E402
 from app.quiz.router import router as quiz_router            # noqa: E402
 from app.search.router import router as search_router        # noqa: E402
 
+app.include_router(analytics_router, prefix="/api/v1/analytics", tags=["analytics"])
 app.include_router(chat_router,      prefix="/api/v1/chat",      tags=["chat"])
 app.include_router(documents_router, prefix="/api/v1/documents", tags=["documents"])
 app.include_router(admin_router,     prefix="/api/v1/admin",     tags=["admin"])
