@@ -390,7 +390,7 @@ async def summarize_thread(
 # F-05 — Schemas
 # ─────────────────────────────────────────────────────────────
 
-_MAX_CONTEXT_CHUNKS = 4
+_MAX_CONTEXT_CHUNKS = 8
 _MAX_CHARS_QUESTION = 2_000
 
 
@@ -483,7 +483,7 @@ async def suggest_reply(
     # 3. Formatear el material del curso (si lo hay).
     material_section = ""
     if chunks:
-        context_str = format_context_for_prompt(chunks)
+        context_str = format_context_for_prompt(chunks, max_chars_per_chunk=1600)
         material_section = _MATERIAL_SECTION_TMPL.format(context=context_str)
 
     messages = [
