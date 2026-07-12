@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,6 +22,7 @@ async def log_interaction(
     *,
     course_id: int,
     user_id: int,
+    user_message_id: uuid.UUID | None,
     question: str,
     answer: str,
     chunks_retrieved: int,
@@ -40,6 +42,7 @@ async def log_interaction(
         log = InteractionLog(
             course_id=course_id,
             user_id_hash=_hash_user_id(user_id),
+            user_message_id=user_message_id,
             question_char_count=len(question),
             answer_char_count=len(answer),
             chunks_retrieved=chunks_retrieved,

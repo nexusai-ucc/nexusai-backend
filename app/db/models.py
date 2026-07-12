@@ -166,6 +166,9 @@ class InteractionLog(Base):
     )
     course_id: Mapped[int] = mapped_column(Integer, nullable=False)
     user_id_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_message_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("messages.id", ondelete="SET NULL"), nullable=True
+    )
     question_char_count: Mapped[int] = mapped_column(Integer, nullable=False)
     answer_char_count: Mapped[int] = mapped_column(Integer, nullable=False)
     chunks_retrieved: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
