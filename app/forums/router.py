@@ -23,6 +23,12 @@ Endpoints:
     es generación pura a partir del texto del hilo. Detecta si la pregunta
     original fue resuelta en el hilo.
 
+  POST /api/v1/forums/suggest-reply
+    Recibe el hilo completo + el post específico al que se responde y genera
+    una sugerencia de respuesta con RAG: primero recupera chunks relevantes
+    del material del curso (pgvector), luego el LLM sintetiza la respuesta
+    combinando el contexto del hilo con el material académico.
+
 Todos los endpoints llevan verify_hmac — contrato de seguridad invariante.
 """
 
@@ -42,6 +48,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.hmac import verify_hmac
 from app.db.models import ForumPostEmbedding
 from app.db.session import get_db
+from app.documents.retriever import format_context_for_prompt, retrieve_context
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
 from app.shared.config import get_settings
@@ -376,4 +383,131 @@ async def summarize_thread(
         resolved=resolved,
         posts_used=posts_used,
         posts_truncated=posts_truncated,
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# F-05 — Schemas
+# ─────────────────────────────────────────────────────────────
+
+_MAX_CONTEXT_CHUNKS = 4
+_MAX_CHARS_QUESTION = 2_000
+
+
+class SuggestReplyRequest(BaseModel):
+    discussion_id: int = Field(gt=0)
+    course_id: int = Field(gt=0)
+    posts: List[ThreadPost] = Field(min_length=1, max_length=50)
+    question: str = Field(
+        min_length=1,
+        max_length=_MAX_CHARS_QUESTION,
+        description="Texto del post al que se responde (para RAG y contexto del LLM)",
+    )
+
+
+class SuggestReplyResponse(BaseModel):
+    suggested_reply: str
+    has_course_material: bool
+    sources_used: int
+
+
+# ─────────────────────────────────────────────────────────────
+# F-05 — Prompts
+# ─────────────────────────────────────────────────────────────
+
+_SUGGEST_SYSTEM = """\
+Sos un asistente académico que ayuda a responder preguntas en foros universitarios.
+Generá una respuesta clara y útil basándote en el contexto del hilo y, si se provee,
+en el material del curso. Respondé en el mismo idioma que la pregunta (español o inglés).
+No inventes información que no esté en el hilo o en el material del curso.
+Si usás información del material, citá el nombre del archivo entre paréntesis.
+"""
+
+_SUGGEST_USER_TMPL = """\
+Tengo que responder a este mensaje en un foro académico:
+
+MENSAJE A RESPONDER:
+{question}
+
+CONTEXTO DEL HILO (cronológico, para entender la discusión):
+{thread_text}
+{material_section}
+Escribí una respuesta útil y concisa para ese mensaje.
+Devolvé solo el texto de la respuesta, sin JSON ni encabezados."""
+
+_MATERIAL_SECTION_TMPL = """\
+
+MATERIAL DEL CURSO (fragmentos relevantes recuperados por búsqueda semántica):
+{context}
+"""
+
+
+# ─────────────────────────────────────────────────────────────
+# F-05 — Endpoint
+# ─────────────────────────────────────────────────────────────
+
+@router.post("/suggest-reply", response_model=SuggestReplyResponse)
+async def suggest_reply(
+    payload: SuggestReplyRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+    embeddings: EmbeddingProvider = Depends(get_embedding_provider),
+    llm: LLMProvider = Depends(get_llm_provider),
+) -> SuggestReplyResponse:
+    """Genera una sugerencia de respuesta para un post de foro usando RAG + LLM.
+
+    Flujo:
+      1. Recupera chunks del material del curso relevantes a la pregunta (pgvector).
+      2. Construye el prompt con el hilo + material recuperado.
+      3. El LLM genera la respuesta sugerida.
+    """
+    # 1. RAG: buscar material del curso relevante a la pregunta.
+    try:
+        chunks = await retrieve_context(
+            question=payload.question,
+            course_id=payload.course_id,
+            db=db,
+            embeddings=embeddings,
+            top_k=_MAX_CONTEXT_CHUNKS,
+            min_similarity=0.35,
+        )
+    except Exception:
+        chunks = []
+
+    has_material = bool(chunks)
+    sources_used = len(chunks)
+
+    # 2. Formatear el contexto del hilo.
+    thread_text, _, _ = _build_summarize_prompt(payload.posts)
+
+    # 3. Formatear el material del curso (si lo hay).
+    material_section = ""
+    if chunks:
+        context_str = format_context_for_prompt(chunks)
+        material_section = _MATERIAL_SECTION_TMPL.format(context=context_str)
+
+    messages = [
+        {"role": "system", "content": _SUGGEST_SYSTEM},
+        {
+            "role": "user",
+            "content": _SUGGEST_USER_TMPL.format(
+                question=payload.question[:_MAX_CHARS_QUESTION],
+                thread_text=thread_text,
+                material_section=material_section,
+            ),
+        },
+    ]
+
+    try:
+        result = await llm.chat_completion(messages)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="El LLM no está disponible temporalmente",
+        ) from exc
+
+    return SuggestReplyResponse(
+        suggested_reply=result.text.strip(),
+        has_course_material=has_material,
+        sources_used=sources_used,
     )
