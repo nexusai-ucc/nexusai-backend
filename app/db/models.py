@@ -1,10 +1,10 @@
 import uuid
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import Computed, DateTime, Float, ForeignKey, Index, Integer, String, Text, func
-from sqlalchemy.dialects.postgresql import TSVECTOR, UUID
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.session import Base
@@ -144,6 +144,42 @@ class UnansweredQuestion(Base):
     max_similarity: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     # Cantidad de chunks que se llegaron a recuperar (0 = nada matcheó).
     chunks_retrieved: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class QuizError(Base):
+    """Pregunta de quiz que el alumno respondió mal (SP-10 — repaso basado en errores).
+
+    Antes esto vivía solo en localStorage del navegador (efímero, no
+    cross-device, se perdía al superar el tope de 100). Persistir server-side
+    habilita historial real y agregación por tema para sugerir qué repasar.
+    """
+    __tablename__ = "quiz_errors"
+    __table_args__ = (
+        Index("ix_quiz_errors_user_id_course_id_created_at", "user_id", "course_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    course_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    question_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    explanation: Mapped[str] = mapped_column(Text, nullable=False)
+    source_filename: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # Texto suelto, no FK: el pipeline de quiz/generate ya arrastra un bug de
+    # tipos (UUID de Document.id tratado como int en el schema de respuesta),
+    # así que este valor no es confiable para joins — solo se guarda best-effort.
+    source_document_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    options: Mapped[Optional[List[Any]]] = mapped_column(JSONB, nullable=True)
+    correct_index: Mapped[int] = mapped_column(Integer, nullable=False, default=-1)
+    user_selected_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    user_answer: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    ai_feedback: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    ai_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

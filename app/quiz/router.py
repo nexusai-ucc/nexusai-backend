@@ -26,15 +26,16 @@ from __future__ import annotations
 import json
 import logging
 import random
-from typing import Annotated, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Annotated, Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, ValidationError, field_validator
-from sqlalchemy import func, select
+from sqlalchemy import delete, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.hmac import verify_hmac
-from app.db.models import Chunk, Document
+from app.db.models import Chunk, Document, QuizError
 from app.db.session import get_db
 from app.documents.retriever import retrieve_context
 from app.gaps.recorder import WEAK_MATCH_THRESHOLD
@@ -78,7 +79,7 @@ class QuizQuestion(BaseModel):
     correct_index: int = Field(default=-1, ge=-1, le=3)  # -1 for open questions
     explanation: str = Field(min_length=1, max_length=1500)
     source_filename: str = Field(default="")
-    source_document_id: Optional[int] = Field(default=None)  # filled after generation
+    source_document_id: Optional[str] = Field(default=None)  # filled after generation; Document.id is a UUID
 
 
 class QuizResponse(BaseModel):
@@ -99,6 +100,80 @@ class EvaluateResponse(BaseModel):
     correct: bool
     score: float
     feedback: str
+
+
+class QuizErrorItem(BaseModel):
+    """Una pregunta que el alumno respondió mal, tal como la arma QuizPanel."""
+    question_type: str = Field(default="multiple_choice", max_length=20)
+    question: str = Field(min_length=1, max_length=1000)
+    explanation: str = Field(default="", max_length=3000)
+    source_filename: Optional[str] = Field(default=None, max_length=255)
+    # No es un UUID confiable — ver comentario en app/db/models.py::QuizError.
+    source_document_id: Optional[str] = Field(default=None, max_length=64)
+    options: List[str] = Field(default=[])
+    correct_index: int = Field(default=-1, ge=-1, le=3)
+    user_selected_index: Optional[int] = Field(default=None, ge=0, le=3)
+    user_answer: Optional[str] = Field(default=None, max_length=3000)
+    ai_feedback: Optional[str] = Field(default=None, max_length=3000)
+    ai_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
+
+class RecordErrorsRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    user_id: int = Field(gt=0)
+    errors: List[QuizErrorItem] = Field(min_length=1, max_length=10)
+
+
+class RecordErrorsResponse(BaseModel):
+    stored: int
+
+
+class ErrorsListRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    user_id: int = Field(gt=0)
+    days: int = Field(default=90, ge=1, le=365)
+    limit: int = Field(default=100, ge=1, le=200)
+
+
+class StoredQuizError(QuizErrorItem):
+    id: str
+    created_at: datetime
+
+
+class ErrorsListResponse(BaseModel):
+    course_id: int
+    total: int
+    items: List[StoredQuizError]
+
+
+class ClearErrorsRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    user_id: int = Field(gt=0)
+
+
+class ClearErrorsResponse(BaseModel):
+    deleted: int
+
+
+class ReviewSuggestionsRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    user_id: int = Field(gt=0)
+    days: int = Field(default=90, ge=1, le=365)
+
+
+class ReviewSuggestion(BaseModel):
+    source_filename: Optional[str] = None
+    source_document_id: Optional[str] = None
+    error_count: int
+    last_error_at: datetime
+    topic: str
+    suggestion: str
+
+
+class ReviewSuggestionsResponse(BaseModel):
+    course_id: int
+    total_errors: int
+    suggestions: List[ReviewSuggestion]
 
 
 # ============================================================
@@ -480,7 +555,7 @@ async def generate_quiz(
             )
         )
         doc_rows = await db.execute(doc_stmt)
-        doc_id_map: dict[str, int] = {row.filename: row.id for row in doc_rows.all()}
+        doc_id_map: dict[str, str] = {row.filename: str(row.id) for row in doc_rows.all()}
         for q in questions:
             if q.source_filename and q.source_filename in doc_id_map:
                 q.source_document_id = doc_id_map[q.source_filename]
@@ -558,3 +633,232 @@ async def evaluate_open_answer(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="No se pudo procesar la evaluación. Intentá de nuevo.",
         ) from exc
+
+
+# ============================================================
+# Repaso de errores — SP-10
+# ============================================================
+
+@router.post("/errors", response_model=RecordErrorsResponse)
+async def record_quiz_errors(
+    payload: RecordErrorsRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+) -> RecordErrorsResponse:
+    """Persiste las preguntas que el alumno respondió mal en un quiz (SP-10).
+
+    Reemplaza el localStorage efímero que usaba antes el frontend: el
+    historial de errores ahora vive en Postgres, por usuario+curso, y
+    sobrevive entre dispositivos/sesiones.
+    """
+    rows = [
+        QuizError(
+            course_id=payload.course_id,
+            user_id=payload.user_id,
+            question_type=e.question_type,
+            question=e.question,
+            explanation=e.explanation,
+            source_filename=e.source_filename,
+            source_document_id=e.source_document_id,
+            options=e.options,
+            correct_index=e.correct_index,
+            user_selected_index=e.user_selected_index,
+            user_answer=e.user_answer,
+            ai_feedback=e.ai_feedback,
+            ai_score=e.ai_score,
+        )
+        for e in payload.errors
+    ]
+    db.add_all(rows)
+    await db.commit()
+    return RecordErrorsResponse(stored=len(rows))
+
+
+@router.post("/errors/list", response_model=ErrorsListResponse)
+async def list_quiz_errors(
+    payload: ErrorsListRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+) -> ErrorsListResponse:
+    """Historial de errores del alumno en un curso, más recientes primero."""
+    since = datetime.now(timezone.utc) - timedelta(days=payload.days)
+
+    stmt = (
+        select(QuizError)
+        .where(QuizError.course_id == payload.course_id)
+        .where(QuizError.user_id == payload.user_id)
+        .where(QuizError.created_at >= since)
+        .order_by(desc(QuizError.created_at))
+        .limit(payload.limit)
+    )
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+
+    items = [
+        StoredQuizError(
+            id=str(r.id),
+            created_at=r.created_at,
+            question_type=r.question_type,
+            question=r.question,
+            explanation=r.explanation,
+            source_filename=r.source_filename,
+            source_document_id=r.source_document_id,
+            options=r.options or [],
+            correct_index=r.correct_index,
+            user_selected_index=r.user_selected_index,
+            user_answer=r.user_answer,
+            ai_feedback=r.ai_feedback,
+            ai_score=r.ai_score,
+        )
+        for r in rows
+    ]
+    return ErrorsListResponse(course_id=payload.course_id, total=len(items), items=items)
+
+
+@router.post("/errors/clear", response_model=ClearErrorsResponse)
+async def clear_quiz_errors(
+    payload: ClearErrorsRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+) -> ClearErrorsResponse:
+    """Borra todo el historial de errores del alumno en un curso."""
+    stmt = delete(QuizError).where(
+        QuizError.course_id == payload.course_id,
+        QuizError.user_id == payload.user_id,
+    )
+    result = await db.execute(stmt)
+    await db.commit()
+    return ClearErrorsResponse(deleted=result.rowcount or 0)
+
+
+@router.post("/review-suggestions", response_model=ReviewSuggestionsResponse)
+async def review_suggestions(
+    payload: ReviewSuggestionsRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+    llm: LLMProvider = Depends(get_llm_provider),
+) -> ReviewSuggestionsResponse:
+    """Analiza el historial de errores del alumno y sugiere qué repasar (SP-10).
+
+    No hay taxonomía de temas en el schema, así que se usa `source_filename`
+    como proxy de tema: se agrupan los errores recientes por archivo fuente,
+    se toman los grupos más frecuentes, y se le pide al LLM una síntesis
+    accionable por grupo. El conteo y el orden se calculan acá — nunca se
+    confía en lo que devuelva el LLM para eso.
+    """
+    since = datetime.now(timezone.utc) - timedelta(days=payload.days)
+
+    stmt = (
+        select(QuizError)
+        .where(QuizError.course_id == payload.course_id)
+        .where(QuizError.user_id == payload.user_id)
+        .where(QuizError.created_at >= since)
+        .order_by(desc(QuizError.created_at))
+        .limit(300)
+    )
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+
+    if not rows:
+        return ReviewSuggestionsResponse(course_id=payload.course_id, total_errors=0, suggestions=[])
+
+    # Agrupar por archivo fuente (fallback a "material general" si no hay filename).
+    groups: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        key = r.source_filename or "__general__"
+        g = groups.setdefault(key, {
+            "filename": r.source_filename,
+            "document_id": r.source_document_id,
+            "count": 0,
+            "last_at": r.created_at,
+            "samples": [],
+        })
+        g["count"] += 1
+        if r.created_at > g["last_at"]:
+            g["last_at"] = r.created_at
+        if not g["document_id"] and r.source_document_id:
+            g["document_id"] = r.source_document_id
+        if len(g["samples"]) < 3:
+            g["samples"].append({"question": r.question, "explanation": r.explanation})
+
+    top_groups = sorted(groups.values(), key=lambda g: g["count"], reverse=True)[:5]
+
+    prompt_blocks = []
+    for i, g in enumerate(top_groups):
+        label = g["filename"] or "Material general del curso"
+        samples_text = "\n".join(
+            f'  - Pregunta: {s["question"]}\n    Respuesta correcta: {s["explanation"]}'
+            for s in g["samples"]
+        )
+        prompt_blocks.append(f'Grupo {i} — fuente: "{label}" ({g["count"]} errores)\n{samples_text}')
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Sos un tutor de NexusAI que ayuda a un alumno a priorizar su repaso. "
+                "Te paso grupos de preguntas que el alumno respondió mal, agrupadas por archivo "
+                "fuente del curso. Para cada grupo, identificá el/los subtemas puntuales que el "
+                "alumno no domina y dale una sugerencia concreta de qué repasar y cómo. "
+                "Tu salida es JSON.\n\n"
+                "Devolvé EXCLUSIVAMENTE un JSON con esta forma exacta:\n"
+                '{"suggestions": [{"group": 0, "topic": "<subtema en 3-6 palabras>", '
+                '"suggestion": "<2-4 oraciones en español, concretas y accionables>"}]}\n'
+                "- topic: nombrá el/los conceptos puntuales que fallan, NO el nombre del archivo.\n"
+                "- suggestion: explicá qué patrón de error ves y qué debería releer/practicar.\n"
+                "- Devolvé un objeto de 'suggestions' por cada grupo recibido, con el mismo índice 'group'."
+            ),
+        },
+        {
+            "role": "user",
+            "content": "\n\n".join(prompt_blocks),
+        },
+    ]
+
+    try:
+        result_llm = await llm.chat_completion(
+            messages,
+            response_format={"type": "json_object"},
+            temperature=0.3,
+        )
+    except Exception as exc:
+        logger.error("Review suggestions LLM call failed: %s: %s", type(exc).__name__, exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudieron generar las sugerencias de repaso en este momento. Intentá de nuevo.",
+        ) from exc
+
+    raw = result_llm.text.strip()
+    if raw.startswith("```"):
+        raw = "\n".join(raw.splitlines()[1:-1]) if raw.endswith("```") else raw.strip("`")
+
+    try:
+        parsed = json.loads(raw)
+        by_group = {int(item.get("group", -1)): item for item in parsed.get("suggestions", [])}
+    except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as exc:
+        logger.error("Review suggestions JSON parse failed. Raw: %.300s", raw)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudieron procesar las sugerencias de repaso. Intentá de nuevo.",
+        ) from exc
+
+    suggestions = [
+        ReviewSuggestion(
+            source_filename=g["filename"],
+            source_document_id=g["document_id"],
+            error_count=g["count"],
+            last_error_at=g["last_at"],
+            topic=str(by_group.get(i, {}).get("topic") or (g["filename"] or "Repaso general")),
+            suggestion=str(
+                by_group.get(i, {}).get("suggestion")
+                or "Revisá el material relacionado con estas preguntas."
+            ),
+        )
+        for i, g in enumerate(top_groups)
+    ]
+
+    return ReviewSuggestionsResponse(
+        course_id=payload.course_id,
+        total_errors=len(rows),
+        suggestions=suggestions,
+    )
