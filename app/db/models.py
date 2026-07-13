@@ -122,6 +122,33 @@ class Message(Base):
     session: Mapped["ChatSession"] = relationship(back_populates="messages")
 
 
+class ForumPostEmbedding(Base):
+    """Embedding de un post de foro para detección de duplicados (Épica 06)."""
+    __tablename__ = "forum_post_embeddings"
+    __table_args__ = (
+        Index("ix_forum_post_embeddings_course_id", "course_id"),
+        Index("ix_forum_post_embeddings_discussion_id", "discussion_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    forum_post_id: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    discussion_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    course_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[Optional[List[float]]] = mapped_column(
+        Vector(get_settings().embedding_dimensions), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class UnansweredQuestion(Base):
     """Preguntas del alumno que el material del curso no pudo responder bien.
 

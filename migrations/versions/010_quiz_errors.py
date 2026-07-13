@@ -1,7 +1,7 @@
 """Add quiz_errors table — SP-10 (sugerencias de repaso basadas en errores)
 
-Revision ID: 009_quiz_errors
-Revises: 008_tsvector_simple
+Revision ID: 010_quiz_errors
+Revises: 009_forum_post_embeddings
 Create Date: 2026-07-09 00:00:00.000000
 
 Persiste las preguntas de quiz que el alumno respondió mal. Antes vivían
@@ -18,8 +18,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision = "009_quiz_errors"
-down_revision = "008_tsvector_simple"
+revision = "010_quiz_errors"
+down_revision = "009_forum_post_embeddings"
 branch_labels = None
 depends_on = None
 

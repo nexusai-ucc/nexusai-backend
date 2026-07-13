@@ -137,6 +137,7 @@ async def retrieve_context(
 def format_context_for_prompt(
     chunks: List[RetrievedChunk],
     course_names: dict[int, str] | None = None,
+    max_chars_per_chunk: int = 800,
 ) -> str:
     """Formatea los chunks recuperados para inyectarlos al system prompt.
 
@@ -160,8 +161,8 @@ def format_context_for_prompt(
         # via chunks ruidosos). 800 chars ~= 200 tokens, suficiente para
         # contexto sin saturar.
         content = chunk.content.strip()
-        if len(content) > 800:
-            content = content[:800] + "..."
+        if len(content) > max_chars_per_chunk:
+            content = content[:max_chars_per_chunk] + "..."
 
         course_label = ""
         if course_names and chunk.course_id in course_names:

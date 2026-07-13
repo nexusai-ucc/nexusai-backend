@@ -114,6 +114,7 @@ from app.admin.router import router as admin_router          # noqa: E402
 from app.chat.router import router as chat_router            # noqa: E402
 from app.courses.router import router as courses_router      # noqa: E402
 from app.documents.router import router as documents_router  # noqa: E402
+from app.forums.router import router as forums_router        # noqa: E402
 from app.gaps.router import router as gaps_router            # noqa: E402
 from app.quiz.router import router as quiz_router            # noqa: E402
 from app.search.router import router as search_router        # noqa: E402
@@ -125,6 +126,7 @@ app.include_router(courses_router,   prefix="/api/v1/courses",   tags=["courses"
 app.include_router(search_router,    prefix="/api/v1/search",    tags=["search"])
 app.include_router(quiz_router,      prefix="/api/v1/quiz",      tags=["quiz"])
 app.include_router(gaps_router,      prefix="/api/v1/gaps",      tags=["gaps"])
+app.include_router(forums_router,    prefix="/api/v1/forums",    tags=["forums"])
 
 
 # ============================================================
