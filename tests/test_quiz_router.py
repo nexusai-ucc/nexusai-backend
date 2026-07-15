@@ -1,0 +1,175 @@
+"""
+Tests del quiz router — flashcards (SP-06) y dificultad (SP-08).
+
+Misma estrategia de aislamiento que test_forums_router.py:
+  - Mini FastAPI solo con el quiz router.
+  - verify_hmac, get_db, get_llm_provider y get_embedding_provider reemplazados con mocks.
+  - Sin llamadas reales a Postgres ni a APIs externas.
+"""
+
+from __future__ import annotations
+
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
+from pydantic import ValidationError
+
+from app.auth.hmac import verify_hmac
+from app.db.session import get_db
+from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
+from app.providers.llm import LLMProvider, get_llm_provider
+from app.quiz.router import QuizRequest, _build_quiz_prompt
+
+
+# ─────────────────────────────────────────────────────────────
+# Validación de QuizRequest
+# ─────────────────────────────────────────────────────────────
+
+def test_quiz_request_accepts_flashcard_type():
+    req = QuizRequest(course_id=1, user_id=1, question_type="flashcard")
+    assert req.question_type == "flashcard"
+    assert req.difficulty == "medium"  # default
+
+
+def test_quiz_request_rejects_invalid_question_type():
+    with pytest.raises(ValidationError):
+        QuizRequest(course_id=1, user_id=1, question_type="not_a_real_type")
+
+
+def test_quiz_request_accepts_valid_difficulty():
+    req = QuizRequest(course_id=1, user_id=1, difficulty="hard")
+    assert req.difficulty == "hard"
+
+
+def test_quiz_request_rejects_invalid_difficulty():
+    with pytest.raises(ValidationError):
+        QuizRequest(course_id=1, user_id=1, difficulty="impossible")
+
+
+# ─────────────────────────────────────────────────────────────
+# _build_quiz_prompt — lógica pura, sin DB ni LLM
+# ─────────────────────────────────────────────────────────────
+
+_CHUNKS = [("apunte1.pdf", "El teorema de Bayes relaciona probabilidades condicionales.")]
+
+
+def test_build_quiz_prompt_flashcard_schema():
+    messages = _build_quiz_prompt(_CHUNKS, num_questions=3, topic=None, question_type="flashcard")
+    user_msg = messages[1]["content"]
+    assert '"question_type": "flashcard"' in user_msg
+    assert '"correct_index": -1' in user_msg
+    assert "flashcards" in user_msg.lower()
+
+
+@pytest.mark.parametrize("difficulty", ["easy", "medium", "hard"])
+def test_build_quiz_prompt_includes_difficulty_instruction(difficulty):
+    messages = _build_quiz_prompt(
+        _CHUNKS, num_questions=3, topic=None, question_type="multiple_choice", difficulty=difficulty
+    )
+    system_msg = messages[0]["content"]
+    assert difficulty.upper() in system_msg or {
+        "easy": "FÁCIL",
+        "medium": "MEDIA",
+        "hard": "DIFÍCIL",
+    }[difficulty] in system_msg
+
+
+def test_build_quiz_prompt_defaults_to_medium_difficulty():
+    with_default = _build_quiz_prompt(_CHUNKS, num_questions=3, topic=None, question_type="open")
+    with_explicit = _build_quiz_prompt(_CHUNKS, num_questions=3, topic=None, question_type="open", difficulty="medium")
+    assert with_default[0]["content"] == with_explicit[0]["content"]
+
+
+# ─────────────────────────────────────────────────────────────
+# Fixtures — endpoint end-to-end con dependencias mockeadas
+# ─────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def mock_db():
+    db = AsyncMock()
+    db.execute.return_value = MagicMock()
+    # Sirve tanto para el sampling de chunks (filename/content) como para el
+    # enriquecimiento posterior de source_document_id (filename/id, SP-10).
+    db.execute.return_value.all.return_value = [
+        SimpleNamespace(
+            filename="apunte1.pdf",
+            content="El teorema de Bayes relaciona probabilidades condicionales.",
+            id="00000000-0000-0000-0000-000000000001",
+        )
+    ]
+    return db
+
+
+@pytest.fixture
+def mock_embeddings():
+    return AsyncMock(spec=EmbeddingProvider)
+
+
+@pytest.fixture
+def mock_llm():
+    llm = AsyncMock(spec=LLMProvider)
+    flashcard_response = {
+        "questions": [
+            {
+                "question_type": "flashcard",
+                "question": "Teorema de Bayes",
+                "options": [],
+                "correct_index": -1,
+                "explanation": "Relaciona la probabilidad condicional de A dado B con la de B dado A.",
+                "source_filename": "apunte1.pdf",
+            }
+        ]
+    }
+    llm.chat_completion.return_value = MagicMock(text=json.dumps(flashcard_response))
+    return llm
+
+
+@pytest.fixture
+async def client(mock_db, mock_embeddings, mock_llm):
+    from app.quiz.router import router
+
+    app = FastAPI()
+    app.include_router(router, prefix="/api/v1/quiz")
+    app.dependency_overrides[verify_hmac] = lambda: b"test-body"
+    app.dependency_overrides[get_db] = lambda: mock_db
+    app.dependency_overrides[get_embedding_provider] = lambda: mock_embeddings
+    app.dependency_overrides[get_llm_provider] = lambda: mock_llm
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        yield c
+
+
+# ─────────────────────────────────────────────────────────────
+# POST /generate — flashcards + dificultad
+# ─────────────────────────────────────────────────────────────
+
+async def test_generate_flashcards_returns_200_with_expected_shape(client):
+    payload = {
+        "course_id": 1,
+        "user_id": 1,
+        "num_questions": 1,
+        "question_type": "flashcard",
+        "difficulty": "hard",
+    }
+
+    response = await client.post("/api/v1/quiz/generate", json=payload)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data["questions"]) == 1
+    q = data["questions"][0]
+    assert q["question_type"] == "flashcard"
+    assert q["options"] == []
+    assert q["correct_index"] == -1
+
+
+async def test_generate_rejects_invalid_difficulty_at_http_level(client):
+    payload = {"course_id": 1, "user_id": 1, "difficulty": "impossible"}
+
+    response = await client.post("/api/v1/quiz/generate", json=payload)
+
+    assert response.status_code == 422

@@ -4,7 +4,9 @@ Quiz Generator — Feature F.
 POST /api/v1/quiz/generate
   Genera un quiz de práctica a partir del material indexado del curso.
   Soporta múltiples tipos de pregunta: opción múltiple, verdadero/falso,
-  preguntas abiertas y mix. El LLM produce JSON estructurado.
+  preguntas abiertas, flashcards (SP-06) y mix. El LLM produce JSON
+  estructurado. Acepta un nivel de dificultad (easy|medium|hard, SP-08)
+  que ajusta la complejidad de las preguntas generadas.
 
   Modos:
   - topic provisto → retrieve_context con esa consulta (chunks relevantes)
@@ -48,7 +50,8 @@ logger = logging.getLogger("nexusai.quiz")
 # Higher than WEAK_MATCH_THRESHOLD (0.4) to reject spurious cross-lingual matches.
 QUIZ_TOPIC_MIN_SIMILARITY = 0.5
 
-_VALID_QUESTION_TYPES = {"multiple_choice", "true_false", "open", "mix"}
+_VALID_QUESTION_TYPES = {"multiple_choice", "true_false", "open", "mix", "flashcard"}
+_VALID_DIFFICULTIES = {"easy", "medium", "hard"}
 
 router = APIRouter()
 
@@ -63,12 +66,20 @@ class QuizRequest(BaseModel):
     topic: Optional[str] = Field(default=None, max_length=200)
     num_questions: int = Field(default=5, ge=1, le=10)
     question_type: str = Field(default="multiple_choice")
+    difficulty: str = Field(default="medium")
 
     @field_validator("question_type")
     @classmethod
     def check_question_type(cls, v: str) -> str:
         if v not in _VALID_QUESTION_TYPES:
             raise ValueError(f"question_type must be one of {_VALID_QUESTION_TYPES}")
+        return v
+
+    @field_validator("difficulty")
+    @classmethod
+    def check_difficulty(cls, v: str) -> str:
+        if v not in _VALID_DIFFICULTIES:
+            raise ValueError(f"difficulty must be one of {_VALID_DIFFICULTIES}")
         return v
 
 
@@ -202,11 +213,19 @@ async def _sample_chunks_for_quiz(
     return [(row.filename, row.content) for row in result.all()]
 
 
+_DIFFICULTY_INSTRUCTIONS = {
+    "easy": "Nivel de dificultad: FÁCIL. Usá definiciones y conceptos básicos citados directamente en el material.",
+    "medium": "Nivel de dificultad: MEDIA. Requerí aplicar o relacionar un concepto, no solo repetir una definición.",
+    "hard": "Nivel de dificultad: DIFÍCIL. Requerí relacionar varios conceptos entre sí o razonar sobre un caso, no una definición aislada.",
+}
+
+
 def _build_quiz_prompt(
     chunks: list[tuple[str, str]],
     num_questions: int,
     topic: Optional[str],
     question_type: str = "multiple_choice",
+    difficulty: str = "medium",
 ) -> list[dict[str, str]]:
     """Arma los mensajes para el LLM según el tipo de pregunta solicitado."""
 
@@ -296,6 +315,31 @@ def _build_quiz_prompt(
             "(opción múltiple, verdadero/falso y preguntas abiertas).\n\n"
         )
 
+    elif question_type == "flashcard":
+        schema_hint = (
+            "Devolvé EXCLUSIVAMENTE un JSON válido con esta forma exacta:\n"
+            '{\n  "questions": [\n    {\n'
+            '      "question_type": "flashcard",\n'
+            '      "question": "<frente de la tarjeta: pregunta o término corto>",\n'
+            '      "options": [],\n'
+            '      "correct_index": -1,\n'
+            '      "explanation": "<dorso de la tarjeta: respuesta corta y directa>",\n'
+            '      "source_filename": "<nombre del archivo fuente>"\n'
+            '    }\n  ]\n}\n' + error_clause
+        )
+        rules = (
+            "Reglas:\n"
+            "1. options SIEMPRE es [] (array vacío).\n"
+            "2. correct_index SIEMPRE es -1.\n"
+            "3. El 'question' (frente) es CORTO: un término, una pregunta puntual o una definición a completar — "
+            "NO una consigna de desarrollo.\n"
+            "4. El 'explanation' (dorso) es la respuesta CORTA y directa a ese frente, no un párrafo largo.\n"
+            "5. Las tarjetas DEBEN basarse en el material entregado.\n"
+            "6. source_filename DEBE ser uno de los nombres de archivo del material.\n"
+            "7. NO usar markdown ni texto fuera del JSON.\n"
+        )
+        type_instruction = f"Generá {num_questions} flashcards de práctica (pregunta corta / respuesta corta).\n\n"
+
     else:  # multiple_choice (default)
         schema_hint = (
             "Devolvé EXCLUSIVAMENTE un JSON válido con esta forma exacta:\n"
@@ -337,12 +381,16 @@ def _build_quiz_prompt(
         "true_false": "Verdadero/Falso",
         "open": "preguntas abiertas evaluadas por IA",
         "mix": "mixto (opción múltiple, V/F y preguntas abiertas)",
+        "flashcard": "flashcards de pregunta y respuesta corta",
     }.get(question_type, "opción múltiple")
+
+    difficulty_line = _DIFFICULTY_INSTRUCTIONS.get(difficulty, _DIFFICULTY_INSTRUCTIONS["medium"])
 
     system = (
         f"Sos un generador de quizzes académicos de NexusAI. "
         f"Producís preguntas de {type_desc} en español, basadas estrictamente "
         "en el material académico del curso del alumno. Tu salida es JSON.\n\n"
+        f"{difficulty_line}\n\n"
         "REGLA CRÍTICA: Solo podés generar preguntas sobre contenido que esté "
         "explícita y directamente presente en el material entregado.\n"
         "- NO generes preguntas sobre la ausencia de un tema.\n"
@@ -472,7 +520,7 @@ async def generate_quiz(
         )
 
     # 2) Pedir al LLM la generación con JSON estricto.
-    messages = _build_quiz_prompt(chunks, payload.num_questions, payload.topic, payload.question_type)
+    messages = _build_quiz_prompt(chunks, payload.num_questions, payload.topic, payload.question_type, payload.difficulty)
     try:
         result = await llm.chat_completion(
             messages,
