@@ -176,6 +176,33 @@ class UnansweredQuestion(Base):
     )
 
 
+class QuizAttempt(Base):
+    """Intento completado de quiz (SP-09 — historial por alumno).
+
+    Registra cada sesión de quiz que el alumno finaliza: tipo de pregunta,
+    dificultad, puntaje y fecha. Permite mostrar el historial de práctica
+    y detectar tendencias de estudio a lo largo del tiempo.
+    """
+    __tablename__ = "quiz_attempts"
+    __table_args__ = (
+        Index("ix_quiz_attempts_user_id_course_id_created_at", "user_id", "course_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    course_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    question_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    difficulty: Mapped[str] = mapped_column(String(10), nullable=False, default="medium")
+    topic: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    total_questions: Mapped[int] = mapped_column(Integer, nullable=False)
+    correct_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class QuizError(Base):
     """Pregunta de quiz que el alumno respondió mal (SP-10 — repaso basado en errores).
 
