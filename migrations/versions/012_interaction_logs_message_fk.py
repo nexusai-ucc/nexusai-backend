@@ -1,7 +1,7 @@
 """Add user_message_id FK to interaction_logs — DOC-D01 gap fix
 
-Revision ID: 011_interaction_logs_message_fk
-Revises: 010_interaction_logs
+Revision ID: 012_interaction_logs_message_fk
+Revises: 011_interaction_logs
 Create Date: 2026-07-12 00:00:00.000000
 
 Agrega FK opcional user_message_id → messages.id con ON DELETE SET NULL.
@@ -15,8 +15,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision = "011_interaction_logs_message_fk"
-down_revision = "010_interaction_logs"
+revision = "012_interaction_logs_message_fk"
+down_revision = "011_interaction_logs"
 branch_labels = None
 depends_on = None
 

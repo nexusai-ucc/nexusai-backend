@@ -1,7 +1,7 @@
 """Add interaction_logs table — DOC-D01 (logging de interacciones anonimizado)
 
-Revision ID: 010_interaction_logs
-Revises: 009_forum_post_embeddings
+Revision ID: 011_interaction_logs
+Revises: 010_quiz_errors
 Create Date: 2026-07-12 00:00:00.000000
 
 Tabla que registra cada interacción con el asistente de forma anonimizada.
@@ -9,6 +9,9 @@ No almacena texto de preguntas ni user_id directo. Usa SHA-256 del user_id
 para poder contar usuarios únicos sin exponer identidad.
 
 Alimenta el dashboard de analytics para docentes (DOC-D01 → ANALYTICS-01).
+
+Nota: renumerada de 010 a 011 al landear en main (DOC-D02) — main ya tenía
+010_quiz_errors.py con el mismo down_revision cuando esta rama fue creada.
 """
 
 from __future__ import annotations
@@ -17,8 +20,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision = "010_interaction_logs"
-down_revision = "009_forum_post_embeddings"
+revision = "011_interaction_logs"
+down_revision = "010_quiz_errors"
 branch_labels = None
 depends_on = None
 
