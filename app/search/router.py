@@ -14,6 +14,7 @@ compartida con chat/quiz. La query híbrida vive exclusivamente aquí.
 
 from __future__ import annotations
 
+import logging
 from typing import Annotated, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -25,6 +26,7 @@ from app.auth.hmac import verify_hmac
 from app.db.session import get_db
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 
+logger = logging.getLogger("nexusai.search")
 router = APIRouter()
 
 _MIN_COMBINED_SCORE = 0.35
@@ -50,7 +52,7 @@ _HYBRID_SQL = text("""
         d.course_id IN :course_ids
         AND d.status = 'indexed'
         AND c.embedding IS NOT NULL
-        AND (:material_type IS NULL OR d.mime_type = :material_type)
+        AND (CAST(:material_type AS TEXT) IS NULL OR d.mime_type = CAST(:material_type AS TEXT))
         AND (
             1 - (c.embedding <=> CAST(:query_embedding AS vector)) >= 0.32
             OR c.content_tsv @@ plainto_tsquery('simple', :query_text)
@@ -117,6 +119,7 @@ async def search(
         )
         rows = result.all()
     except Exception as exc:
+        logger.error("Search failed: %s", exc, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="El servicio de búsqueda no está disponible temporalmente",

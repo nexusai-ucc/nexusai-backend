@@ -44,7 +44,9 @@ from app.db.models import Document
 from app.db.session import get_db, get_session_factory
 from app.documents.extractor import SUPPORTED_MIME_TYPES
 from app.documents.pipeline import index_document
+from app.documents.summarizer import summarize_document
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
+from app.providers.llm import LLMProvider, get_llm_provider
 
 logger = logging.getLogger("nexusai.documents")
 
@@ -355,6 +357,50 @@ async def download_document(
         filename=document.filename,
         media_type=document.mime_type,
     )
+
+
+class SummarizeRequest(BaseModel):
+    document_id: UUID
+    course_id: int = Field(gt=0)
+    user_id: int = Field(gt=0)
+
+
+class SummarizeResponse(BaseModel):
+    document_id: str
+    document_filename: str
+    summary: str
+    chunks_used: int
+    total_chunks: int
+
+
+@router.post("/summarize", response_model=SummarizeResponse)
+async def summarize_document_endpoint(
+    payload: SummarizeRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+    llm: LLMProvider = Depends(get_llm_provider),
+) -> SummarizeResponse:
+    """Genera un resumen del documento usando el LLM (BUS-03).
+
+    Recupera todos los chunks del documento en orden y los envía al LLM.
+    El documento debe pertenecer al course_id recibido (aislamiento multi-curso).
+    """
+    try:
+        result = await summarize_document(
+            document_id=payload.document_id,
+            course_id=payload.course_id,
+            db=db,
+            llm=llm,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="El servicio de resumen no está disponible temporalmente",
+        ) from exc
+
+    return SummarizeResponse(**result)
 
 
 @router.delete(
