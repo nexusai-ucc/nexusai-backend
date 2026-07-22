@@ -19,16 +19,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import Chunk, Document
 from app.providers.llm import LLMProvider
 
-MAX_CHARS = 15_000
+MAX_CHARS = 20_000
 _SUMMARY_PROMPT_TEMPLATE = """\
-Sos un asistente académico. Resumí el siguiente documento de forma clara y estructurada.
+Sos un asistente académico. Leé el siguiente documento y generá un resumen completo y útil.
 
-El resumen debe:
-- Estar en el mismo idioma que el documento
-- Tener entre 150 y 300 palabras
-- Destacar los conceptos principales y la estructura del documento
-- Ser útil para un estudiante que quiere saber de qué trata antes de leerlo
-- No inventar información que no esté en el texto
+Instrucciones:
+- Escribí en el mismo idioma que el documento (español o inglés).
+- El resumen debe tener entre 200 y 400 palabras.
+- Organizá el resumen en párrafos claros: primero una introducción general, luego los temas principales, y finalmente una conclusión breve.
+- No uses asteriscos, guiones ni ningún tipo de formato especial. Solo texto plano con saltos de línea entre párrafos.
+- No inventes información que no esté en el documento.
+- Si el documento es un cronograma o índice, mencioná los temas principales que cubre y su estructura general.
 
 DOCUMENTO: {filename}
 
@@ -104,7 +105,7 @@ async def summarize_document(
         result = await llm.chat_completion(
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
-            max_tokens=600,
+            max_tokens=1200,
         )
         summary_text = result.text.strip()
     except Exception as exc:
