@@ -1,7 +1,7 @@
 """Add quiz_attempts table — SP-09 (historial de quizzes por alumno)
 
-Revision ID: 012_quiz_attempts
-Revises: 011_interaction_logs_message_fk
+Revision ID: 013_quiz_attempts
+Revises: 012_interaction_logs_message_fk
 Create Date: 2026-07-15 00:00:00.000000
 
 Registra cada sesión de quiz completada por un alumno: tipo de pregunta,
@@ -15,8 +15,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision = "012_quiz_attempts"
-down_revision = "011_interaction_logs_message_fk"
+revision = "013_quiz_attempts"
+down_revision = "012_interaction_logs_message_fk"
 branch_labels = None
 depends_on = None
 
