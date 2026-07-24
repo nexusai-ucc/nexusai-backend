@@ -6,6 +6,7 @@ POST /api/v1/search
   para devolver los fragmentos más relevantes del material del curso.
   Score combinado: 0.6 * semantic + 0.4 * lexical.
   No genera texto con el LLM — es retrieval puro.
+  Soporta filtro opcional por material_type (mime type del documento, BUS-02).
 
 IMPORTANTE: esta función NO modifica retrieve_context() ni ninguna función
 compartida con chat/quiz. La query híbrida vive exclusivamente aquí.
@@ -35,6 +36,7 @@ _HYBRID_SQL = text("""
         c.chunk_index,
         d.filename        AS document_filename,
         d.course_id,
+        d.mime_type,
         (d.storage_path IS NOT NULL AND d.storage_path != '') AS has_file,
         1 - (c.embedding <=> CAST(:query_embedding AS vector))                          AS semantic_score,
         COALESCE(ts_rank(c.content_tsv, plainto_tsquery('simple', :query_text)), 0)    AS lexical_score,
@@ -48,6 +50,7 @@ _HYBRID_SQL = text("""
         d.course_id IN :course_ids
         AND d.status = 'indexed'
         AND c.embedding IS NOT NULL
+        AND (:material_type IS NULL OR d.mime_type = :material_type)
         AND (
             1 - (c.embedding <=> CAST(:query_embedding AS vector)) >= 0.32
             OR c.content_tsv @@ plainto_tsquery('simple', :query_text)
@@ -64,6 +67,7 @@ class SearchRequest(BaseModel):
     user_id: int = Field(gt=0)
     top_k: int = Field(default=5, ge=1, le=10)
     course_ids: Optional[List[int]] = Field(default=None)
+    material_type: Optional[str] = Field(default=None)
 
 
 class SearchResult(BaseModel):
@@ -74,6 +78,7 @@ class SearchResult(BaseModel):
     content: str
     similarity: float
     has_file: bool = False
+    mime_type: Optional[str] = None
 
 
 class SearchResponse(BaseModel):
@@ -107,6 +112,7 @@ async def search(
                 "course_ids": ids_to_query,
                 "top_k": payload.top_k,
                 "filename_pattern": f"%{payload.query.strip()}%",
+                "material_type": payload.material_type,
             },
         )
         rows = result.all()
@@ -135,6 +141,7 @@ async def search(
             content=row.content[:400].strip(),
             similarity=round(float(row.combined_score), 3),
             has_file=bool(row.has_file),
+            mime_type=row.mime_type,
         )
         for row in deduped
     ]
