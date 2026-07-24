@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Any, List, Optional
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Boolean, Computed, DateTime, Float, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import Boolean, Computed, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -241,6 +241,27 @@ class QuizError(Base):
     user_answer: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     ai_feedback: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     ai_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class CalendarAlert(Base):
+    """Alerta de evento de calendario configurada por el alumno (CAL-02)."""
+    __tablename__ = "calendar_alerts"
+    __table_args__ = (
+        UniqueConstraint("user_id", "event_id", name="uq_calendar_alerts_user_event"),
+        Index("ix_calendar_alerts_user_course", "user_id", "course_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    course_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    event_timestamp: Mapped[int] = mapped_column(Integer, nullable=False)
+    days_before: Mapped[int] = mapped_column(Integer, nullable=False)
+    notified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
