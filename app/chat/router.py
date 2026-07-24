@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.analytics.logger import log_interaction
 from app.auth.hmac import verify_hmac
 from app.chat.schemas import ChatRequest, ChatResponse, MessageOut
 from app.db.models import ChatSession, Message
@@ -314,6 +315,24 @@ async def messages(
         )
     )
 
+    # ----- DOC-D01: Logging anonimizado para analytics -----
+    has_ctx = bool(retrieved_chunks and max_sim_for_gap is not None and max_sim_for_gap >= WEAK_MATCH_THRESHOLD)
+    await log_interaction(
+        db,
+        course_id=payload.course_id,
+        user_id=payload.user_id,
+        user_message_id=user_message.id,
+        question=payload.question,
+        answer=result.text,
+        chunks_retrieved=len(retrieved_chunks),
+        has_relevant_context=has_ctx,
+        is_multicourse=is_multicourse,
+        prompt_tokens=result.prompt_tokens,
+        completion_tokens=result.completion_tokens,
+        latency_ms=latency_ms,
+        endpoint="chat",
+    )
+
     return ChatResponse(
         session_id=session.id,
         answer=result.text,
@@ -547,6 +566,23 @@ async def messages_stream(
                         "completion_tokens": usage_seen.completion_tokens if usage_seen else 0,
                         "total_tokens": usage_seen.total_tokens if usage_seen else 0,
                     }) + "\n\n"
+                )
+
+                # ----- DOC-D01: Logging anonimizado para analytics -----
+                await log_interaction(
+                    db,
+                    course_id=payload.course_id,
+                    user_id=payload.user_id,
+                    user_message_id=user_message.id,
+                    question=payload.question,
+                    answer=full_text,
+                    chunks_retrieved=len(retrieved_chunks),
+                    has_relevant_context=grounded,
+                    is_multicourse=is_multicourse,
+                    prompt_tokens=usage_seen.prompt_tokens if usage_seen else None,
+                    completion_tokens=usage_seen.completion_tokens if usage_seen else None,
+                    latency_ms=latency_ms,
+                    endpoint="stream",
                 )
 
             except Exception as exc:
