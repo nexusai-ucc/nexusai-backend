@@ -32,6 +32,7 @@ def _row(**kwargs):
         document_filename="apunte1.pdf",
         course_id=1,
         mime_type="application/pdf",
+        section=None,
         has_file=True,
         combined_score=0.6,
     )
@@ -140,3 +141,40 @@ async def test_material_type_defaults_to_none(client, mock_db):
 
     params = mock_db.execute.call_args[0][1]
     assert params["material_type"] is None
+
+
+async def test_section_is_threaded_into_query_params(client, mock_db):
+    payload = {**_BASE_PAYLOAD, "section": 3}
+
+    await client.post("/api/v1/search", json=payload)
+
+    params = mock_db.execute.call_args[0][1]
+    assert params["section"] == 3
+    assert params["section_unassigned"] is False
+
+
+async def test_section_unassigned_is_threaded_into_query_params(client, mock_db):
+    payload = {**_BASE_PAYLOAD, "section_unassigned": True}
+
+    await client.post("/api/v1/search", json=payload)
+
+    params = mock_db.execute.call_args[0][1]
+    assert params["section"] is None
+    assert params["section_unassigned"] is True
+
+
+async def test_section_defaults_to_none_and_not_unassigned(client, mock_db):
+    await client.post("/api/v1/search", json=_BASE_PAYLOAD)
+
+    params = mock_db.execute.call_args[0][1]
+    assert params["section"] is None
+    assert params["section_unassigned"] is False
+
+
+async def test_search_result_echoes_section(client, mock_db):
+    mock_db.execute.return_value.all.return_value = [_row(section=2)]
+
+    response = await client.post("/api/v1/search", json=_BASE_PAYLOAD)
+
+    data = response.json()
+    assert data["results"][0]["section"] == 2
