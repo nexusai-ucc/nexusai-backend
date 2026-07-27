@@ -23,7 +23,7 @@ from app.auth.hmac import verify_hmac
 from app.db.session import get_db
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
-from app.quiz.router import QuizRequest, _build_quiz_prompt
+from app.quiz.router import ExamGenerateRequest, QuizRequest, _build_quiz_prompt
 
 
 # ─────────────────────────────────────────────────────────────
@@ -310,3 +310,73 @@ async def test_study_plan_ignores_out_of_range_group_indices(client, mock_db, mo
     # "Tema inventado" no cita ningún grupo válido -> queda afuera.
     assert len(data["topics"]) == 1
     assert data["topics"][0]["topic"] == "Derivadas"
+
+
+# ─────────────────────────────────────────────────────────────
+# ExamGenerateRequest — validación (EVAL-01 / issue #235)
+# ─────────────────────────────────────────────────────────────
+
+_VALID_DOC_ID = "00000000-0000-0000-0000-000000000001"
+
+
+def test_exam_request_accepts_valid_payload():
+    req = ExamGenerateRequest(
+        course_id=1, user_id=5, document_ids=[_VALID_DOC_ID], question_type="true_false"
+    )
+    assert req.document_ids == [_VALID_DOC_ID]
+    assert req.question_type == "true_false"
+    assert req.num_questions == 10  # default
+
+
+def test_exam_request_rejects_empty_document_ids():
+    with pytest.raises(ValidationError):
+        ExamGenerateRequest(course_id=1, user_id=5, document_ids=[])
+
+
+def test_exam_request_rejects_non_uuid_document_id():
+    with pytest.raises(ValidationError):
+        ExamGenerateRequest(course_id=1, user_id=5, document_ids=["not-a-uuid"])
+
+
+def test_exam_request_rejects_flashcard_type():
+    # flashcard es válido para el quiz de alumno pero no tiene sentido en un examen.
+    with pytest.raises(ValidationError):
+        ExamGenerateRequest(course_id=1, user_id=5, document_ids=[_VALID_DOC_ID], question_type="flashcard")
+
+
+# ─────────────────────────────────────────────────────────────
+# POST /generate-exam — endpoint end-to-end
+# ─────────────────────────────────────────────────────────────
+
+async def test_generate_exam_returns_200_with_expected_shape(client):
+    payload = {
+        "course_id": 1,
+        "user_id": 9,
+        "document_ids": [_VALID_DOC_ID],
+        "num_questions": 1,
+        "question_type": "multiple_choice",
+    }
+
+    response = await client.post("/api/v1/quiz/generate-exam", json=payload)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["course_id"] == 1
+    assert len(data["questions"]) == 1
+
+
+async def test_generate_exam_rejects_empty_document_ids_at_http_level(client):
+    payload = {"course_id": 1, "user_id": 9, "document_ids": []}
+
+    response = await client.post("/api/v1/quiz/generate-exam", json=payload)
+
+    assert response.status_code == 422
+
+
+async def test_generate_exam_404_when_no_chunks_for_selected_documents(client, mock_db):
+    mock_db.execute.return_value.all.return_value = []
+    payload = {"course_id": 1, "user_id": 9, "document_ids": [_VALID_DOC_ID]}
+
+    response = await client.post("/api/v1/quiz/generate-exam", json=payload)
+
+    assert response.status_code == 404
