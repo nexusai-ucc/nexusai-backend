@@ -12,6 +12,12 @@ POST /api/v1/quiz/generate
   - topic provisto → retrieve_context con esa consulta (chunks relevantes)
   - topic vacío    → chunks aleatorios del curso (variedad de temas)
 
+POST /api/v1/quiz/generate-exam
+  Genera un banco de preguntas de EXAMEN para el docente (EVAL-01, issue #235).
+  El docente elige explícitamente document_ids del curso en vez de un topic
+  libre o sampling aleatorio. Devuelve el mismo shape que /generate — el
+  export a formato GIFT (Moodle) se hace del lado del frontend.
+
 POST /api/v1/quiz/evaluate
   Evalúa la respuesta libre de un alumno a una pregunta abierta usando LLM.
   Devuelve { correct, score, feedback }.
@@ -28,6 +34,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, List, Optional
 
@@ -97,6 +104,49 @@ class QuizResponse(BaseModel):
     course_id: int
     topic: Optional[str]
     questions: List[QuizQuestion]
+
+
+_VALID_EXAM_QUESTION_TYPES = {"multiple_choice", "true_false", "open", "mix"}
+
+
+class ExamGenerateRequest(BaseModel):
+    """Generador de exámenes para docentes — EVAL-01 / issue #235 (DOC-D04).
+
+    A diferencia de QuizRequest (alumno, material aleatorio o por topic libre),
+    el docente elige explícitamente de qué archivos del curso quiere sacar las
+    preguntas.
+    """
+    course_id: int = Field(gt=0)
+    user_id: int = Field(gt=0)  # docente — $USER->id real, validado por la capability del lado Moodle
+    document_ids: List[str] = Field(min_length=1, max_length=20)
+    topic: Optional[str] = Field(default=None, max_length=200)
+    num_questions: int = Field(default=10, ge=1, le=20)
+    question_type: str = Field(default="multiple_choice")
+    difficulty: str = Field(default="medium")
+
+    @field_validator("question_type")
+    @classmethod
+    def check_question_type(cls, v: str) -> str:
+        if v not in _VALID_EXAM_QUESTION_TYPES:
+            raise ValueError(f"question_type must be one of {_VALID_EXAM_QUESTION_TYPES}")
+        return v
+
+    @field_validator("difficulty")
+    @classmethod
+    def check_difficulty(cls, v: str) -> str:
+        if v not in _VALID_DIFFICULTIES:
+            raise ValueError(f"difficulty must be one of {_VALID_DIFFICULTIES}")
+        return v
+
+    @field_validator("document_ids")
+    @classmethod
+    def check_document_ids(cls, v: List[str]) -> List[str]:
+        for doc_id in v:
+            try:
+                uuid.UUID(doc_id)
+            except ValueError as exc:
+                raise ValueError(f"invalid document id: {doc_id}") from exc
+        return v
 
 
 class EvaluateRequest(BaseModel):
@@ -211,6 +261,132 @@ async def _sample_chunks_for_quiz(
     )
     result = await db.execute(stmt)
     return [(row.filename, row.content) for row in result.all()]
+
+
+async def _fetch_chunks_for_documents(
+    db: AsyncSession,
+    course_id: int,
+    document_ids: list[str],
+    limit: int = 20,
+) -> list[tuple[str, str]]:
+    """Devuelve [(filename, content)] de chunks de los archivos elegidos por el docente.
+
+    A diferencia de `_sample_chunks_for_quiz` (todo el curso), acá se restringe
+    explícitamente a `document_ids` — y siempre se re-filtra por `course_id`
+    para que un docente no pueda pedir material de un curso ajeno pasando IDs
+    de otro curso a mano.
+    """
+    stmt = (
+        select(Document.filename, Chunk.content)
+        .join(Document, Chunk.document_id == Document.id)
+        .where(Document.course_id == course_id)
+        .where(Document.status == "indexed")
+        .where(Document.id.in_([uuid.UUID(d) for d in document_ids]))
+        .order_by(func.random())
+        .limit(limit)
+    )
+    result = await db.execute(stmt)
+    return [(row.filename, row.content) for row in result.all()]
+
+
+async def _run_quiz_generation(
+    chunks: list[tuple[str, str]],
+    course_id: int,
+    topic: Optional[str],
+    num_questions: int,
+    question_type: str,
+    difficulty: str,
+    db: AsyncSession,
+    llm: LLMProvider,
+) -> list[QuizQuestion]:
+    """Llama al LLM con los chunks dados y devuelve preguntas validadas + enriquecidas.
+
+    Compartido entre el quiz de práctica del alumno (`/generate`) y el
+    generador de exámenes del docente (`/generate-exam`) — misma pipeline de
+    prompt → JSON → validación → shuffle → mapeo a document_id, solo cambia
+    de dónde salen los chunks.
+    """
+    messages = _build_quiz_prompt(chunks, num_questions, topic, question_type, difficulty)
+    try:
+        result = await llm.chat_completion(
+            messages,
+            response_format={"type": "json_object"},
+            temperature=0.6,
+        )
+    except Exception as exc:
+        logger.error("Quiz LLM call failed: %s: %s", type(exc).__name__, exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudo generar el quiz en este momento. Intentá de nuevo.",
+        ) from exc
+
+    raw = result.text.strip()
+    if raw.startswith("```"):
+        raw = "\n".join(raw.splitlines()[1:-1]) if raw.endswith("```") else raw.strip("`")
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.error("Quiz JSON parse failed. Raw response: %.500s", raw)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="El generador devolvió una respuesta inválida. Intentá de nuevo.",
+        ) from exc
+
+    if isinstance(parsed, dict) and "error" in parsed:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=parsed.get(
+                "detail",
+                "El material del curso no contiene suficiente contenido sobre este tema para generar preguntas.",
+            ),
+        )
+
+    questions_raw = parsed.get("questions") if isinstance(parsed, dict) else None
+    if not isinstance(questions_raw, list) or not questions_raw:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="El generador no devolvió preguntas válidas.",
+        )
+
+    questions: list[QuizQuestion] = []
+    for q in questions_raw:
+        try:
+            questions.append(QuizQuestion.model_validate(q))
+        except ValidationError:
+            # Saltear preguntas malformadas en lugar de tirar 503 — degradación graceful.
+            continue
+
+    if not questions:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Ninguna pregunta generada pasó validación.",
+        )
+
+    # Truncar al número pedido (el LLM a veces se pasa por uno).
+    questions = questions[:num_questions]
+
+    # Shuffle de opciones para no dejar siempre la correcta en el mismo lugar.
+    for q in questions:
+        if q.question_type == "multiple_choice" and len(q.options) == 4 and q.correct_index >= 0:
+            original_correct = q.options[q.correct_index]
+            random.shuffle(q.options)
+            q.correct_index = q.options.index(original_correct)
+
+    # Enriquecer preguntas con el document_id del archivo fuente.
+    source_filenames = {q.source_filename for q in questions if q.source_filename}
+    if source_filenames:
+        doc_stmt = select(Document.filename, Document.id).where(
+            Document.course_id == course_id,
+            Document.filename.in_(source_filenames),
+        )
+        doc_rows = await db.execute(doc_stmt)
+        doc_id_map: dict[str, str] = {row.filename: str(row.id) for row in doc_rows.all()}
+        for q in questions:
+            if q.source_filename and q.source_filename in doc_id_map:
+                q.source_document_id = doc_id_map[q.source_filename]
+
+    return questions
 
 
 _DIFFICULTY_INSTRUCTIONS = {
@@ -519,94 +695,64 @@ async def generate_quiz(
             detail="Este curso todavía no tiene material indexado para generar un quiz.",
         )
 
-    # 2) Pedir al LLM la generación con JSON estricto.
-    messages = _build_quiz_prompt(chunks, payload.num_questions, payload.topic, payload.question_type, payload.difficulty)
-    try:
-        result = await llm.chat_completion(
-            messages,
-            response_format={"type": "json_object"},
-            temperature=0.6,
-        )
-    except Exception as exc:
-        logger.error("Quiz LLM call failed: %s: %s", type(exc).__name__, exc, exc_info=True)
+    # 2) Pedir al LLM la generación + parseo/validación/enriquecimiento (compartido con /generate-exam).
+    questions = await _run_quiz_generation(
+        chunks=chunks,
+        course_id=payload.course_id,
+        topic=payload.topic,
+        num_questions=payload.num_questions,
+        question_type=payload.question_type,
+        difficulty=payload.difficulty,
+        db=db,
+        llm=llm,
+    )
+
+    return QuizResponse(
+        course_id=payload.course_id,
+        topic=payload.topic,
+        questions=questions,
+    )
+
+
+@router.post("/generate-exam", response_model=QuizResponse)
+async def generate_exam(
+    payload: ExamGenerateRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+    llm: LLMProvider = Depends(get_llm_provider),
+) -> QuizResponse:
+    """Genera un banco de preguntas de examen para el docente (EVAL-01 / issue #235).
+
+    A diferencia de `/generate` (quiz de práctica del alumno), el docente elige
+    explícitamente de qué archivos del curso salen las preguntas — no hay
+    sampling aleatorio de todo el curso ni búsqueda semántica por tema.
+
+    La autorización de rol (solo docentes) se hace en el plugin de Moodle vía
+    `require_capability('local/nexusai:manage', ...)`, igual que el resto de
+    las funciones del dashboard docente — este endpoint solo valida HMAC.
+
+    Si ninguno de los `document_ids` tiene material indexado en ese curso → 404.
+    Si el LLM devuelve JSON inválido o falla → 503.
+    """
+    chunks = await _fetch_chunks_for_documents(
+        db, payload.course_id, payload.document_ids, limit=20
+    )
+    if not chunks:
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="No se pudo generar el quiz en este momento. Intentá de nuevo.",
-        ) from exc
-
-    # 3) Parsear y validar.
-    raw = result.text.strip()
-    # Defensa: si el LLM envuelve el JSON en ```json ... ```, sacar las cercas.
-    if raw.startswith("```"):
-        # quitar primera línea (```json o ```) y última (```)
-        raw = "\n".join(raw.splitlines()[1:-1]) if raw.endswith("```") else raw.strip("`")
-
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        logger.error("Quiz JSON parse failed. Raw response: %.500s", raw)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="El generador devolvió una respuesta inválida. Intentá de nuevo.",
-        ) from exc
-
-    if isinstance(parsed, dict) and "error" in parsed:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=parsed.get(
-                "detail",
-                "El material del curso no contiene suficiente contenido sobre este tema para generar preguntas.",
-            ),
-        )
-
-    questions_raw = parsed.get("questions") if isinstance(parsed, dict) else None
-    if not isinstance(questions_raw, list) or not questions_raw:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="El generador no devolvió preguntas válidas.",
-        )
-
-    questions: list[QuizQuestion] = []
-    for q in questions_raw:
-        try:
-            questions.append(QuizQuestion.model_validate(q))
-        except ValidationError:
-            # Saltear preguntas malformadas en lugar de tirar 503 — degradación graceful.
-            continue
-
-    if not questions:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Ninguna pregunta generada pasó validación.",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Los archivos seleccionados no tienen material indexado en este curso.",
         )
 
-    # Truncar al número pedido (el LLM a veces se pasa por uno).
-    questions = questions[: payload.num_questions]
-
-    # Shuffle de opciones para no dejar siempre la correcta en el mismo lugar.
-    # Solo aplica a opción múltiple; T/F y preguntas abiertas no se modifican.
-    for q in questions:
-        if q.question_type == "multiple_choice" and len(q.options) == 4 and q.correct_index >= 0:
-            original_correct = q.options[q.correct_index]
-            random.shuffle(q.options)
-            q.correct_index = q.options.index(original_correct)
-
-    # Enriquecer preguntas con el document_id del archivo fuente (SP-10).
-    # Permite al frontend ofrecer descarga directa del material relacionado.
-    source_filenames = {q.source_filename for q in questions if q.source_filename}
-    if source_filenames:
-        doc_stmt = (
-            select(Document.filename, Document.id)
-            .where(
-                Document.course_id == payload.course_id,
-                Document.filename.in_(source_filenames),
-            )
-        )
-        doc_rows = await db.execute(doc_stmt)
-        doc_id_map: dict[str, str] = {row.filename: str(row.id) for row in doc_rows.all()}
-        for q in questions:
-            if q.source_filename and q.source_filename in doc_id_map:
-                q.source_document_id = doc_id_map[q.source_filename]
+    questions = await _run_quiz_generation(
+        chunks=chunks,
+        course_id=payload.course_id,
+        topic=payload.topic,
+        num_questions=payload.num_questions,
+        question_type=payload.question_type,
+        difficulty=payload.difficulty,
+        db=db,
+        llm=llm,
+    )
 
     return QuizResponse(
         course_id=payload.course_id,
