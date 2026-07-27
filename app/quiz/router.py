@@ -37,7 +37,7 @@ from sqlalchemy import delete, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.hmac import verify_hmac
-from app.db.models import Chunk, Document, QuizError
+from app.db.models import Chunk, Document, QuizError, UnansweredQuestion
 from app.db.session import get_db
 from app.documents.retriever import retrieve_context
 from app.gaps.recorder import WEAK_MATCH_THRESHOLD
@@ -185,6 +185,25 @@ class ReviewSuggestionsResponse(BaseModel):
     course_id: int
     total_errors: int
     suggestions: List[ReviewSuggestion]
+
+
+class StudyPlanRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    user_id: int = Field(gt=0)
+    days: int = Field(default=30, ge=1, le=365)
+
+
+class StudyPlanTopic(BaseModel):
+    topic: str
+    quiz_error_count: int
+    gap_count: int
+    reason: str
+    suggested_quiz_topic: str
+
+
+class StudyPlanResponse(BaseModel):
+    course_id: int
+    topics: List[StudyPlanTopic]
 
 
 # ============================================================
@@ -910,3 +929,156 @@ async def review_suggestions(
         total_errors=len(rows),
         suggestions=suggestions,
     )
+
+
+@router.post("/study-plan", response_model=StudyPlanResponse)
+async def study_plan(
+    payload: StudyPlanRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+    llm: LLMProvider = Depends(get_llm_provider),
+) -> StudyPlanResponse:
+    """Plan de estudio personalizado: combina errores de quiz + gaps del chat.
+
+    Dos señales de "dónde le cuesta al alumno" que hoy viven separadas:
+    errores de quiz (QuizError, agrupados por source_filename como proxy de
+    tema — igual que review_suggestions) y preguntas del chat que el
+    material no pudo responder bien (UnansweredQuestion, sin ninguna
+    columna de tema, agrupadas por texto normalizado — igual que
+    gaps/router.py, pero acá filtrado también por user_id porque esto es
+    personal del alumno, no agregado de todo el curso). Un único LLM call
+    sintetiza ambas señales en una lista unificada de temas débiles. El
+    conteo y el orden se calculan acá — nunca se confía en lo que
+    devuelva el LLM para eso.
+    """
+    since = datetime.now(timezone.utc) - timedelta(days=payload.days)
+
+    quiz_stmt = (
+        select(QuizError)
+        .where(QuizError.course_id == payload.course_id)
+        .where(QuizError.user_id == payload.user_id)
+        .where(QuizError.created_at >= since)
+        .order_by(desc(QuizError.created_at))
+        .limit(300)
+    )
+    quiz_rows = (await db.execute(quiz_stmt)).scalars().all()
+
+    norm_question = func.lower(func.trim(UnansweredQuestion.question))
+    gap_stmt = (
+        select(
+            norm_question.label("question"),
+            func.count().label("count"),
+            func.max(UnansweredQuestion.created_at).label("last_asked_at"),
+        )
+        .where(UnansweredQuestion.course_id == payload.course_id)
+        .where(UnansweredQuestion.user_id == payload.user_id)
+        .where(UnansweredQuestion.created_at >= since)
+        .group_by(norm_question)
+        .order_by(desc("count"), desc("last_asked_at"))
+        .limit(20)
+    )
+    gap_rows = (await db.execute(gap_stmt)).all()
+
+    if not quiz_rows and not gap_rows:
+        return StudyPlanResponse(course_id=payload.course_id, topics=[])
+
+    # Agrupar errores de quiz por archivo fuente (idéntico a review_suggestions).
+    quiz_groups: dict[str, dict[str, Any]] = {}
+    for r in quiz_rows:
+        key = r.source_filename or "__general__"
+        g = quiz_groups.setdefault(key, {"filename": r.source_filename, "count": 0, "samples": []})
+        g["count"] += 1
+        if len(g["samples"]) < 3:
+            g["samples"].append({"question": r.question, "explanation": r.explanation})
+    top_quiz_groups = sorted(quiz_groups.values(), key=lambda g: g["count"], reverse=True)[:5]
+
+    top_gap_groups = [{"question": row.question, "count": int(row.count)} for row in gap_rows]
+
+    prompt_blocks = []
+    for i, g in enumerate(top_quiz_groups):
+        label = g["filename"] or "Material general del curso"
+        samples_text = "\n".join(
+            f'  - Pregunta: {s["question"]}\n    Respuesta correcta: {s["explanation"]}'
+            for s in g["samples"]
+        )
+        prompt_blocks.append(f'Grupo Q{i} — errores de quiz, fuente: "{label}" ({g["count"]} errores)\n{samples_text}')
+    for j, g in enumerate(top_gap_groups):
+        prompt_blocks.append(f'Grupo G{j} — pregunta del chat sin responder bien: "{g["question"]}" ({g["count"]} veces)')
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Sos un tutor de NexusAI que arma un plan de estudio personalizado para un "
+                "alumno. Te paso dos tipos de evidencia: grupos de preguntas de quiz que "
+                "respondió mal (prefijo Q), y preguntas que le hizo al asistente de chat y "
+                "el material del curso no pudo responder bien (prefijo G). Identificá los "
+                "temas débiles más importantes combinando ambas señales — un mismo tema "
+                "puede aparecer en evidencia Q y G a la vez. Tu salida es JSON.\n\n"
+                "Devolvé EXCLUSIVAMENTE un JSON con esta forma exacta:\n"
+                '{"topics": [{"topic": "<tema en 3-6 palabras>", '
+                '"quiz_groups": [0, 2], "gap_groups": [1], '
+                '"reason": "<1-2 oraciones explicando por qué es un tema débil>", '
+                '"suggested_quiz_topic": "<2-4 palabras para buscar este tema en un generador de quiz>"}]}\n'
+                "- Máximo 6 temas, ordenados del más al menos urgente.\n"
+                "- quiz_groups/gap_groups: índices (0-based) de los grupos Q/G que sustentan ese tema — "
+                "pueden estar vacíos si el tema solo tiene evidencia de un tipo.\n"
+                "- No repitas el mismo grupo en dos temas distintos."
+            ),
+        },
+        {
+            "role": "user",
+            "content": "\n\n".join(prompt_blocks),
+        },
+    ]
+
+    try:
+        result_llm = await llm.chat_completion(
+            messages,
+            response_format={"type": "json_object"},
+            temperature=0.3,
+        )
+    except Exception as exc:
+        logger.error("Study plan LLM call failed: %s: %s", type(exc).__name__, exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudo generar el plan de estudio en este momento. Intentá de nuevo.",
+        ) from exc
+
+    raw = result_llm.text.strip()
+    if raw.startswith("```"):
+        raw = "\n".join(raw.splitlines()[1:-1]) if raw.endswith("```") else raw.strip("`")
+
+    try:
+        parsed = json.loads(raw)
+        llm_topics = parsed.get("topics", [])
+    except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as exc:
+        logger.error("Study plan JSON parse failed. Raw: %.300s", raw)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudo procesar el plan de estudio. Intentá de nuevo.",
+        ) from exc
+
+    topics: List[StudyPlanTopic] = []
+    for item in llm_topics:
+        if not isinstance(item, dict) or not item.get("topic"):
+            continue
+        quiz_idx = [i for i in item.get("quiz_groups", []) if isinstance(i, int) and 0 <= i < len(top_quiz_groups)]
+        gap_idx = [j for j in item.get("gap_groups", []) if isinstance(j, int) and 0 <= j < len(top_gap_groups)]
+        quiz_error_count = sum(top_quiz_groups[i]["count"] for i in quiz_idx)
+        gap_count = sum(top_gap_groups[j]["count"] for j in gap_idx)
+        if quiz_error_count == 0 and gap_count == 0:
+            continue
+        topics.append(
+            StudyPlanTopic(
+                topic=str(item["topic"]),
+                quiz_error_count=quiz_error_count,
+                gap_count=gap_count,
+                reason=str(item.get("reason") or ""),
+                suggested_quiz_topic=str(item.get("suggested_quiz_topic") or item["topic"]),
+            )
+        )
+
+    topics.sort(key=lambda t: t.quiz_error_count + t.gap_count, reverse=True)
+
+    return StudyPlanResponse(course_id=payload.course_id, topics=topics[:6])
