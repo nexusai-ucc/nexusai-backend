@@ -52,6 +52,7 @@ def _make_doc(**kwargs) -> SimpleNamespace:
         uploader_id=42,
         filename="apuntes.pdf",
         mime_type="application/pdf",
+        section=None,
         status="pending",
         error_message=None,
         file_hash=_PDF_HASH,
@@ -154,6 +155,25 @@ async def test_upload_new_document_returns_202(client, mock_db):
     assert data["status"] == "pending"
     assert data["filename"] == "apuntes.pdf"
     assert data["course_id"] == 1
+
+
+async def test_upload_with_section_round_trips_in_response(client, mock_db):
+    """El campo `section` (BUS-05) viaja del payload a la respuesta sin perderse."""
+    mock_db.execute.return_value = _exec_result(scalar=None)
+
+    payload = {**_BASE_PAYLOAD, "section": 2}
+    response = await client.post("/api/v1/documents", json=payload)
+
+    assert response.status_code == 202
+    assert response.json()["section"] == 2
+
+
+async def test_upload_without_section_defaults_to_none(client, mock_db):
+    mock_db.execute.return_value = _exec_result(scalar=None)
+
+    response = await client.post("/api/v1/documents", json=_BASE_PAYLOAD)
+
+    assert response.json()["section"] is None
 
 
 # ============================================================
