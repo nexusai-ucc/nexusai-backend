@@ -1,15 +1,15 @@
 """Crear tabla calendar_alerts — CAL-02
 
 Revision ID: 013_calendar_alerts
-Revises: 012_interaction_logs_message_fk
+Revises: 012_quiz_attempts
 Create Date: 2026-07-24 00:00:00.000000
 
 Alertas de calendario configurables por el alumno: un registro por (user_id, event_id)
 con columna notified para que el cron PHP no duplique notificaciones.
 
-Nota: la rama feature/sp04-sp09-fill-blank-historial también usa prefijo 013
-para su migración de quiz_attempts. La cadena de Alembic deberá resolverse
-manualmente al mergear ambas ramas a development.
+Nota: down_revision apunta a 012_quiz_attempts (rama feature/sp04-sp09-fill-blank-historial)
+porque esa migración llegó primero a development. La migración 012_interaction_logs_message_fk
+quedó absorbida en esa cadena.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision = "013_calendar_alerts"
-down_revision = "012_interaction_logs_message_fk"
+down_revision = "012_quiz_attempts"
 branch_labels = None
 depends_on = None
 
