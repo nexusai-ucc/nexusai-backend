@@ -23,11 +23,12 @@ from typing import Annotated, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.analytics.service import get_top_questions
 from app.auth.hmac import verify_hmac
-from app.db.models import InteractionLog, Message
+from app.db.models import InteractionLog
 from app.db.session import get_db
 from app.providers.llm import LLMProvider, get_llm_provider
 
@@ -153,23 +154,7 @@ async def faq_topics(
     # 1) Agrupar por pregunta normalizada, uniendo interaction_logs con el
     # mensaje de usuario real para recuperar el texto (interaction_logs no
     # guarda el texto de la pregunta, solo métricas — ver InteractionLog).
-    norm_question = func.lower(func.trim(Message.content))
-    stmt = (
-        select(
-            norm_question.label("question"),
-            func.count().label("count"),
-        )
-        .select_from(InteractionLog)
-        .join(Message, Message.id == InteractionLog.user_message_id)
-        .where(InteractionLog.course_id == payload.course_id)
-        .where(InteractionLog.created_at >= since)
-        .where(Message.role == "user")
-        .group_by(norm_question)
-        .order_by(func.count().desc())
-        .limit(_FAQ_SAMPLE_LIMIT)
-    )
-    result = await db.execute(stmt)
-    rows = result.all()
+    rows = await get_top_questions(db, payload.course_id, since, limit=_FAQ_SAMPLE_LIMIT)
 
     if not rows:
         return FaqTopicsResponse(

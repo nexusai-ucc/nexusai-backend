@@ -380,3 +380,73 @@ async def test_generate_exam_404_when_no_chunks_for_selected_documents(client, m
     response = await client.post("/api/v1/quiz/generate-exam", json=payload)
 
     assert response.status_code == 404
+
+
+# ─────────────────────────────────────────────────────────────
+# POST /attempts — ANALYTICS-01, fuente de datos para el histograma
+# de quiz scores del dashboard docente.
+# ─────────────────────────────────────────────────────────────
+
+async def test_record_attempt_recomputes_score_from_answers(client, mock_db):
+    # db.add() es sync en SQLAlchemy AsyncSession — MagicMock evita coroutine warning.
+    mock_db.add = MagicMock()
+    payload = {"course_id": 1, "user_id": 9, "total_questions": 10, "correct_answers": 7}
+
+    response = await client.post("/api/v1/quiz/attempts", json=payload)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["score"] == 0.7
+    mock_db.add.assert_called_once()
+    mock_db.commit.assert_awaited_once()
+
+
+async def test_record_attempt_ignores_score_sent_by_client(client, mock_db):
+    """El score nunca viene del cliente — solo total_questions/correct_answers."""
+    mock_db.add = MagicMock()
+    payload = {
+        "course_id": 1,
+        "user_id": 9,
+        "total_questions": 4,
+        "correct_answers": 1,
+        "score": 1.0,  # campo extra, ignorado por el schema
+    }
+
+    response = await client.post("/api/v1/quiz/attempts", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["score"] == 0.25
+
+
+async def test_record_attempt_perfect_score(client, mock_db):
+    mock_db.add = MagicMock()
+    payload = {"course_id": 1, "user_id": 9, "total_questions": 5, "correct_answers": 5}
+
+    response = await client.post("/api/v1/quiz/attempts", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["score"] == 1.0
+
+
+async def test_record_attempt_rejects_correct_greater_than_total(client):
+    payload = {"course_id": 1, "user_id": 9, "total_questions": 3, "correct_answers": 4}
+
+    response = await client.post("/api/v1/quiz/attempts", json=payload)
+
+    assert response.status_code == 422
+
+
+async def test_record_attempt_rejects_zero_total_questions(client):
+    payload = {"course_id": 1, "user_id": 9, "total_questions": 0, "correct_answers": 0}
+
+    response = await client.post("/api/v1/quiz/attempts", json=payload)
+
+    assert response.status_code == 422
+
+
+async def test_record_attempt_rejects_negative_course_id(client):
+    payload = {"course_id": -1, "user_id": 9, "total_questions": 5, "correct_answers": 3}
+
+    response = await client.post("/api/v1/quiz/attempts", json=payload)
+
+    assert response.status_code == 422

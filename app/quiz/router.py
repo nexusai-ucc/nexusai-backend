@@ -44,7 +44,7 @@ from sqlalchemy import delete, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.hmac import verify_hmac
-from app.db.models import Chunk, Document, QuizError, UnansweredQuestion
+from app.db.models import Chunk, Document, QuizAttempt, QuizError, UnansweredQuestion
 from app.db.session import get_db
 from app.documents.retriever import retrieve_context
 from app.gaps.recorder import WEAK_MATCH_THRESHOLD
@@ -214,6 +214,26 @@ class ClearErrorsRequest(BaseModel):
 
 class ClearErrorsResponse(BaseModel):
     deleted: int
+
+
+class RecordAttemptRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    user_id: int = Field(gt=0)
+    total_questions: int = Field(gt=0, le=50)
+    correct_answers: int = Field(ge=0, le=50)
+
+    @field_validator("correct_answers")
+    @classmethod
+    def check_correct_not_greater_than_total(cls, v: int, info) -> int:
+        total = info.data.get("total_questions")
+        if total is not None and v > total:
+            raise ValueError("correct_answers no puede ser mayor que total_questions")
+        return v
+
+
+class RecordAttemptResponse(BaseModel):
+    id: str
+    score: float
 
 
 class ReviewSuggestionsRequest(BaseModel):
@@ -942,6 +962,38 @@ async def clear_quiz_errors(
     result = await db.execute(stmt)
     await db.commit()
     return ClearErrorsResponse(deleted=result.rowcount or 0)
+
+
+@router.post("/attempts", response_model=RecordAttemptResponse)
+async def record_quiz_attempt(
+    payload: RecordAttemptRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+) -> RecordAttemptResponse:
+    """Persiste el resultado de un intento de quiz completo (ANALYTICS-01).
+
+    El frontend llama esto una única vez cuando el alumno termina de
+    responder todas las preguntas del quiz (multiple choice/true-false se
+    corrigen client-side contra correct_index, las abiertas ya pasaron por
+    /quiz/evaluate) — acá solo se persiste el resultado agregado. El score
+    siempre se recalcula acá a partir de correct_answers/total_questions,
+    nunca se confía en un score enviado directamente por el cliente.
+    """
+    score = round(payload.correct_answers / payload.total_questions, 4)
+    attempt_id = uuid.uuid4()
+
+    attempt = QuizAttempt(
+        id=attempt_id,
+        course_id=payload.course_id,
+        user_id=payload.user_id,
+        total_questions=payload.total_questions,
+        correct_answers=payload.correct_answers,
+        score=score,
+    )
+    db.add(attempt)
+    await db.commit()
+
+    return RecordAttemptResponse(id=str(attempt_id), score=score)
 
 
 @router.post("/review-suggestions", response_model=ReviewSuggestionsResponse)

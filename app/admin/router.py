@@ -1,5 +1,5 @@
 """
-Endpoints de monitoreo de uso de tokens — BACK-12.
+Endpoints de monitoreo y analytics para docentes — BACK-12 / ANALYTICS-01.
 
 GET /api/v1/admin/usage?course_id=X
   Devuelve:
@@ -7,24 +7,48 @@ GET /api/v1/admin/usage?course_id=X
     - total_messages (solo mensajes tipo 'assistant', es decir, respuestas del LLM)
     - desglose por sesión: session_id, tokens, message_count
 
-Solo accesible con HMAC válido (mismo esquema que el resto de la API).
+GET /api/v1/admin/analytics?course_id=X&days=30
+  Dashboard agregado de métricas de un curso para el docente (ANALYTICS-01):
+    - top_queries: hasta 10 preguntas más frecuentes (agrupadas por texto
+      normalizado — bag-of-words literal, reusa la misma query que
+      analytics/faq-topics vía app.analytics.service, sin llamar al LLM
+      porque acá no hace falta sintetizar temas, solo listar lo más pedido)
+    - daily_message_counts: serie temporal {date, message_count} de los
+      últimos N días (reusa app.analytics.service, misma fuente que
+      analytics/course-stats: interaction_logs, DOC-D01)
+    - quiz_score_distribution: histograma de puntajes sobre quiz_attempts
+      (ANALYTICS-01) — a diferencia de quiz_errors, que solo registra
+      respuestas incorrectas, quiz_attempts persiste el score de CADA
+      intento completo vía POST /api/v1/quiz/attempts
+    - gaps_ratio: gaps detectados (unanswered_questions, DOC-D03) sobre
+      preguntas respondidas (interaction_logs) en el mismo período
+
+Ambos endpoints solo requieren HMAC válido — la validación de rol docente
+(capability local/nexusai:viewanalytics) se hace del lado del plugin PHP
+antes de llamar al backend, como el resto de la API (arquitectura Hybrid
+PHP Proxy, ver app/auth/hmac.py).
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.analytics.service import get_daily_message_counts, get_top_questions
 from app.auth.hmac import verify_hmac
-from app.db.models import ChatSession, Message
+from app.db.models import ChatSession, InteractionLog, Message, QuizAttempt, UnansweredQuestion
 from app.db.session import get_db
 
 router = APIRouter()
+
+_TOP_QUERIES_LIMIT = 10
+_QUIZ_SCORE_BUCKETS = ["0-20", "20-40", "40-60", "60-80", "80-100"]
 
 
 # ============================================================
@@ -42,6 +66,42 @@ class CourseUsage(BaseModel):
     total_tokens: int
     total_messages: int
     sessions: List[SessionUsage]
+
+
+class TopQuery(BaseModel):
+    question: str
+    count: int
+
+
+class DailyMessageCount(BaseModel):
+    date: str
+    message_count: int
+
+
+class QuizScoreBucket(BaseModel):
+    range: str
+    count: int
+
+
+class QuizScoreDistribution(BaseModel):
+    total_attempts: int
+    average_score: float
+    buckets: List[QuizScoreBucket]
+
+
+class GapsRatio(BaseModel):
+    gaps_detected: int
+    questions_answered: int
+    ratio: float
+
+
+class CourseAnalytics(BaseModel):
+    course_id: int
+    period_days: int
+    top_queries: List[TopQuery]
+    daily_message_counts: List[DailyMessageCount]
+    quiz_score_distribution: QuizScoreDistribution
+    gaps_ratio: GapsRatio
 
 
 # ============================================================
@@ -120,4 +180,100 @@ async def get_usage(
             )
             for row in sessions_rows
         ],
+    )
+
+
+# ============================================================
+# Analytics — ANALYTICS-01
+# ============================================================
+
+def _bucket_for_score(score: float) -> str:
+    """Mapea un score 0.0-1.0 a uno de los 5 buckets de 20 puntos."""
+    pct = min(max(score, 0.0), 1.0) * 100
+    idx = min(int(pct // 20), len(_QUIZ_SCORE_BUCKETS) - 1)
+    return _QUIZ_SCORE_BUCKETS[idx]
+
+
+async def _get_quiz_score_distribution(
+    db: AsyncSession, course_id: int, since: datetime
+) -> QuizScoreDistribution:
+    stmt = select(QuizAttempt.score).where(
+        QuizAttempt.course_id == course_id,
+        QuizAttempt.created_at >= since,
+    )
+    result = await db.execute(stmt)
+    scores = [row[0] for row in result.all()]
+
+    counts = {bucket: 0 for bucket in _QUIZ_SCORE_BUCKETS}
+    for score in scores:
+        counts[_bucket_for_score(score)] += 1
+
+    total = len(scores)
+    average = round(sum(scores) / total, 4) if total else 0.0
+
+    return QuizScoreDistribution(
+        total_attempts=total,
+        average_score=average,
+        buckets=[QuizScoreBucket(range=b, count=counts[b]) for b in _QUIZ_SCORE_BUCKETS],
+    )
+
+
+async def _get_gaps_ratio(db: AsyncSession, course_id: int, since: datetime) -> GapsRatio:
+    gaps_stmt = (
+        select(func.count())
+        .select_from(UnansweredQuestion)
+        .where(
+            UnansweredQuestion.course_id == course_id,
+            UnansweredQuestion.created_at >= since,
+        )
+    )
+    gaps_detected = (await db.execute(gaps_stmt)).scalar_one()
+
+    answered_stmt = (
+        select(func.count())
+        .select_from(InteractionLog)
+        .where(
+            InteractionLog.course_id == course_id,
+            InteractionLog.created_at >= since,
+        )
+    )
+    questions_answered = (await db.execute(answered_stmt)).scalar_one()
+
+    ratio = round(gaps_detected / questions_answered, 4) if questions_answered else 0.0
+
+    return GapsRatio(
+        gaps_detected=gaps_detected,
+        questions_answered=questions_answered,
+        ratio=ratio,
+    )
+
+
+@router.get("/analytics", response_model=CourseAnalytics)
+async def get_course_analytics(
+    course_id: int = Query(..., gt=0),
+    days: int = Query(default=30, ge=1, le=365),
+    _body: Annotated[bytes, Depends(verify_hmac)] = b"",
+    db: AsyncSession = Depends(get_db),
+) -> CourseAnalytics:
+    """Dashboard agregado de métricas de un curso para el docente (ANALYTICS-01)."""
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+
+    top_rows = await get_top_questions(db, course_id, since, limit=_TOP_QUERIES_LIMIT)
+    top_queries = [TopQuery(question=r.question, count=r.count) for r in top_rows]
+
+    daily = await get_daily_message_counts(db, course_id, since)
+    daily_message_counts = [
+        DailyMessageCount(date=d, message_count=c) for d, c in sorted(daily.items())
+    ]
+
+    quiz_score_distribution = await _get_quiz_score_distribution(db, course_id, since)
+    gaps_ratio = await _get_gaps_ratio(db, course_id, since)
+
+    return CourseAnalytics(
+        course_id=course_id,
+        period_days=days,
+        top_queries=top_queries,
+        daily_message_counts=daily_message_counts,
+        quiz_score_distribution=quiz_score_distribution,
+        gaps_ratio=gaps_ratio,
     )
