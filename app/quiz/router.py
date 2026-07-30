@@ -259,7 +259,6 @@ class RecordAttemptRequest(BaseModel):
 class RecordAttemptResponse(BaseModel):
     id: str
     score: float
-    created_at: datetime
 
 
 class AttemptsListRequest(BaseModel):
@@ -1185,8 +1184,7 @@ async def record_quiz_attempt(
     )
     db.add(row)
     await db.commit()
-    await db.refresh(row)
-    return RecordAttemptResponse(id=str(row.id), score=score, created_at=row.created_at)
+    return RecordAttemptResponse(id=str(row.id), score=score)
 
 
 @router.post("/attempts/list", response_model=AttemptsListResponse)
