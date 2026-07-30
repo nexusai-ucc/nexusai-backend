@@ -214,6 +214,35 @@ class UnansweredQuestion(Base):
     )
 
 
+class QuizAttempt(Base):
+    """Intento completado de quiz (SP-09 + ANALYTICS-01).
+
+    Registra cada sesión de quiz que el alumno finaliza. Sirve para:
+    - SP-09: historial de práctica del alumno (question_type, difficulty, topic).
+    - ANALYTICS-01: histograma de puntajes por curso para el dashboard docente (score).
+    """
+    __tablename__ = "quiz_attempts"
+    __table_args__ = (
+        Index("ix_quiz_attempts_user_id_course_id_created_at", "user_id", "course_id", "created_at"),
+        Index("ix_quiz_attempts_course_id_created_at", "course_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    course_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    question_type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    difficulty: Mapped[str] = mapped_column(String(10), nullable=False, default="medium")
+    topic: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    total_questions: Mapped[int] = mapped_column(Integer, nullable=False)
+    correct_answers: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class QuizError(Base):
     """Pregunta de quiz que el alumno respondió mal (SP-10 — repaso basado en errores).
 
@@ -250,34 +279,3 @@ class QuizError(Base):
     )
 
 
-class QuizAttempt(Base):
-    """Resultado agregado de un intento de quiz completo (ANALYTICS-01).
-
-    A diferencia de QuizError (solo errores), esta tabla registra CADA
-    intento de quiz que el alumno termina, con su score total — es la
-    fuente de datos para el histograma de puntajes por curso del dashboard
-    docente. Se persiste vía POST /api/v1/quiz/attempts, que el frontend
-    llama una vez cuando el alumno termina de responder todas las
-    preguntas (la corrección de multiple choice/true-false es client-side,
-    la de preguntas abiertas usa /quiz/evaluate — acá solo se guarda el
-    resultado final ya calculado).
-    """
-    __tablename__ = "quiz_attempts"
-    __table_args__ = (
-        Index("ix_quiz_attempts_course_id_created_at", "course_id", "created_at"),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    course_id: Mapped[int] = mapped_column(Integer, nullable=False)
-    user_id: Mapped[int] = mapped_column(Integer, nullable=False)
-    total_questions: Mapped[int] = mapped_column(Integer, nullable=False)
-    correct_answers: Mapped[int] = mapped_column(Integer, nullable=False)
-    # Ratio 0.0-1.0, siempre recalculado en el backend a partir de
-    # correct_answers/total_questions — nunca se confía en un score
-    # enviado por el cliente (mismo principio que faq-topics).
-    score: Mapped[float] = mapped_column(Float, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )

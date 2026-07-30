@@ -1,13 +1,12 @@
-"""Add quiz_attempts table — ANALYTICS-01 (histograma de quiz scores por curso)
+"""Add quiz_attempts table — SP-09 + ANALYTICS-01 (historial y métricas de quizzes)
 
 Revision ID: 014_quiz_attempts
 Revises: 013_document_section
-Create Date: 2026-07-29 00:00:00.000000
+Create Date: 2026-07-30 00:00:00.000000
 
-quiz_errors solo registra respuestas incorrectas, así que no alcanza para un
-histograma representativo de puntajes (queda sesgado hacia errores). Esta
-tabla registra el resultado de CADA intento de quiz completo (score total),
-alimentando GET /api/v1/admin/analytics.
+Unifica SP-09 (historial de práctica del alumno: question_type, difficulty, topic)
+con ANALYTICS-01 (histograma de puntajes por curso: score). El score se
+calcula server-side a partir de correct_answers/total_questions.
 """
 
 from __future__ import annotations
@@ -33,9 +32,12 @@ def upgrade() -> None:
             sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
             sa.Column("course_id", sa.Integer(), nullable=False),
             sa.Column("user_id", sa.Integer(), nullable=False),
+            sa.Column("question_type", sa.String(length=20), nullable=True),
+            sa.Column("difficulty", sa.String(length=10), nullable=False, server_default="medium"),
+            sa.Column("topic", sa.String(length=200), nullable=True),
             sa.Column("total_questions", sa.Integer(), nullable=False),
-            sa.Column("correct_answers", sa.Integer(), nullable=False),
-            sa.Column("score", sa.Float(), nullable=False),
+            sa.Column("correct_answers", sa.Integer(), nullable=False, server_default="0"),
+            sa.Column("score", sa.Float(), nullable=False, server_default="0.0"),
             sa.Column(
                 "created_at",
                 sa.DateTime(timezone=True),
@@ -45,6 +47,12 @@ def upgrade() -> None:
         )
 
     existing_indexes = {idx["name"] for idx in inspector.get_indexes("quiz_attempts")}
+    if "ix_quiz_attempts_user_id_course_id_created_at" not in existing_indexes:
+        op.create_index(
+            "ix_quiz_attempts_user_id_course_id_created_at",
+            "quiz_attempts",
+            ["user_id", "course_id", "created_at"],
+        )
     if "ix_quiz_attempts_course_id_created_at" not in existing_indexes:
         op.create_index(
             "ix_quiz_attempts_course_id_created_at",
@@ -55,4 +63,5 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_index("ix_quiz_attempts_course_id_created_at", "quiz_attempts")
+    op.drop_index("ix_quiz_attempts_user_id_course_id_created_at", "quiz_attempts")
     op.drop_table("quiz_attempts")
