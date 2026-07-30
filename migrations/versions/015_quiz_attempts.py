@@ -1,7 +1,7 @@
 """Add quiz_attempts table — SP-09 + ANALYTICS-01 (historial y métricas de quizzes)
 
-Revision ID: 014_quiz_attempts
-Revises: 013_document_section
+Revision ID: 015_quiz_attempts
+Revises: 014_calendar_alerts
 Create Date: 2026-07-30 00:00:00.000000
 
 Unifica SP-09 (historial de práctica del alumno: question_type, difficulty, topic)
@@ -15,8 +15,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision = "014_quiz_attempts"
-down_revision = "013_document_section"
+revision = "015_quiz_attempts"
+down_revision = "014_calendar_alerts"
 branch_labels = None
 depends_on = None
 
