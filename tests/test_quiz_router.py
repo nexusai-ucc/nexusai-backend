@@ -10,6 +10,7 @@ Misma estrategia de aislamiento que test_forums_router.py:
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -22,7 +23,7 @@ from app.auth.hmac import verify_hmac
 from app.db.session import get_db
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
-from app.quiz.router import QuizRequest, _build_quiz_prompt
+from app.quiz.router import ExamGenerateRequest, QuizRequest, _build_quiz_prompt
 
 
 # ─────────────────────────────────────────────────────────────
@@ -173,3 +174,209 @@ async def test_generate_rejects_invalid_difficulty_at_http_level(client):
     response = await client.post("/api/v1/quiz/generate", json=payload)
 
     assert response.status_code == 422
+
+
+# ─────────────────────────────────────────────────────────────
+# POST /study-plan — combina QuizError + UnansweredQuestion
+# ─────────────────────────────────────────────────────────────
+
+def _quiz_error_row(**kwargs):
+    defaults = dict(
+        source_filename="apunte1.pdf",
+        question="¿Cuál es la derivada de x^2?",
+        explanation="2x",
+        created_at=datetime.now(timezone.utc),
+    )
+    defaults.update(kwargs)
+    return SimpleNamespace(**defaults)
+
+
+def _gap_row(**kwargs):
+    defaults = dict(
+        question="que es una integral impropia",
+        count=3,
+        last_asked_at=datetime.now(timezone.utc),
+    )
+    defaults.update(kwargs)
+    return SimpleNamespace(**defaults)
+
+
+def _mock_quiz_result(rows):
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = rows
+    return result
+
+
+def _mock_gap_result(rows):
+    result = MagicMock()
+    result.all.return_value = rows
+    return result
+
+
+_STUDY_PLAN_PAYLOAD = {"course_id": 1, "user_id": 1}
+
+
+async def test_study_plan_skips_llm_when_no_signal(client, mock_db, mock_llm):
+    mock_db.execute.side_effect = [_mock_quiz_result([]), _mock_gap_result([])]
+
+    response = await client.post("/api/v1/quiz/study-plan", json=_STUDY_PLAN_PAYLOAD)
+
+    assert response.status_code == 200
+    assert response.json()["topics"] == []
+    mock_llm.chat_completion.assert_not_called()
+
+
+async def test_study_plan_combines_quiz_errors_and_gaps(client, mock_db, mock_llm):
+    mock_db.execute.side_effect = [
+        _mock_quiz_result([_quiz_error_row(), _quiz_error_row()]),
+        _mock_gap_result([_gap_row()]),
+    ]
+    llm_response = {
+        "topics": [
+            {
+                "topic": "Derivadas",
+                "quiz_groups": [0],
+                "gap_groups": [],
+                "reason": "Fallaste 2 preguntas sobre derivadas.",
+                "suggested_quiz_topic": "derivadas",
+            },
+            {
+                "topic": "Integrales impropias",
+                "quiz_groups": [],
+                "gap_groups": [0],
+                "reason": "Preguntaste esto 3 veces sin buena respuesta.",
+                "suggested_quiz_topic": "integrales impropias",
+            },
+        ]
+    }
+    mock_llm.chat_completion.return_value = MagicMock(text=json.dumps(llm_response))
+
+    response = await client.post("/api/v1/quiz/study-plan", json=_STUDY_PLAN_PAYLOAD)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data["topics"]) == 2
+    # Orden por (quiz_error_count + gap_count) desc: "Integrales impropias" (3)
+    # queda antes que "Derivadas" (2), aunque el LLM las haya listado al revés.
+    assert data["topics"][0]["topic"] == "Integrales impropias"
+    assert data["topics"][0]["gap_count"] == 3
+    assert data["topics"][1]["topic"] == "Derivadas"
+    assert data["topics"][1]["quiz_error_count"] == 2
+    assert data["topics"][1]["gap_count"] == 0
+
+
+async def test_study_plan_never_trusts_llm_counts(client, mock_db, mock_llm):
+    """El LLM podría devolver counts propios — Python siempre los recalcula."""
+    mock_db.execute.side_effect = [
+        _mock_quiz_result([_quiz_error_row()]),
+        _mock_gap_result([]),
+    ]
+    llm_response = {
+        "topics": [
+            {
+                "topic": "Derivadas",
+                "quiz_groups": [0],
+                "gap_groups": [],
+                "quiz_error_count": 999,
+                "gap_count": 999,
+            }
+        ]
+    }
+    mock_llm.chat_completion.return_value = MagicMock(text=json.dumps(llm_response))
+
+    response = await client.post("/api/v1/quiz/study-plan", json=_STUDY_PLAN_PAYLOAD)
+
+    data = response.json()
+    assert data["topics"][0]["quiz_error_count"] == 1
+    assert data["topics"][0]["gap_count"] == 0
+
+
+async def test_study_plan_ignores_out_of_range_group_indices(client, mock_db, mock_llm):
+    mock_db.execute.side_effect = [
+        _mock_quiz_result([_quiz_error_row()]),
+        _mock_gap_result([]),
+    ]
+    llm_response = {
+        "topics": [
+            {"topic": "Tema inventado", "quiz_groups": [99], "gap_groups": [5]},
+            {"topic": "Derivadas", "quiz_groups": [0], "gap_groups": []},
+        ]
+    }
+    mock_llm.chat_completion.return_value = MagicMock(text=json.dumps(llm_response))
+
+    response = await client.post("/api/v1/quiz/study-plan", json=_STUDY_PLAN_PAYLOAD)
+
+    data = response.json()
+    # "Tema inventado" no cita ningún grupo válido -> queda afuera.
+    assert len(data["topics"]) == 1
+    assert data["topics"][0]["topic"] == "Derivadas"
+
+
+# ─────────────────────────────────────────────────────────────
+# ExamGenerateRequest — validación (EVAL-01 / issue #235)
+# ─────────────────────────────────────────────────────────────
+
+_VALID_DOC_ID = "00000000-0000-0000-0000-000000000001"
+
+
+def test_exam_request_accepts_valid_payload():
+    req = ExamGenerateRequest(
+        course_id=1, user_id=5, document_ids=[_VALID_DOC_ID], question_type="true_false"
+    )
+    assert req.document_ids == [_VALID_DOC_ID]
+    assert req.question_type == "true_false"
+    assert req.num_questions == 10  # default
+
+
+def test_exam_request_rejects_empty_document_ids():
+    with pytest.raises(ValidationError):
+        ExamGenerateRequest(course_id=1, user_id=5, document_ids=[])
+
+
+def test_exam_request_rejects_non_uuid_document_id():
+    with pytest.raises(ValidationError):
+        ExamGenerateRequest(course_id=1, user_id=5, document_ids=["not-a-uuid"])
+
+
+def test_exam_request_rejects_flashcard_type():
+    # flashcard es válido para el quiz de alumno pero no tiene sentido en un examen.
+    with pytest.raises(ValidationError):
+        ExamGenerateRequest(course_id=1, user_id=5, document_ids=[_VALID_DOC_ID], question_type="flashcard")
+
+
+# ─────────────────────────────────────────────────────────────
+# POST /generate-exam — endpoint end-to-end
+# ─────────────────────────────────────────────────────────────
+
+async def test_generate_exam_returns_200_with_expected_shape(client):
+    payload = {
+        "course_id": 1,
+        "user_id": 9,
+        "document_ids": [_VALID_DOC_ID],
+        "num_questions": 1,
+        "question_type": "multiple_choice",
+    }
+
+    response = await client.post("/api/v1/quiz/generate-exam", json=payload)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["course_id"] == 1
+    assert len(data["questions"]) == 1
+
+
+async def test_generate_exam_rejects_empty_document_ids_at_http_level(client):
+    payload = {"course_id": 1, "user_id": 9, "document_ids": []}
+
+    response = await client.post("/api/v1/quiz/generate-exam", json=payload)
+
+    assert response.status_code == 422
+
+
+async def test_generate_exam_404_when_no_chunks_for_selected_documents(client, mock_db):
+    mock_db.execute.return_value.all.return_value = []
+    payload = {"course_id": 1, "user_id": 9, "document_ids": [_VALID_DOC_ID]}
+
+    response = await client.post("/api/v1/quiz/generate-exam", json=payload)
+
+    assert response.status_code == 404
