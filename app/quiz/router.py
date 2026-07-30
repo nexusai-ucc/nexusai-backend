@@ -44,7 +44,7 @@ from sqlalchemy import delete, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.hmac import verify_hmac
-from app.db.models import Chunk, Document, QuizError, UnansweredQuestion
+from app.db.models import Chunk, Document, QuizAttempt, QuizError, UnansweredQuestion
 from app.db.session import get_db
 from app.documents.retriever import retrieve_context
 from app.gaps.recorder import WEAK_MATCH_THRESHOLD
@@ -57,7 +57,7 @@ logger = logging.getLogger("nexusai.quiz")
 # Higher than WEAK_MATCH_THRESHOLD (0.4) to reject spurious cross-lingual matches.
 QUIZ_TOPIC_MIN_SIMILARITY = 0.5
 
-_VALID_QUESTION_TYPES = {"multiple_choice", "true_false", "open", "mix", "flashcard"}
+_VALID_QUESTION_TYPES = {"multiple_choice", "true_false", "open", "mix", "flashcard", "fill_blank"}
 _VALID_DIFFICULTIES = {"easy", "medium", "hard"}
 
 router = APIRouter()
@@ -235,6 +235,45 @@ class ReviewSuggestionsResponse(BaseModel):
     course_id: int
     total_errors: int
     suggestions: List[ReviewSuggestion]
+
+
+class RecordAttemptRequest(BaseModel):
+    """Intento de quiz completado por el alumno (SP-09)."""
+    course_id: int = Field(gt=0)
+    user_id: int = Field(gt=0)
+    question_type: str = Field(max_length=20)
+    difficulty: str = Field(default="medium", max_length=10)
+    topic: Optional[str] = Field(default=None, max_length=200)
+    total_questions: int = Field(ge=1, le=10)
+    correct_count: int = Field(ge=0)
+
+
+class RecordAttemptResponse(BaseModel):
+    id: str
+    created_at: datetime
+
+
+class AttemptsListRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    user_id: int = Field(gt=0)
+    days: int = Field(default=90, ge=1, le=365)
+    limit: int = Field(default=20, ge=1, le=100)
+
+
+class AttemptItem(BaseModel):
+    id: str
+    question_type: str
+    difficulty: str
+    topic: Optional[str]
+    total_questions: int
+    correct_count: int
+    created_at: datetime
+
+
+class AttemptsListResponse(BaseModel):
+    course_id: int
+    total: int
+    items: List[AttemptItem]
 
 
 class StudyPlanRequest(BaseModel):
@@ -535,6 +574,34 @@ def _build_quiz_prompt(
         )
         type_instruction = f"Generá {num_questions} flashcards de práctica (pregunta corta / respuesta corta).\n\n"
 
+    elif question_type == "fill_blank":
+        schema_hint = (
+            "Devolvé EXCLUSIVAMENTE un JSON válido con esta forma exacta:\n"
+            '{\n  "questions": [\n    {\n'
+            '      "question_type": "fill_blank",\n'
+            '      "question": "<oración con exactamente un _____ donde falta la palabra>",\n'
+            '      "options": [],\n'
+            '      "correct_index": -1,\n'
+            '      "explanation": "<palabra_correcta> — <justificación breve basada en el material>",\n'
+            '      "source_filename": "<nombre del archivo fuente>"\n'
+            '    }\n  ]\n}\n' + error_clause
+        )
+        rules = (
+            "Reglas:\n"
+            "1. options SIEMPRE es [] (array vacío).\n"
+            "2. correct_index SIEMPRE es -1.\n"
+            "3. La 'question' es una oración con EXACTAMENTE UN espacio en blanco marcado como '_____' (5 guiones bajos).\n"
+            "4. La palabra omitida DEBE ser un término técnico, conceptual o relevante del material.\n"
+            "5. La oración debe tener suficiente contexto para que se pueda deducir la palabra correcta.\n"
+            "6. NO uses oraciones ambiguas donde varias palabras serían igualmente correctas.\n"
+            "7. El 'explanation' comienza con la palabra correcta, seguida de ' — ' y luego una justificación breve.\n"
+            "   Ejemplo: \"mitocondria — La mitocondria es el orgánulo encargado de la respiración celular aeróbica.\"\n"
+            "8. Las oraciones DEBEN basarse en el material entregado.\n"
+            "9. source_filename DEBE ser uno de los nombres de archivo del material.\n"
+            "10. NO usar markdown ni texto fuera del JSON.\n"
+        )
+        type_instruction = f"Generá {num_questions} ejercicios de completar espacios en blanco.\n\n"
+
     else:  # multiple_choice (default)
         schema_hint = (
             "Devolvé EXCLUSIVAMENTE un JSON válido con esta forma exacta:\n"
@@ -577,6 +644,7 @@ def _build_quiz_prompt(
         "open": "preguntas abiertas evaluadas por IA",
         "mix": "mixto (opción múltiple, V/F y preguntas abiertas)",
         "flashcard": "flashcards de pregunta y respuesta corta",
+        "fill_blank": "completar espacios en blanco",
     }.get(question_type, "opción múltiple")
 
     difficulty_line = _DIFFICULTY_INSTRUCTIONS.get(difficulty, _DIFFICULTY_INSTRUCTIONS["medium"])
@@ -1077,6 +1145,73 @@ async def review_suggestions(
     )
 
 
+# ============================================================
+# Historial de quizzes — SP-09
+# ============================================================
+
+@router.post("/attempts", response_model=RecordAttemptResponse)
+async def record_quiz_attempt(
+    payload: RecordAttemptRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+) -> RecordAttemptResponse:
+    """Persiste el resultado de un quiz completado por el alumno (SP-09).
+
+    Llamado best-effort desde el frontend al llegar a la pantalla de
+    resultado final. Registra tipo, dificultad, tema y puntaje para
+    mostrar el historial de práctica del alumno.
+    """
+    row = QuizAttempt(
+        course_id=payload.course_id,
+        user_id=payload.user_id,
+        question_type=payload.question_type,
+        difficulty=payload.difficulty,
+        topic=payload.topic,
+        total_questions=payload.total_questions,
+        correct_count=min(payload.correct_count, payload.total_questions),
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return RecordAttemptResponse(id=str(row.id), created_at=row.created_at)
+
+
+@router.post("/attempts/list", response_model=AttemptsListResponse)
+async def list_quiz_attempts(
+    payload: AttemptsListRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+) -> AttemptsListResponse:
+    """Historial de quizzes completados por el alumno en un curso, más recientes primero (SP-09)."""
+    since = datetime.now(timezone.utc) - timedelta(days=payload.days)
+
+    stmt = (
+        select(QuizAttempt)
+        .where(QuizAttempt.course_id == payload.course_id)
+        .where(QuizAttempt.user_id == payload.user_id)
+        .where(QuizAttempt.created_at >= since)
+        .order_by(desc(QuizAttempt.created_at))
+        .limit(payload.limit)
+    )
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+
+    items = [
+        AttemptItem(
+            id=str(r.id),
+            question_type=r.question_type,
+            difficulty=r.difficulty,
+            topic=r.topic,
+            total_questions=r.total_questions,
+            correct_count=r.correct_count,
+            created_at=r.created_at,
+        )
+        for r in rows
+    ]
+    return AttemptsListResponse(course_id=payload.course_id, total=len(items), items=items)
+
+
+
 @router.post("/study-plan", response_model=StudyPlanResponse)
 async def study_plan(
     payload: StudyPlanRequest,
@@ -1228,3 +1363,4 @@ async def study_plan(
     topics.sort(key=lambda t: t.quiz_error_count + t.gap_count, reverse=True)
 
     return StudyPlanResponse(course_id=payload.course_id, topics=topics[:6])
+
