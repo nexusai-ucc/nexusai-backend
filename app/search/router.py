@@ -14,6 +14,7 @@ compartida con chat/quiz. La query híbrida vive exclusivamente aquí.
 
 from __future__ import annotations
 
+import logging
 from typing import Annotated, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -25,6 +26,7 @@ from app.auth.hmac import verify_hmac
 from app.db.session import get_db
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 
+logger = logging.getLogger("nexusai.search")
 router = APIRouter()
 
 _MIN_COMBINED_SCORE = 0.35
@@ -128,6 +130,7 @@ async def search(
         )
         rows = result.all()
     except Exception as exc:
+        logger.error("Search failed: %s", exc, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="El servicio de búsqueda no está disponible temporalmente",
