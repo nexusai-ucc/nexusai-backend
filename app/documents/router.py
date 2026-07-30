@@ -90,6 +90,9 @@ class DocumentUploadRequest(BaseModel):
         min_length=1,
         description="Archivo encodeado en base64. Tamaño máximo decodeado: 20 MB",
     )
+    section: Optional[int] = Field(
+        default=None, ge=0, description="Número de sección/unidad del curso (BUS-05)"
+    )
 
 
 class DocumentOut(BaseModel):
@@ -100,6 +103,7 @@ class DocumentOut(BaseModel):
     uploader_id: int
     filename: str
     mime_type: str
+    section: Optional[int] = None
     status: str  # pending | indexing | indexed | error
     error_message: Optional[str] = None
     created_at: Optional[datetime] = None
@@ -113,6 +117,7 @@ class DocumentOut(BaseModel):
             uploader_id=doc.uploader_id,
             filename=doc.filename,
             mime_type=doc.mime_type,
+            section=doc.section,
             status=doc.status,
             error_message=doc.error_message,
             created_at=doc.created_at,
@@ -257,6 +262,7 @@ async def upload_document(
         uploader_id=payload.uploader_id,
         filename=payload.filename,
         mime_type=payload.mime_type,
+        section=payload.section,
         status="pending",
         file_hash=file_hash,
     )

@@ -39,6 +39,7 @@ _HYBRID_SQL = text("""
         d.filename        AS document_filename,
         d.course_id,
         d.mime_type,
+        d.section,
         (d.storage_path IS NOT NULL AND d.storage_path != '') AS has_file,
         1 - (c.embedding <=> CAST(:query_embedding AS vector))                          AS semantic_score,
         COALESCE(ts_rank(c.content_tsv, plainto_tsquery('simple', :query_text)), 0)    AS lexical_score,
@@ -52,7 +53,12 @@ _HYBRID_SQL = text("""
         d.course_id IN :course_ids
         AND d.status = 'indexed'
         AND c.embedding IS NOT NULL
-        AND (CAST(:material_type AS TEXT) IS NULL OR d.mime_type = CAST(:material_type AS TEXT))
+        AND (CAST(:material_type AS text) IS NULL OR d.mime_type = CAST(:material_type AS text))
+        AND (
+            (CAST(:section AS integer) IS NULL AND NOT CAST(:section_unassigned AS boolean))
+            OR (CAST(:section_unassigned AS boolean) AND d.section IS NULL)
+            OR (NOT CAST(:section_unassigned AS boolean) AND d.section = CAST(:section AS integer))
+        )
         AND (
             1 - (c.embedding <=> CAST(:query_embedding AS vector)) >= 0.32
             OR c.content_tsv @@ plainto_tsquery('simple', :query_text)
@@ -70,6 +76,8 @@ class SearchRequest(BaseModel):
     top_k: int = Field(default=5, ge=1, le=10)
     course_ids: Optional[List[int]] = Field(default=None)
     material_type: Optional[str] = Field(default=None)
+    section: Optional[int] = Field(default=None)
+    section_unassigned: bool = Field(default=False)
 
 
 class SearchResult(BaseModel):
@@ -81,6 +89,7 @@ class SearchResult(BaseModel):
     similarity: float
     has_file: bool = False
     mime_type: Optional[str] = None
+    section: Optional[int] = None
 
 
 class SearchResponse(BaseModel):
@@ -115,6 +124,8 @@ async def search(
                 "top_k": payload.top_k,
                 "filename_pattern": f"%{payload.query.strip()}%",
                 "material_type": payload.material_type,
+                "section": payload.section,
+                "section_unassigned": payload.section_unassigned,
             },
         )
         rows = result.all()
@@ -145,6 +156,7 @@ async def search(
             similarity=round(float(row.combined_score), 3),
             has_file=bool(row.has_file),
             mime_type=row.mime_type,
+            section=row.section,
         )
         for row in deduped
     ]
