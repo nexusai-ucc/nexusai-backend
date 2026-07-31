@@ -44,7 +44,7 @@ from app.db.models import Document
 from app.db.session import get_db, get_session_factory
 from app.documents.extractor import SUPPORTED_MIME_TYPES
 from app.documents.pipeline import index_document
-from app.documents.summarizer import summarize_document
+from app.documents.summarizer import summarize_document, summarize_pre_exam
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
 
@@ -407,6 +407,53 @@ async def summarize_document_endpoint(
         ) from exc
 
     return SummarizeResponse(**result)
+
+
+class PreExamSummaryRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    user_id: int = Field(gt=0)
+    section: Optional[int] = Field(default=None)
+
+
+class DocumentUsed(BaseModel):
+    document_id: str
+    filename: str
+
+
+class PreExamSummaryResponse(BaseModel):
+    summary: str
+    documents_used: list[DocumentUsed]
+    total_documents: int
+
+
+@router.post("/pre-exam-summary", response_model=PreExamSummaryResponse)
+async def pre_exam_summary_endpoint(
+    payload: PreExamSummaryRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+    llm: LLMProvider = Depends(get_llm_provider),
+) -> PreExamSummaryResponse:
+    """Resumen de repaso combinando todo el material indexado relevante para
+    un próximo examen (BUS-04). Opcionalmente acotado a una unidad/sección.
+
+    Reusa summarize_document por cada documento y hace una única síntesis
+    final. Si no hay documentos indexados (para el curso o la sección
+    elegida), devuelve summary="" sin llamar al LLM.
+    """
+    try:
+        result = await summarize_pre_exam(
+            course_id=payload.course_id,
+            db=db,
+            llm=llm,
+            section=payload.section,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="El servicio de resumen no está disponible temporalmente",
+        ) from exc
+
+    return PreExamSummaryResponse(**result)
 
 
 @router.delete(
