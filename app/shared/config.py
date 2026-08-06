@@ -1,3 +1,5 @@
+from typing import Optional
+
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 
@@ -9,6 +11,13 @@ class Settings(BaseSettings):
     llm_api_key: str
     llm_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
     llm_model: str = "gemini-2.0-flash"
+
+    # LLM — proveedor secundario (fallback automático, INFRA-01 / issue #307).
+    # Opcionales: si los 3 no están seteados, el fallback queda deshabilitado
+    # y el comportamiento es idéntico al de antes (un solo proveedor).
+    llm_fallback_api_key: Optional[str] = None
+    llm_fallback_base_url: Optional[str] = None
+    llm_fallback_model: Optional[str] = None
 
     # Embeddings
     embedding_api_key: str

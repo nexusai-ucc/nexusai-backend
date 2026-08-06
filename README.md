@@ -223,6 +223,43 @@ Todas viven en el `.env` raíz del repo (no acá). Detalle en
 | `HMAC_REPLAY_WINDOW_SEC` | `300` | Ventana de tolerancia para clock skew |
 | `RATE_LIMIT_PER_USER_DAILY` | `50` | Implementación pendiente Sprint 2 |
 | `API_PORT` | `8001` | Puerto en el host (8000 dentro del container) |
+| `LLM_FALLBACK_API_KEY` | — (opcional) | Key del proveedor secundario. Ver "Fallback automático entre proveedores" abajo |
+| `LLM_FALLBACK_BASE_URL` | — (opcional) | Endpoint del proveedor secundario (ej. `https://api.openai.com/v1`) |
+| `LLM_FALLBACK_MODEL` | — (opcional) | Modelo del proveedor secundario (ej. `gpt-4o-mini`) |
+
+### Fallback automático entre proveedores (INFRA-01 / issue #307)
+
+El 31/07 y 01/08 el proyecto de Gemini agotó la cuota gratuita diaria (20
+requests/día) a mitad de una demo, tirando 503 en cascada en chat, foros con
+IA y generador de exámenes. Para que eso no vuelva a pasar, `LLMProvider`
+(`app/providers/llm.py`) soporta un **proveedor secundario opcional**: si el
+primario devuelve `RateLimitError` (429, cuota agotada) o
+`InternalServerError` (503) después de agotar sus 3 reintentos, la misma
+request se reintenta automáticamente contra el secundario, sin que el
+usuario vea el error.
+
+**Cómo activarlo:** setear las 3 variables `LLM_FALLBACK_API_KEY` /
+`LLM_FALLBACK_BASE_URL` / `LLM_FALLBACK_MODEL` en el `.env`. Si falta alguna,
+el fallback queda deshabilitado y el comportamiento es el de siempre (un solo
+proveedor, error propaga tal cual). Ejemplo con OpenAI como secundario de
+Gemini:
+
+```bash
+LLM_API_KEY=AIzaSy...                 # Gemini (primario)
+LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
+LLM_MODEL=gemini-2.5-flash
+
+LLM_FALLBACK_API_KEY=sk-...           # OpenAI (secundario)
+LLM_FALLBACK_BASE_URL=https://api.openai.com/v1
+LLM_FALLBACK_MODEL=gpt-4o-mini
+```
+
+**Alcance:** cubre `chat_completion` (retry + fallback) y la apertura del
+stream en `chat_stream`/`chat_completion_stream`. Si el stream ya empezó a
+mandar texto y se corta a mitad de camino, no se reintenta (no se puede
+"deshacer" output parcial ya enviado) — mismo comportamiento que antes de
+esta feature. El fallback queda logueado con `logger.warning` en
+`app.providers.llm` para verlo en los logs del container `api`.
 
 ## Endpoints
 

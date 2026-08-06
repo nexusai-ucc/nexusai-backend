@@ -9,10 +9,27 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import openai
 import pytest
 
 from app.providers.embeddings import EmbeddingProvider
 from app.providers.llm import LLMProvider
+
+
+def _rate_limit_error() -> openai.RateLimitError:
+    """Construye un RateLimitError (429) sin necesidad de una response HTTP real."""
+    response = MagicMock()
+    response.status_code = 429
+    response.headers = {}
+    return openai.RateLimitError("quota exhausted", response=response, body=None)
+
+
+def _server_error() -> openai.InternalServerError:
+    """Construye un InternalServerError (503) sin necesidad de una response HTTP real."""
+    response = MagicMock()
+    response.status_code = 503
+    response.headers = {}
+    return openai.InternalServerError("service unavailable", response=response, body=None)
 
 
 # ============================================================
@@ -116,6 +133,99 @@ async def test_chat_stream_skips_empty_chunks():
         deltas.append(d)
 
     assert deltas == ["ok"]
+
+
+# ============================================================
+# LLMProvider — fallback automático entre proveedores (INFRA-01 / #307)
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_chat_completion_falls_back_to_secondary_on_quota_error(
+    fake_openai_chat_response, caplog
+):
+    """Si el primario agota sus reintentos por cuota, la request se completa
+    igual usando el secundario, sin que el error llegue al caller."""
+    provider = LLMProvider()
+    assert provider.fallback_client is not None  # configurado en conftest.py
+
+    provider.client.chat.completions.create = AsyncMock(side_effect=_rate_limit_error())
+    provider.fallback_client.chat.completions.create = AsyncMock(
+        return_value=fake_openai_chat_response
+    )
+
+    with patch("app.shared.retry.asyncio.sleep", new=AsyncMock()):
+        with caplog.at_level("WARNING", logger="app.providers.llm"):
+            result = await provider.chat_completion(
+                messages=[{"role": "user", "content": "hola"}]
+            )
+
+    assert result.text == "respuesta mockeada"
+    # El primario se llamó 3 veces (async_retry) antes de rendirse.
+    assert provider.client.chat.completions.create.call_count == 3
+    # El secundario se llamó una sola vez, con su propio modelo configurado.
+    provider.fallback_client.chat.completions.create.assert_called_once()
+    assert provider.fallback_client.chat.completions.create.call_args.kwargs["model"] == "gpt-4o-mini"
+    assert "fallback" in caplog.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_falls_back_on_server_error_503():
+    """InternalServerError (503) también dispara el fallback, no solo 429."""
+    provider = LLMProvider()
+    fake_response = MagicMock()
+    fake_response.choices = [MagicMock()]
+    fake_response.choices[0].message.content = "desde el secundario"
+    fake_response.usage = None
+
+    provider.client.chat.completions.create = AsyncMock(side_effect=_server_error())
+    provider.fallback_client.chat.completions.create = AsyncMock(return_value=fake_response)
+
+    with patch("app.shared.retry.asyncio.sleep", new=AsyncMock()):
+        result = await provider.chat_completion(messages=[{"role": "user", "content": "hola"}])
+
+    assert result.text == "desde el secundario"
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_propagates_when_no_fallback_configured():
+    """Sin proveedor secundario configurado, el error de cuota propaga tal
+    cual (comportamiento anterior a INFRA-01, sin regresión)."""
+    provider = LLMProvider()
+    provider.fallback_client = None  # simula deploy sin LLM_FALLBACK_* configurado
+
+    provider.client.chat.completions.create = AsyncMock(side_effect=_rate_limit_error())
+
+    with patch("app.shared.retry.asyncio.sleep", new=AsyncMock()):
+        with pytest.raises(openai.RateLimitError):
+            await provider.chat_completion(messages=[{"role": "user", "content": "hola"}])
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_falls_back_to_secondary_on_quota_error(caplog):
+    """chat_stream también cae al secundario si la apertura del stream
+    primario falla por cuota (antes de yieldear ningún token)."""
+    provider = LLMProvider()
+
+    async def fake_fallback_stream():
+        for word in ["Hola", " ", "secundario"]:
+            chunk = MagicMock()
+            choice = MagicMock()
+            choice.delta.content = word
+            chunk.choices = [choice]
+            yield chunk
+
+    provider.client.chat.completions.create = AsyncMock(side_effect=_rate_limit_error())
+    provider.fallback_client.chat.completions.create = AsyncMock(
+        return_value=fake_fallback_stream()
+    )
+
+    with caplog.at_level("WARNING", logger="app.providers.llm"):
+        deltas = []
+        async for d in provider.chat_stream(messages=[{"role": "user", "content": "x"}]):
+            deltas.append(d)
+
+    assert deltas == ["Hola", " ", "secundario"]
+    assert "fallback" in caplog.text.lower()
 
 
 # ============================================================
