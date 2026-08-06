@@ -238,6 +238,8 @@ Swagger UI completo: http://localhost:8001/docs
 | `/api/v1/chat/sessions/{id}` | DELETE | HMAC | ⏳ | Borrar conversación (Sprint 2) |
 | `/api/v1/documents` | POST | HMAC | ⏳ | Upload PDF + dispara pipeline RAG (Sprint 2) |
 | `/api/v1/documents/{id}` | GET | HMAC | ⏳ | Estado de indexación (Sprint 2) |
+| `/api/v1/privacy/export` | GET | HMAC | ✅ | Exporta el historial personal del alumno (mensajes, quiz attempts, quiz errors) — PRIV-01 |
+| `/api/v1/privacy/data` | DELETE | HMAC | ✅ | Borra el historial personal del alumno. quiz_attempts se anonimiza, no se borra (ver `app/privacy/router.py`) — PRIV-01 |
 
 ## Troubleshooting frecuente
 

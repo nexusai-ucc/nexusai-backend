@@ -231,7 +231,11 @@ class QuizAttempt(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     course_id: Mapped[int] = mapped_column(Integer, nullable=False)
-    user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Nullable: PRIV-01 anonimiza (en vez de borrar) los intentos de un alumno
+    # que pide eliminar sus datos, para no romper el histograma de puntajes
+    # de Analytics (app/admin/router.py::_get_quiz_score_distribution lee
+    # course_id/created_at/score, nunca user_id — el score sobrevive intacto).
+    user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     question_type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     difficulty: Mapped[str] = mapped_column(String(10), nullable=False, default="medium")
     topic: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
@@ -241,6 +245,10 @@ class QuizAttempt(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    # NULL = intento activo del alumno. Timestamp = fue anonimizado a pedido
+    # del alumno (PRIV-01) — user_id ya es NULL, la fila se excluye del
+    # export/vista personal pero sigue contando en los agregados del curso.
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class QuizError(Base):
