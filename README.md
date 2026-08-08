@@ -226,6 +226,7 @@ Todas viven en el `.env` raíz del repo (no acá). Detalle en
 | `LLM_FALLBACK_API_KEY` | — (opcional) | Key del proveedor secundario. Ver "Fallback automático entre proveedores" abajo |
 | `LLM_FALLBACK_BASE_URL` | — (opcional) | Endpoint del proveedor secundario (ej. `https://api.openai.com/v1`) |
 | `LLM_FALLBACK_MODEL` | — (opcional) | Modelo del proveedor secundario (ej. `gpt-4o-mini`) |
+| `LLM_INTERMEDIATE_MODELS` | — (opcional) | Modelos extra de Gemini a probar antes del secundario, coma-separados. Ver "Cadena de modelos intermedios" abajo |
 
 ### Fallback automático entre proveedores (INFRA-01 / issue #307)
 
@@ -260,6 +261,34 @@ mandar texto y se corta a mitad de camino, no se reintenta (no se puede
 "deshacer" output parcial ya enviado) — mismo comportamiento que antes de
 esta feature. El fallback queda logueado con `logger.warning` en
 `app.providers.llm` para verlo en los logs del container `api`.
+
+### Cadena de modelos intermedios de Gemini (INFRA-03 / issue #343)
+
+Google AI Studio da cuota gratuita **por modelo, no por cuenta** —
+`gemini-2.5-flash`, `gemini-2.5-flash-lite` y `gemini-2.0-flash` tienen cupos
+diarios independientes. Agotar `gemini-2.5-flash` no agota Gemini entero,
+agota ESE modelo. `LLM_INTERMEDIATE_MODELS` (opcional, coma-separado) prueba
+esos modelos extra — usando la misma `LLM_API_KEY`/`LLM_BASE_URL` del
+primario, no es otro proveedor — antes de recién ahí pasar al secundario
+configurado en `LLM_FALLBACK_*`.
+
+```bash
+LLM_API_KEY=AIzaSy...
+LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
+LLM_MODEL=gemini-2.5-flash
+
+LLM_INTERMEDIATE_MODELS=gemini-2.5-flash-lite,gemini-2.0-flash
+
+LLM_FALLBACK_API_KEY=gsk_...          # Groq (última red de seguridad)
+LLM_FALLBACK_BASE_URL=https://api.groq.com/openai/v1
+LLM_FALLBACK_MODEL=llama-3.3-70b-versatile
+```
+
+Cadena resultante: `gemini-2.5-flash` → `gemini-2.5-flash-lite` →
+`gemini-2.0-flash` → Groq. Vacío = comportamiento idéntico a antes de
+INFRA-03 (salta directo del primario al secundario). Sin
+`LLM_FALLBACK_*` tampoco, los modelos intermedios igual funcionan solos
+(no necesitan un secundario configurado).
 
 ## Endpoints
 

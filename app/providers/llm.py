@@ -21,6 +21,15 @@ automáticamente contra ese secundario antes de propagar el error al caller.
 Sin esas 3 env vars, el fallback queda deshabilitado (comportamiento idéntico
 al anterior).
 
+Cadena de modelos intermedios (INFRA-03 / issue #343): Google AI Studio da
+cuota gratuita POR MODELO, no por cuenta — agotar `gemini-2.5-flash` no
+agota `gemini-2.5-flash-lite` ni `gemini-2.0-flash`. `LLM_INTERMEDIATE_MODELS`
+(opcional, coma-separado) prueba esos modelos extra usando el MISMO client
+del primario (misma API key, mismo base_url — no son otro proveedor, solo
+otro modelo) antes de recién ahí pasar al proveedor secundario configurado.
+Cadena resultante: primario → intermedios (en orden) → secundario. Vacío =
+comportamiento idéntico a antes de INFRA-03.
+
 Ver ADR-003 (decisión multi-provider) y ADR-004 (Gemini MVP / OpenAI prod).
 """
 
@@ -116,6 +125,30 @@ class LLMProvider:
                 max_retries=0,
             )
 
+        # Modelos intermedios opcionales (INFRA-03) — mismo client que el
+        # primario, ver _fallback_chain().
+        self.intermediate_models: list[str] = [
+            m.strip()
+            for m in (settings.llm_intermediate_models or "").split(",")
+            if m.strip()
+        ]
+
+    def _fallback_chain(self) -> list[tuple[AsyncOpenAI, str]]:
+        """Cadena completa a intentar en orden (INFRA-03):
+
+          primario → modelos intermedios (mismo client, ver __init__) →
+          proveedor secundario final (otro client, si está configurado).
+
+        Sin LLM_INTERMEDIATE_MODELS ni fallback configurado, devuelve una
+        lista de un solo elemento — mismo comportamiento que antes de
+        INFRA-01/INFRA-03 (un solo intento, sin fallback).
+        """
+        chain = [(self.client, self.model)]
+        chain.extend((self.client, m) for m in self.intermediate_models)
+        if self.fallback_client:
+            chain.append((self.fallback_client, self.fallback_model))
+        return chain
+
     async def chat_completion(
         self,
         messages: list[dict[str, str]],
@@ -136,27 +169,15 @@ class LLMProvider:
         Returns:
             CompletionResult con el texto de respuesta y los token counts del LLM.
 
-        Si el proveedor primario agota sus reintentos por cuota/servidor caído
-        (ver _FALLBACK_TRIGGERS) y hay un proveedor secundario configurado,
-        reintenta automáticamente contra ese secundario antes de propagar.
+        Si un eslabón de la cadena (ver _fallback_chain) agota sus reintentos
+        por cuota/servidor caído (ver _FALLBACK_TRIGGERS), pasa automáticamente
+        al siguiente eslabón antes de propagar.
 
         Raises:
-            openai.* — errores no-retryables, o del secundario si también falla,
-            o del primario si no hay secundario configurado.
+            openai.* — errores no-retryables, o el del último eslabón de la
+            cadena si todos fallan.
         """
-        try:
-            response = await self._create_completion(self.client, self.model, messages, **kwargs)
-        except _FALLBACK_TRIGGERS as exc:
-            if not self.fallback_client:
-                raise
-            logger.warning(
-                "LLM fallback activado: proveedor primario agotado (%s: %s). "
-                "Reintentando con proveedor secundario (%s).",
-                type(exc).__name__, exc, self.fallback_model,
-            )
-            response = await self._create_completion(
-                self.fallback_client, self.fallback_model, messages, **kwargs
-            )
+        response = await self._run_completion_chain(self._fallback_chain(), messages, **kwargs)
         text = response.choices[0].message.content or ""
         usage = response.usage
         return CompletionResult(
@@ -183,41 +204,61 @@ class LLMProvider:
             )
         )
 
+    @staticmethod
+    async def _run_completion_chain(
+        chain: list[tuple[AsyncOpenAI, str]],
+        messages: list[dict[str, str]],
+        **kwargs: Any,
+    ) -> Any:
+        """Recorre la cadena en orden (ver _fallback_chain). Cada eslabón ya
+        tiene sus propios 3 reintentos vía _create_completion/async_retry —
+        recién si esos 3 fallan por _FALLBACK_TRIGGERS pasa al siguiente
+        eslabón. Con un solo eslabón (caso default sin fallback configurado),
+        el comportamiento es idéntico al de antes de INFRA-01/INFRA-03."""
+        for i, (client, model) in enumerate(chain):
+            try:
+                return await LLMProvider._create_completion(client, model, messages, **kwargs)
+            except _FALLBACK_TRIGGERS as exc:
+                if i == len(chain) - 1:
+                    raise
+                next_model = chain[i + 1][1]
+                logger.warning(
+                    "LLM fallback activado: %s agotado (%s: %s). Pasando a %s.",
+                    model, type(exc).__name__, exc, next_model,
+                )
+
     async def _create_stream(
         self,
         messages: list[dict[str, str]],
         **kwargs: Any,
     ) -> Any:
         """
-        Abre un stream contra el proveedor primario, con fallback al secundario
-        si la apertura del stream falla por cuota/servidor caído.
+        Abre un stream recorriendo la cadena de fallback en orden (ver
+        _fallback_chain), pasando al siguiente eslabón si la apertura falla
+        por cuota/servidor caído.
 
         Nota: el fallback solo cubre la apertura del stream. Si la conexión se
         corta a mitad de la iteración (después de ya haber yieldeado texto),
         no se reintenta — mismo comportamiento que antes de INFRA-01, porque
         ya se envió output parcial al caller y no se puede "deshacer".
         """
-        try:
-            return await self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                stream=True,
-                **kwargs,
-            )
-        except _FALLBACK_TRIGGERS as exc:
-            if not self.fallback_client:
-                raise
-            logger.warning(
-                "LLM fallback activado (stream): proveedor primario agotado "
-                "(%s: %s). Reintentando con proveedor secundario (%s).",
-                type(exc).__name__, exc, self.fallback_model,
-            )
-            return await self.fallback_client.chat.completions.create(
-                model=self.fallback_model,
-                messages=messages,
-                stream=True,
-                **kwargs,
-            )
+        chain = self._fallback_chain()
+        for i, (client, model) in enumerate(chain):
+            try:
+                return await client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    stream=True,
+                    **kwargs,
+                )
+            except _FALLBACK_TRIGGERS as exc:
+                if i == len(chain) - 1:
+                    raise
+                next_model = chain[i + 1][1]
+                logger.warning(
+                    "LLM fallback activado (stream): %s agotado (%s: %s). Pasando a %s.",
+                    model, type(exc).__name__, exc, next_model,
+                )
 
     async def chat_stream(
         self,

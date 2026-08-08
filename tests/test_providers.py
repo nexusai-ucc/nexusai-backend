@@ -229,6 +229,120 @@ async def test_chat_stream_falls_back_to_secondary_on_quota_error(caplog):
 
 
 # ============================================================
+# LLMProvider — cadena de modelos intermedios (INFRA-03 / #343)
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_chat_completion_uses_intermediate_model_before_secondary(
+    fake_openai_chat_response, caplog
+):
+    """Con LLM_INTERMEDIATE_MODELS configurado, un 429 en el primario prueba
+    el modelo intermedio ANTES de tocar el proveedor secundario."""
+    provider = LLMProvider()
+    provider.intermediate_models = ["gemini-2.5-flash-lite"]
+
+    provider.client.chat.completions.create = AsyncMock(
+        side_effect=[
+            _rate_limit_error(), _rate_limit_error(), _rate_limit_error(),  # primario: 3 intentos
+            fake_openai_chat_response,  # intermedio: responde OK al primer intento
+        ]
+    )
+    provider.fallback_client.chat.completions.create = AsyncMock()
+
+    with patch("app.shared.retry.asyncio.sleep", new=AsyncMock()):
+        with caplog.at_level("WARNING", logger="app.providers.llm"):
+            result = await provider.chat_completion(messages=[{"role": "user", "content": "hola"}])
+
+    assert result.text == "respuesta mockeada"
+    assert provider.client.chat.completions.create.call_count == 4  # 3 primario + 1 intermedio
+    provider.fallback_client.chat.completions.create.assert_not_called()
+    assert "gemini-2.5-flash-lite" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_falls_through_full_chain_to_secondary(fake_openai_chat_response):
+    """Si el primario Y todos los intermedios fallan, recién ahí se usa el
+    proveedor secundario — la cadena completa se recorre en orden."""
+    provider = LLMProvider()
+    provider.intermediate_models = ["gemini-2.5-flash-lite", "gemini-2.0-flash"]
+
+    # 3 intentos primario + 3 intentos c/u de los 2 intermedios = 9 llamadas, todas 429.
+    provider.client.chat.completions.create = AsyncMock(side_effect=_rate_limit_error())
+    provider.fallback_client.chat.completions.create = AsyncMock(
+        return_value=fake_openai_chat_response
+    )
+
+    with patch("app.shared.retry.asyncio.sleep", new=AsyncMock()):
+        result = await provider.chat_completion(messages=[{"role": "user", "content": "hola"}])
+
+    assert result.text == "respuesta mockeada"
+    assert provider.client.chat.completions.create.call_count == 9
+    provider.fallback_client.chat.completions.create.assert_called_once()
+    assert provider.fallback_client.chat.completions.create.call_args.kwargs["model"] == "gpt-4o-mini"
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_cascades_between_gemini_models_without_secondary_configured():
+    """Los modelos intermedios de Gemini funcionan solos, sin necesidad de
+    tener un proveedor secundario (Groq) configurado."""
+    provider = LLMProvider()
+    provider.intermediate_models = ["gemini-2.5-flash-lite"]
+    provider.fallback_client = None  # sin secundario configurado
+
+    response = MagicMock()
+    response.choices = [MagicMock()]
+    response.choices[0].message.content = "desde el modelo intermedio"
+    response.usage = None
+
+    provider.client.chat.completions.create = AsyncMock(
+        side_effect=[_rate_limit_error(), _rate_limit_error(), _rate_limit_error(), response]
+    )
+
+    with patch("app.shared.retry.asyncio.sleep", new=AsyncMock()):
+        result = await provider.chat_completion(messages=[{"role": "user", "content": "hola"}])
+
+    assert result.text == "desde el modelo intermedio"
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_without_intermediate_models_behaves_like_infra01():
+    """Sin LLM_INTERMEDIATE_MODELS (default), la cadena tiene un solo salto —
+    comportamiento idéntico a antes de INFRA-03, sin regresión."""
+    provider = LLMProvider()
+    assert provider.intermediate_models == []
+    assert provider._fallback_chain() == [
+        (provider.client, provider.model),
+        (provider.fallback_client, provider.fallback_model),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_cascades_through_intermediate_model():
+    """chat_stream también recorre modelos intermedios antes del secundario."""
+    provider = LLMProvider()
+    provider.intermediate_models = ["gemini-2.5-flash-lite"]
+
+    async def fake_intermediate_stream():
+        chunk = MagicMock()
+        choice = MagicMock()
+        choice.delta.content = "desde intermedio"
+        chunk.choices = [choice]
+        yield chunk
+
+    provider.client.chat.completions.create = AsyncMock(
+        side_effect=[_rate_limit_error(), fake_intermediate_stream()]
+    )
+    provider.fallback_client.chat.completions.create = AsyncMock()
+
+    deltas = []
+    async for d in provider.chat_stream(messages=[{"role": "user", "content": "x"}]):
+        deltas.append(d)
+
+    assert deltas == ["desde intermedio"]
+    provider.fallback_client.chat.completions.create.assert_not_called()
+
+
+# ============================================================
 # EmbeddingProvider
 # ============================================================
 

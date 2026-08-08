@@ -19,6 +19,14 @@ class Settings(BaseSettings):
     llm_fallback_base_url: Optional[str] = None
     llm_fallback_model: Optional[str] = None
 
+    # LLM — cadena de modelos intermedios de Gemini (INFRA-03 / issue #343).
+    # Opcional. Lista separada por comas de modelos que comparten
+    # LLM_API_KEY/LLM_BASE_URL con el primario (ej. cuotas gratuitas
+    # independientes por modelo en Google AI Studio) — se prueban en orden
+    # ANTES de pasar al proveedor secundario. Vacío = comportamiento idéntico
+    # a antes de INFRA-03 (salta directo del primario al secundario).
+    llm_intermediate_models: Optional[str] = None
+
     # Embeddings
     embedding_api_key: str
     embedding_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
