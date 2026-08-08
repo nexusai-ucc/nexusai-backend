@@ -209,6 +209,13 @@ class UnansweredQuestion(Base):
     max_similarity: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     # Cantidad de chunks que se llegaron a recuperar (0 = nada matcheó).
     chunks_retrieved: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Embedding de `question`, para agrupar gaps por similitud semántica en
+    # vez de texto normalizado (DOC-D06, issue #313). Nullable: filas viejas
+    # (de antes de esta feature) o casos donde el embed falló no lo tienen —
+    # el router cae de vuelta a agrupación por texto para esas filas.
+    embedding: Mapped[Optional[List[float]]] = mapped_column(
+        Vector(get_settings().embedding_dimensions), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
