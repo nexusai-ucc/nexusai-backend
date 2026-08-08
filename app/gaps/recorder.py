@@ -29,6 +29,7 @@ from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import UnansweredQuestion
+from app.providers.embeddings import EmbeddingProvider
 
 logger = logging.getLogger("nexusai.gaps")
 
@@ -78,11 +79,18 @@ async def record_gap_if_needed(
     chunks_count: int,
     max_similarity: Optional[float],
     llm_answer: Optional[str] = None,
+    embeddings: Optional[EmbeddingProvider] = None,
 ) -> bool:
     """Persiste un gap si el material no respondió bien.
 
     No commitea — el caller debe hacer commit. Esto mantiene consistencia con
     el flujo del mensaje del alumno (mismo commit).
+
+    `embeddings` es opcional a propósito: si no se pasa (o el embed falla),
+    el gap igual se registra, solo que sin `.embedding` — el router de
+    listado (DOC-D06 / #313) cae de vuelta a agrupar esa fila por texto
+    normalizado en vez de semántica. Un embed fallido nunca debe impedir
+    registrar el gap en sí.
 
     Devuelve True si se registró un gap (útil para tests y telemetría).
     Si falla, swallowea la excepción y loguea — un gap no registrado es
@@ -96,17 +104,30 @@ async def record_gap_if_needed(
         if not (no_chunks or weak_match or llm_said_no):
             return False
 
+        question_text = question.strip()[:2000]
+
+        vector: Optional[list[float]] = None
+        if embeddings is not None:
+            try:
+                vector = await embeddings.embed(question_text)
+            except Exception as exc:
+                logger.warning(
+                    "No se pudo embeddear el gap (se registra igual, sin embedding): %s: %s",
+                    type(exc).__name__, exc,
+                )
+
         gap = UnansweredQuestion(
             course_id=course_id,
             user_id=user_id,
-            question=question.strip()[:2000],
+            question=question_text,
             max_similarity=max_similarity,
             chunks_retrieved=chunks_count,
+            embedding=vector,
         )
         db.add(gap)
         logger.info(
-            "gap_recorded course_id=%d user_id=%d chunks=%d sim=%s llm_said_no=%s",
-            course_id, user_id, chunks_count, max_similarity, llm_said_no,
+            "gap_recorded course_id=%d user_id=%d chunks=%d sim=%s llm_said_no=%s embedded=%s",
+            course_id, user_id, chunks_count, max_similarity, llm_said_no, vector is not None,
         )
         return True
     except Exception as exc:

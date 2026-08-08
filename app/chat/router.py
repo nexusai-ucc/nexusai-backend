@@ -284,6 +284,7 @@ async def messages(
             chunks_count=len(retrieved_chunks),
             max_similarity=max_sim_for_gap,
             llm_answer=result.text,
+            embeddings=embeddings,
         )
 
     await db.commit()
@@ -528,6 +529,7 @@ async def messages_stream(
                         chunks_count=len(retrieved_chunks),
                         max_similarity=max_sim_stream,
                         llm_answer=full_text,
+                        embeddings=embeddings,
                     )
                     grounded = not gap_recorded
                 else:
