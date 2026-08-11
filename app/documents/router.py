@@ -33,10 +33,10 @@ from pathlib import Path
 from typing import Annotated, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.hmac import verify_hmac
@@ -123,6 +123,22 @@ class DocumentOut(BaseModel):
             created_at=doc.created_at,
             updated_at=doc.updated_at,
         )
+
+
+# UX-17 (#387): tope duro para el modo "traer todo" (limit no especificado),
+# usado hoy por ExamGeneratorPanel.jsx para poder elegir de cualquier
+# documento indexado del curso sin paginar. Sigue siendo un límite, a
+# diferencia del `select(Document)...` sin `.limit()` que había antes.
+_DEFAULT_LIST_LIMIT = 500
+
+
+class DocumentListResponse(BaseModel):
+    """UX-17 (#387): total es la cantidad real de documentos del curso,
+    no la cantidad ya recortada por limit — así el frontend sabe si hay
+    más para paginar."""
+
+    total: int
+    items: list[DocumentOut]
 
 
 # ============================================================
@@ -317,21 +333,42 @@ async def get_document_status(
     return DocumentOut.from_orm(document)
 
 
-@router.get("", response_model=list[DocumentOut])
+@router.get("", response_model=DocumentListResponse)
 async def list_documents_by_course(
     course_id: int,
     _body: Annotated[bytes, Depends(verify_hmac)],
     db: AsyncSession = Depends(get_db),
-) -> list[DocumentOut]:
-    """Lista todos los documentos de un curso. Para la tabla en la vista docente."""
+    limit: Optional[int] = Query(default=None, ge=1, le=_DEFAULT_LIST_LIMIT),
+    offset: int = Query(default=0, ge=0),
+) -> DocumentListResponse:
+    """Lista los documentos de un curso. Para la tabla en la vista docente.
+
+    UX-17 (#387): `limit`/`offset` son opcionales — si no se pasan (caso de
+    ExamGeneratorPanel.jsx, que necesita elegir entre todos los documentos
+    indexados, no una página), se devuelve hasta `_DEFAULT_LIST_LIMIT`. La
+    tabla de materiales sí manda `limit`/`offset` explícitos para paginar.
+    """
     if course_id <= 0:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="course_id must be positive")
 
+    effective_limit = limit if limit is not None else _DEFAULT_LIST_LIMIT
+
+    total = await db.scalar(
+        select(func.count()).select_from(Document).where(Document.course_id == course_id)
+    )
+
     result = await db.execute(
-        select(Document).where(Document.course_id == course_id).order_by(Document.created_at.desc())
+        select(Document)
+        .where(Document.course_id == course_id)
+        .order_by(Document.created_at.desc())
+        .offset(offset)
+        .limit(effective_limit)
     )
     documents = result.scalars().all()
-    return [DocumentOut.from_orm(d) for d in documents]
+    return DocumentListResponse(
+        total=total or 0,
+        items=[DocumentOut.from_orm(d) for d in documents],
+    )
 
 
 @router.get("/{document_id}/download")
