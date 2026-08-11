@@ -202,11 +202,14 @@ async def test_upload_existing_hash_returns_200(client, mock_db):
 async def test_list_documents_empty(client, mock_db):
     """Curso sin documentos → lista vacía."""
     mock_db.execute.return_value = _exec_result(scalars_all=[])
+    mock_db.scalar.return_value = 0
 
     response = await client.get("/api/v1/documents?course_id=1")
 
     assert response.status_code == 200
-    assert response.json() == []
+    body = response.json()
+    assert body["items"] == []
+    assert body["total"] == 0
 
 
 async def test_list_documents_includes_timestamps(client, mock_db):
@@ -214,18 +217,52 @@ async def test_list_documents_includes_timestamps(client, mock_db):
     doc1 = _make_doc(status="indexed")
     doc2 = _make_doc(status="error", error_message="embedding falló")
     mock_db.execute.return_value = _exec_result(scalars_all=[doc1, doc2])
+    mock_db.scalar.return_value = 2
 
     response = await client.get("/api/v1/documents?course_id=1")
 
     assert response.status_code == 200
-    items = response.json()
+    body = response.json()
+    items = body["items"]
     assert len(items) == 2
+    assert body["total"] == 2
     # CONT-05: campos de timestamps presentes
     assert "created_at" in items[0]
     assert "updated_at" in items[0]
     assert items[0]["created_at"] is not None
     assert items[1]["status"] == "error"
     assert items[1]["error_message"] == "embedding falló"
+
+
+async def test_list_documents_total_reflects_course_count_not_page_size(client, mock_db):
+    """UX-17 (#387): total es la cantidad real de documentos del curso, no
+    la cantidad de items ya recortada por limit — así el frontend sabe si
+    hay más para paginar."""
+    page = [_make_doc() for _ in range(2)]
+    mock_db.execute.return_value = _exec_result(scalars_all=page)
+    mock_db.scalar.return_value = 37  # el curso tiene 37 documentos en total
+
+    response = await client.get("/api/v1/documents?course_id=1&limit=2&offset=0")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["items"]) == 2
+    assert body["total"] == 37
+
+
+async def test_list_documents_without_limit_uses_default_cap(client, mock_db):
+    """Sin limit/offset (caso ExamGeneratorPanel.jsx), sigue funcionando
+    igual que antes — trae todo hasta el tope por default, no una página chica."""
+    docs = [_make_doc() for _ in range(5)]
+    mock_db.execute.return_value = _exec_result(scalars_all=docs)
+    mock_db.scalar.return_value = 5
+
+    response = await client.get("/api/v1/documents?course_id=1")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["items"]) == 5
+    assert body["total"] == 5
 
 
 # ============================================================
