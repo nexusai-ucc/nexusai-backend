@@ -10,6 +10,7 @@ aparte, con el mismo patrón de aislamiento que el resto de los routers
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
@@ -24,8 +25,15 @@ from app.gaps.router import SEMANTIC_GAP_SIMILARITY_THRESHOLD, _cluster_gaps, ro
 _NOW = datetime(2026, 8, 8, 12, 0, 0, tzinfo=timezone.utc)
 
 
-def _row(question: str, minutes_ago: int, embedding=None, max_similarity=None):
-    return (question, _NOW - timedelta(minutes=minutes_ago), max_similarity, embedding)
+def _row(question: str, minutes_ago: int, embedding=None, max_similarity=None, row_id=None, archived_at=None):
+    return (
+        row_id or uuid.uuid4(),
+        question,
+        _NOW - timedelta(minutes=minutes_ago),
+        max_similarity,
+        embedding,
+        archived_at,
+    )
 
 
 # ============================================================
@@ -131,17 +139,51 @@ def test_cluster_gaps_sorts_by_count_desc_then_recency():
 def test_cluster_gaps_averages_similarity_across_merged_rows():
     emb = [1.0, 0.0]
     rows = [
-        (q, dt, sim, e)
-        for q, dt, sim, e in [
-            _row("pregunta A", minutes_ago=10, embedding=emb, max_similarity=0.2),
-            _row("pregunta A reformulada", minutes_ago=5, embedding=[0.99, 0.14], max_similarity=0.4),
-        ]
+        _row("pregunta A", minutes_ago=10, embedding=emb, max_similarity=0.2),
+        _row("pregunta A reformulada", minutes_ago=5, embedding=[0.99, 0.14], max_similarity=0.4),
     ]
 
     items = _cluster_gaps(rows)
 
     assert len(items) == 1
     assert items[0].avg_similarity == pytest.approx(0.3)
+
+
+def test_cluster_gaps_exposes_underlying_row_ids():
+    """DOC-D08 (#383): el gap mostrado debe traer los IDs reales de las
+    filas fusionadas — es la clave que el docente manda para archivar,
+    ya que el texto representante no es estable entre clusters."""
+    id_a, id_b = uuid.uuid4(), uuid.uuid4()
+    emb_a = [1.0, 0.05, 0.0]
+    emb_b = [0.99, 0.1, 0.0]
+    rows = [
+        _row("¿qué es overfitting?", minutes_ago=10, embedding=emb_a, row_id=id_a),
+        _row("¿cuándo un modelo memoriza en vez de generalizar?", minutes_ago=5, embedding=emb_b, row_id=id_b),
+    ]
+
+    items = _cluster_gaps(rows)
+
+    assert len(items) == 1
+    assert set(items[0].question_ids) == {id_a, id_b}
+
+
+def test_cluster_gaps_is_archived_true_only_when_all_rows_archived():
+    """Un grupo queda marcado is_archived solo si TODAS sus filas están
+    archivadas. Si una pregunta nueva y sin archivar se fusiona con un
+    grupo previamente archivado, el gap vuelve a considerarse activo."""
+    emb_a = [1.0, 0.0]
+    emb_b = [0.99, 0.14]
+
+    fully_archived = _cluster_gaps([
+        _row("pregunta archivada", minutes_ago=10, embedding=emb_a, archived_at=_NOW),
+    ])
+    assert fully_archived[0].is_archived is True
+
+    mixed = _cluster_gaps([
+        _row("pregunta archivada", minutes_ago=10, embedding=emb_a, archived_at=_NOW),
+        _row("pregunta archivada reformulada", minutes_ago=1, embedding=emb_b, archived_at=None),
+    ])
+    assert mixed[0].is_archived is False
 
 
 # ============================================================

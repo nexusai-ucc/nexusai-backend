@@ -219,6 +219,14 @@ class UnansweredQuestion(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    # NULL = gap activo. El docente lo archiva desde el panel cuando ya lo
+    # resolvió (agregó material, o decidió que no es relevante) — DOC-D08,
+    # issue #383. Si un alumno vuelve a preguntar algo equivalente después,
+    # se inserta una fila nueva con archived_at=NULL, así que el gap
+    # resurge solo sin lógica extra (ver app/gaps/router.py).
+    archived_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class QuizAttempt(Base):

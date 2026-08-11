@@ -27,12 +27,13 @@ comportamiento que el código viejo tenía para todas las filas.
 from __future__ import annotations
 
 import math
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, List, Optional
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.hmac import verify_hmac
@@ -68,6 +69,9 @@ class GapsListRequest(BaseModel):
     course_id: int = Field(gt=0)
     days: int = Field(default=30, ge=1, le=365)
     limit: int = Field(default=20, ge=1, le=100)
+    # DOC-D08 (#383): por default solo gaps activos. True trae también los
+    # archivados, cada uno marcado con is_archived en la respuesta.
+    include_archived: bool = False
 
 
 class GapItem(BaseModel):
@@ -75,6 +79,16 @@ class GapItem(BaseModel):
     count: int
     last_asked_at: datetime
     avg_similarity: Optional[float] = None
+    # IDs reales de unanswered_questions detrás de este grupo (puede ser
+    # varias filas fusionadas por texto exacto o por similitud semántica) —
+    # es la clave que el docente manda de vuelta para archivar/desarchivar
+    # este gap puntual, ya que el "question" mostrado es solo el
+    # representante más reciente del cluster, no una clave estable.
+    question_ids: List[uuid.UUID] = Field(default_factory=list)
+    # True solo si TODAS las filas del grupo están archivadas. Si alguien
+    # vuelve a preguntar algo equivalente después de archivar, esa fila
+    # nueva entra sin archivar y el grupo pasa a False otra vez.
+    is_archived: bool = False
 
 
 class GapsListResponse(BaseModel):
@@ -84,31 +98,52 @@ class GapsListResponse(BaseModel):
     items: List[GapItem]
 
 
+class GapsArchiveRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    question_ids: List[uuid.UUID] = Field(min_length=1)
+    archived: bool
+
+
+class GapsArchiveResponse(BaseModel):
+    course_id: int
+    archived: bool
+    affected: int
+
+
 class _TextGroup:
     """Un grupo de gaps — arranca como dedup exacto por texto normalizado,
     después el clustering semántico puede fusionar varios de estos entre sí."""
 
-    __slots__ = ("representative_question", "count", "last_asked_at", "_sim_values", "embedding")
+    __slots__ = (
+        "representative_question", "count", "last_asked_at", "_sim_values",
+        "embedding", "row_ids", "_all_archived",
+    )
 
     def __init__(
         self,
+        row_id: uuid.UUID,
         question: str,
         created_at: datetime,
         max_similarity: Optional[float],
         embedding: Optional[List[float]],
+        archived_at: Optional[datetime],
     ) -> None:
         self.representative_question = question
         self.count = 1
         self.last_asked_at = created_at
         self._sim_values: List[float] = [max_similarity] if max_similarity is not None else []
         self.embedding = embedding
+        self.row_ids: List[uuid.UUID] = [row_id]
+        self._all_archived = archived_at is not None
 
     def add_row(
         self,
+        row_id: uuid.UUID,
         question: str,
         created_at: datetime,
         max_similarity: Optional[float],
         embedding: Optional[List[float]],
+        archived_at: Optional[datetime],
     ) -> None:
         self.count += 1
         if created_at > self.last_asked_at:
@@ -118,6 +153,8 @@ class _TextGroup:
             self._sim_values.append(max_similarity)
         if self.embedding is None and embedding is not None:
             self.embedding = embedding
+        self.row_ids.append(row_id)
+        self._all_archived = self._all_archived and archived_at is not None
 
     def merge(self, other: "_TextGroup") -> None:
         self.count += other.count
@@ -127,12 +164,18 @@ class _TextGroup:
         self._sim_values.extend(other._sim_values)
         if self.embedding is None and other.embedding is not None:
             self.embedding = other.embedding
+        self.row_ids.extend(other.row_ids)
+        self._all_archived = self._all_archived and other._all_archived
 
     @property
     def avg_similarity(self) -> Optional[float]:
         if not self._sim_values:
             return None
         return sum(self._sim_values) / len(self._sim_values)
+
+    @property
+    def is_archived(self) -> bool:
+        return self._all_archived
 
 
 def _cluster_gaps(
@@ -142,19 +185,20 @@ def _cluster_gaps(
 ) -> List[GapItem]:
     """Agrupa filas crudas de gaps en dos pasadas — ver docstring del módulo.
 
-    `rows`: iterable de tuplas (question, created_at, max_similarity, embedding).
+    `rows`: iterable de tuplas
+    (id, question, created_at, max_similarity, embedding, archived_at).
     Función pura (sin DB) a propósito, para poder testear el clustering en
     aislamiento sin mockear una sesión de SQLAlchemy.
     """
     # Pasada 1 — dedup exacto por texto normalizado.
     text_groups: "dict[str, _TextGroup]" = {}
     order: List[str] = []
-    for question, created_at, max_similarity, embedding in rows:
+    for row_id, question, created_at, max_similarity, embedding, archived_at in rows:
         norm = question.strip().lower()
         if norm in text_groups:
-            text_groups[norm].add_row(question, created_at, max_similarity, embedding)
+            text_groups[norm].add_row(row_id, question, created_at, max_similarity, embedding, archived_at)
         else:
-            text_groups[norm] = _TextGroup(question, created_at, max_similarity, embedding)
+            text_groups[norm] = _TextGroup(row_id, question, created_at, max_similarity, embedding, archived_at)
             order.append(norm)
 
     # Pasada 2 — clustering semántico de esos grupos entre sí. Filas sin
@@ -189,6 +233,8 @@ def _cluster_gaps(
             count=g.count,
             last_asked_at=g.last_asked_at,
             avg_similarity=g.avg_similarity,
+            question_ids=g.row_ids,
+            is_archived=g.is_archived,
         )
         for g in merged
     ]
@@ -207,16 +253,20 @@ async def gaps_list(
 
     stmt = (
         select(
+            UnansweredQuestion.id,
             UnansweredQuestion.question,
             UnansweredQuestion.created_at,
             UnansweredQuestion.max_similarity,
             UnansweredQuestion.embedding,
+            UnansweredQuestion.archived_at,
         )
         .where(UnansweredQuestion.course_id == payload.course_id)
         .where(UnansweredQuestion.created_at >= since)
         .order_by(UnansweredQuestion.created_at.desc())
         .limit(_MAX_ROWS_TO_CLUSTER)
     )
+    if not payload.include_archived:
+        stmt = stmt.where(UnansweredQuestion.archived_at.is_(None))
 
     result = await db.execute(stmt)
     rows = result.all()
@@ -228,4 +278,34 @@ async def gaps_list(
         days=payload.days,
         total=len(items),
         items=items,
+    )
+
+
+@router.post("/archive", response_model=GapsArchiveResponse)
+async def gaps_archive(
+    payload: GapsArchiveRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+) -> GapsArchiveResponse:
+    """Archiva o desarchiva un gap puntual (DOC-D08, issue #383).
+
+    Opera sobre `question_ids` — los IDs reales de las filas que el
+    clustering de `/list` fusionó bajo un mismo gap mostrado — no sobre el
+    texto de la pregunta, que solo es el representante del cluster y no una
+    clave estable (ver docstring del módulo).
+    """
+    new_value = datetime.now(timezone.utc) if payload.archived else None
+    stmt = (
+        update(UnansweredQuestion)
+        .where(UnansweredQuestion.course_id == payload.course_id)
+        .where(UnansweredQuestion.id.in_(payload.question_ids))
+        .values(archived_at=new_value)
+    )
+    result = await db.execute(stmt)
+    await db.commit()
+
+    return GapsArchiveResponse(
+        course_id=payload.course_id,
+        archived=payload.archived,
+        affected=result.rowcount,
     )
