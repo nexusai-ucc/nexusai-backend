@@ -57,13 +57,14 @@ def _one_result(row):
 
 @pytest.fixture
 def mock_db():
-    """execute() se llama 4 veces en orden fijo dentro del endpoint:
+    """execute() se llama 6 veces en orden fijo dentro del endpoint:
 
     1) top_queries (get_top_questions)      -> .all()
     2) daily_message_counts (agrupado)      -> .all()
     3) quiz score distribution (agregado)   -> .one()
     4) gaps_ratio: gaps_detected             -> .scalar_one()
     5) gaps_ratio: questions_answered        -> .scalar_one()
+    6) topics_consulted (get_distinct_topic_count) -> .scalar_one()
     """
     db = AsyncMock()
     top_queries_result = MagicMock()
@@ -86,6 +87,7 @@ def mock_db():
         quiz_result,
         _scalar_result(2),   # gaps_detected
         _scalar_result(10),  # questions_answered
+        _scalar_result(4),   # topics_consulted
     ]
     return db
 
@@ -115,6 +117,7 @@ async def test_analytics_returns_expected_shape(client):
         {"date": "2026-07-01", "message_count": 2},
         {"date": "2026-07-02", "message_count": 1},
     ]
+    assert data["topics_consulted"] == 4
 
 
 async def test_quiz_score_distribution_buckets_and_average(client):
@@ -146,6 +149,7 @@ async def test_gaps_ratio_is_zero_when_no_questions_answered(mock_db):
         _one_result(_quiz_buckets_row(total=0, avg_score=None, bucket_counts=[0, 0, 0, 0, 0])),
         _scalar_result(0),
         _scalar_result(0),
+        _scalar_result(0),  # topics_consulted
     ]
 
     from app.admin.router import router
@@ -158,8 +162,15 @@ async def test_gaps_ratio_is_zero_when_no_questions_answered(mock_db):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         response = await c.get("/api/v1/admin/analytics?course_id=1")
 
-    data = response.json()["gaps_ratio"]
-    assert data == {"gaps_detected": 0, "questions_answered": 0, "ratio": 0.0}
+    data = response.json()
+    assert data["gaps_ratio"] == {"gaps_detected": 0, "questions_answered": 0, "ratio": 0.0}
+    assert data["topics_consulted"] == 0
+
+
+async def test_topics_consulted_returns_distinct_question_count(client):
+    response = await client.get("/api/v1/admin/analytics?course_id=1")
+
+    assert response.json()["topics_consulted"] == 4
 
 
 async def test_analytics_rejects_invalid_course_id(client):

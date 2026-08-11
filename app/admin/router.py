@@ -40,7 +40,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.analytics.service import get_daily_message_counts, get_top_questions
+from app.analytics.service import get_daily_message_counts, get_distinct_topic_count, get_top_questions
 from app.auth.hmac import verify_hmac
 from app.db.models import ChatSession, InteractionLog, Message, QuizAttempt, UnansweredQuestion
 from app.db.session import get_db
@@ -106,6 +106,7 @@ class CourseAnalytics(BaseModel):
     daily_message_counts: List[DailyMessageCount]
     quiz_score_distribution: QuizScoreDistribution
     gaps_ratio: GapsRatio
+    topics_consulted: int
 
 
 # ============================================================
@@ -282,6 +283,7 @@ async def get_course_analytics(
 
     quiz_score_distribution = await _get_quiz_score_distribution(db, course_id, since)
     gaps_ratio = await _get_gaps_ratio(db, course_id, since)
+    topics_consulted = await get_distinct_topic_count(db, course_id, since)
 
     return CourseAnalytics(
         course_id=course_id,
@@ -290,4 +292,5 @@ async def get_course_analytics(
         daily_message_counts=daily_message_counts,
         quiz_score_distribution=quiz_score_distribution,
         gaps_ratio=gaps_ratio,
+        topics_consulted=topics_consulted,
     )

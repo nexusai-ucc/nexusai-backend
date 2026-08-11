@@ -81,3 +81,28 @@ async def get_top_questions(
     )
     result = await db.execute(stmt)
     return [QuestionCount(question=row.question, count=int(row.count)) for row in result.all()]
+
+
+async def get_distinct_topic_count(
+    db: AsyncSession,
+    course_id: int,
+    since: datetime,
+) -> int:
+    """Cantidad de preguntas distintas (texto normalizado) en el período.
+
+    Mismo agrupado que get_top_questions (lower(trim(content))), pero
+    cuenta grupos distintos en vez de traer las N más frecuentes con su
+    texto — COUNT(DISTINCT ...) sin LLM, para el stat-card "Temas
+    consultados" (RDS-06).
+    """
+    norm_question = func.lower(func.trim(Message.content))
+    stmt = (
+        select(func.count(func.distinct(norm_question)))
+        .select_from(InteractionLog)
+        .join(Message, Message.id == InteractionLog.user_message_id)
+        .where(InteractionLog.course_id == course_id)
+        .where(InteractionLog.created_at >= since)
+        .where(Message.role == "user")
+    )
+    result = await db.execute(stmt)
+    return int(result.scalar_one())
