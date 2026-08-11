@@ -7,6 +7,11 @@ mocks, sin conexión real a Postgres. Cada query interna (top_queries, daily
 breakdown, quiz score distribution, gaps ratio) se testea vía el orden de
 llamadas a `db.execute`, siguiendo el mismo `side_effect` en secuencia que
 usa test_study_plan en test_quiz_router.py para combinar múltiples queries.
+
+daily_message_counts y quiz_score_distribution agrupan en SQL (UX-16, #386)
+en vez de traer filas crudas — los mocks devuelven directamente el shape ya
+agregado que devolvería Postgres (una fila por día, una única fila de
+agregados para los buckets de quiz), no filas individuales.
 """
 
 from __future__ import annotations
@@ -27,8 +32,15 @@ def _question_row(question: str, count: int):
     return SimpleNamespace(question=question, count=count)
 
 
-def _daily_row(created_at: datetime):
-    return (created_at,)
+def _daily_group_row(day: datetime, count: int):
+    return SimpleNamespace(day=day, count=count)
+
+
+def _quiz_buckets_row(total: int, avg_score, bucket_counts: list[int]):
+    fields = {"total": total, "avg_score": avg_score}
+    for i, c in enumerate(bucket_counts):
+        fields[f"bucket_{i}"] = c
+    return SimpleNamespace(**fields)
 
 
 def _scalar_result(value: int):
@@ -37,15 +49,21 @@ def _scalar_result(value: int):
     return result
 
 
+def _one_result(row):
+    result = MagicMock()
+    result.one.return_value = row
+    return result
+
+
 @pytest.fixture
 def mock_db():
     """execute() se llama 4 veces en orden fijo dentro del endpoint:
 
     1) top_queries (get_top_questions)      -> .all()
-    2) daily_message_counts                  -> .all()
-    3) quiz score distribution               -> .all()
-    4) gaps_ratio: gaps_detected              -> .scalar_one()
-    5) gaps_ratio: questions_answered         -> .scalar_one()
+    2) daily_message_counts (agrupado)      -> .all()
+    3) quiz score distribution (agregado)   -> .one()
+    4) gaps_ratio: gaps_detected             -> .scalar_one()
+    5) gaps_ratio: questions_answered        -> .scalar_one()
     """
     db = AsyncMock()
     top_queries_result = MagicMock()
@@ -53,18 +71,19 @@ def mock_db():
 
     daily_result = MagicMock()
     daily_result.all.return_value = [
-        _daily_row(datetime(2026, 7, 1, tzinfo=timezone.utc)),
-        _daily_row(datetime(2026, 7, 1, tzinfo=timezone.utc)),
-        _daily_row(datetime(2026, 7, 2, tzinfo=timezone.utc)),
+        _daily_group_row(datetime(2026, 7, 1, tzinfo=timezone.utc), 2),
+        _daily_group_row(datetime(2026, 7, 2, tzinfo=timezone.utc), 1),
     ]
 
-    scores_result = MagicMock()
-    scores_result.all.return_value = [(1.0,), (0.5,), (0.1,)]
+    # scores 1.0, 0.5, 0.1 -> buckets [0-20]=1 (0.1), [40-60]=1 (0.5), [80-100]=1 (1.0)
+    quiz_result = _one_result(
+        _quiz_buckets_row(total=3, avg_score=(1.0 + 0.5 + 0.1) / 3, bucket_counts=[1, 0, 1, 0, 1])
+    )
 
     db.execute.side_effect = [
         top_queries_result,
         daily_result,
-        scores_result,
+        quiz_result,
         _scalar_result(2),   # gaps_detected
         _scalar_result(10),  # questions_answered
     ]
@@ -124,7 +143,7 @@ async def test_gaps_ratio_is_zero_when_no_questions_answered(mock_db):
     db.execute.side_effect = [
         MagicMock(all=MagicMock(return_value=[])),
         MagicMock(all=MagicMock(return_value=[])),
-        MagicMock(all=MagicMock(return_value=[])),
+        _one_result(_quiz_buckets_row(total=0, avg_score=None, bucket_counts=[0, 0, 0, 0, 0])),
         _scalar_result(0),
         _scalar_result(0),
     ]

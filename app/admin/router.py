@@ -49,6 +49,10 @@ router = APIRouter()
 
 _TOP_QUERIES_LIMIT = 10
 _QUIZ_SCORE_BUCKETS = ["0-20", "20-40", "40-60", "60-80", "80-100"]
+# Límites de score [lo, hi) por bucket — score=0.2 exacto cae en "20-40", no
+# en "0-20" (idéntico al mapeo previo vía idx = int(pct // 20)). El último
+# límite (1.01) es solo para incluir score=1.0 en "80-100" con un `<` uniforme.
+_QUIZ_SCORE_BUCKET_BOUNDS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.01]
 
 
 # ============================================================
@@ -187,34 +191,44 @@ async def get_usage(
 # Analytics — ANALYTICS-01
 # ============================================================
 
-def _bucket_for_score(score: float) -> str:
-    """Mapea un score 0.0-1.0 a uno de los 5 buckets de 20 puntos."""
-    pct = min(max(score, 0.0), 1.0) * 100
-    idx = min(int(pct // 20), len(_QUIZ_SCORE_BUCKETS) - 1)
-    return _QUIZ_SCORE_BUCKETS[idx]
-
-
 async def _get_quiz_score_distribution(
     db: AsyncSession, course_id: int, since: datetime
 ) -> QuizScoreDistribution:
-    stmt = select(QuizAttempt.score).where(
+    """Histograma de puntajes armado en una sola query de agregados (UX-16).
+
+    Antes traía cada QuizAttempt.score del período a Python para bucketearlo
+    ahí — con muchos alumnos rindiendo muchos quizzes esa lista podía crecer
+    sin límite. `FILTER` calcula los 5 buckets + el promedio en el motor,
+    sin importar cuántos intentos haya.
+    """
+    bucket_cols = [
+        func.count()
+        .filter(QuizAttempt.score >= lo, QuizAttempt.score < hi)
+        .label(f"bucket_{i}")
+        for i, (lo, hi) in enumerate(
+            zip(_QUIZ_SCORE_BUCKET_BOUNDS, _QUIZ_SCORE_BUCKET_BOUNDS[1:])
+        )
+    ]
+    stmt = select(
+        func.count().label("total"),
+        func.avg(QuizAttempt.score).label("avg_score"),
+        *bucket_cols,
+    ).where(
         QuizAttempt.course_id == course_id,
         QuizAttempt.created_at >= since,
     )
-    result = await db.execute(stmt)
-    scores = [row[0] for row in result.all()]
+    row = (await db.execute(stmt)).one()
 
-    counts = {bucket: 0 for bucket in _QUIZ_SCORE_BUCKETS}
-    for score in scores:
-        counts[_bucket_for_score(score)] += 1
-
-    total = len(scores)
-    average = round(sum(scores) / total, 4) if total else 0.0
+    total = int(row.total)
+    average = round(float(row.avg_score), 4) if total else 0.0
+    bucket_counts = [int(getattr(row, f"bucket_{i}")) for i in range(len(_QUIZ_SCORE_BUCKETS))]
 
     return QuizScoreDistribution(
         total_attempts=total,
         average_score=average,
-        buckets=[QuizScoreBucket(range=b, count=counts[b]) for b in _QUIZ_SCORE_BUCKETS],
+        buckets=[
+            QuizScoreBucket(range=b, count=c) for b, c in zip(_QUIZ_SCORE_BUCKETS, bucket_counts)
+        ],
     )
 
 

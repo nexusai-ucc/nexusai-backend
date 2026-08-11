@@ -32,19 +32,23 @@ async def get_daily_message_counts(
     interacción con el asistente — un proxy directo de "mensajes" sin
     depender de que el logging best-effort haya corrido para cada mensaje
     de la tabla `messages`.
+
+    Agrupa en SQL (UX-16) en vez de traer cada fila a Python — con mucha
+    actividad en el curso, `days=365` podía significar miles de filas
+    viajando solo para contarlas de a una.
     """
-    stmt = select(InteractionLog.created_at).where(
-        InteractionLog.course_id == course_id,
-        InteractionLog.created_at >= since,
+    day = func.date_trunc("day", InteractionLog.created_at, "UTC").label("day")
+    stmt = (
+        select(day, func.count().label("count"))
+        .where(
+            InteractionLog.course_id == course_id,
+            InteractionLog.created_at >= since,
+        )
+        .group_by(day)
     )
     result = await db.execute(stmt)
-    rows = result.all()
 
-    daily: dict[str, int] = {}
-    for (created_at,) in rows:
-        day = created_at.strftime("%Y-%m-%d")
-        daily[day] = daily.get(day, 0) + 1
-    return daily
+    return {row.day.strftime("%Y-%m-%d"): int(row.count) for row in result.all()}
 
 
 async def get_top_questions(
