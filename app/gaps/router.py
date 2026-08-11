@@ -69,6 +69,11 @@ class GapsListRequest(BaseModel):
     course_id: int = Field(gt=0)
     days: int = Field(default=30, ge=1, le=365)
     limit: int = Field(default=20, ge=1, le=100)
+    # UX-15 (#385): paginación — offset sobre los grupos ya clusterizados,
+    # no sobre las filas crudas (el clustering agrupa filas de distintas
+    # posiciones bajo un mismo gap, así que paginar antes de clusterizar
+    # daría resultados inconsistentes entre páginas).
+    offset: int = Field(default=0, ge=0)
     # DOC-D08 (#383): por default solo gaps activos. True trae también los
     # archivados, cada uno marcado con is_archived en la respuesta.
     include_archived: bool = False
@@ -271,12 +276,13 @@ async def gaps_list(
     result = await db.execute(stmt)
     rows = result.all()
 
-    items = _cluster_gaps(rows)[: payload.limit]
+    all_items = _cluster_gaps(rows)
+    items = all_items[payload.offset : payload.offset + payload.limit]
 
     return GapsListResponse(
         course_id=payload.course_id,
         days=payload.days,
-        total=len(items),
+        total=len(all_items),
         items=items,
     )
 

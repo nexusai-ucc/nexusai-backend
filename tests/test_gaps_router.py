@@ -36,6 +36,15 @@ def _row(question: str, minutes_ago: int, embedding=None, max_similarity=None, r
     )
 
 
+def _onehot(i: int, dims: int = 5) -> list[float]:
+    """Embedding con coseno 0 contra cualquier otro _onehot — a diferencia de
+    [float(i), 0.0], que son todos colineales (mismo ángulo) y por eso el
+    clustering semántico los fusiona en un solo grupo sin querer."""
+    vec = [0.0] * dims
+    vec[i % dims] = 1.0
+    return vec
+
+
 # ============================================================
 # _cluster_gaps — algoritmo puro
 # ============================================================
@@ -227,7 +236,7 @@ async def test_gaps_list_merges_synonyms_end_to_end(client, mock_db):
 @pytest.mark.asyncio
 async def test_gaps_list_applies_limit_after_clustering(client, mock_db):
     rows = [
-        _row(f"pregunta distinta {i}", minutes_ago=i, embedding=[float(i), 0.0])
+        _row(f"pregunta distinta {i}", minutes_ago=i, embedding=_onehot(i))
         for i in range(5)
     ]
     db_result = MagicMock()
@@ -239,4 +248,29 @@ async def test_gaps_list_applies_limit_after_clustering(client, mock_db):
     assert resp.status_code == 200
     body = resp.json()
     assert len(body["items"]) == 2
-    assert body["total"] == 2
+    # UX-15 (#385): total es la cantidad real de grupos clusterizados
+    # (5), no la cantidad de items ya recortados por limit — así el
+    # frontend sabe que todavía hay más para paginar.
+    assert body["total"] == 5
+
+
+@pytest.mark.asyncio
+async def test_gaps_list_offset_paginates_without_overlap(client, mock_db):
+    """UX-15 (#385): pedir la página siguiente con offset trae los grupos
+    restantes, ordenados igual, sin repetir los ya devueltos en la página 1."""
+    rows = [
+        _row(f"pregunta distinta {i}", minutes_ago=i, embedding=_onehot(i))
+        for i in range(5)
+    ]
+    db_result = MagicMock()
+    db_result.all.return_value = rows
+    mock_db.execute = AsyncMock(return_value=db_result)
+
+    page1 = await client.post("/api/v1/gaps/list", json={"course_id": 1, "days": 30, "limit": 2, "offset": 0})
+    page2 = await client.post("/api/v1/gaps/list", json={"course_id": 1, "days": 30, "limit": 2, "offset": 2})
+    page3 = await client.post("/api/v1/gaps/list", json={"course_id": 1, "days": 30, "limit": 2, "offset": 4})
+
+    body1, body2, body3 = page1.json(), page2.json(), page3.json()
+    assert [i["question"] for i in body1["items"]] != [i["question"] for i in body2["items"]]
+    assert len(body3["items"]) == 1
+    assert body1["total"] == body2["total"] == body3["total"] == 5
