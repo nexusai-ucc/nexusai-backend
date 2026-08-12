@@ -194,6 +194,7 @@ class ErrorsListRequest(BaseModel):
     user_id: int = Field(gt=0)
     days: int = Field(default=90, ge=1, le=365)
     limit: int = Field(default=100, ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
 
 
 class StoredQuizError(QuizErrorItem):
@@ -970,15 +971,29 @@ async def list_quiz_errors(
     _body: Annotated[bytes, Depends(verify_hmac)],
     db: AsyncSession = Depends(get_db),
 ) -> ErrorsListResponse:
-    """Historial de errores del alumno en un curso, más recientes primero."""
+    """Historial de errores del alumno en un curso, más recientes primero.
+
+    UX-19 (#389): `total` es el conteo real de errores en el rango de
+    `days` (no solo el tamaño de la página devuelta), para que el frontend
+    pueda saber si hay más resultados y pedirlos con `offset`.
+    """
     since = datetime.now(timezone.utc) - timedelta(days=payload.days)
+
+    base_filters = (
+        QuizError.course_id == payload.course_id,
+        QuizError.user_id == payload.user_id,
+        QuizError.created_at >= since,
+    )
+
+    total = await db.scalar(
+        select(func.count()).select_from(QuizError).where(*base_filters)
+    )
 
     stmt = (
         select(QuizError)
-        .where(QuizError.course_id == payload.course_id)
-        .where(QuizError.user_id == payload.user_id)
-        .where(QuizError.created_at >= since)
+        .where(*base_filters)
         .order_by(desc(QuizError.created_at))
+        .offset(payload.offset)
         .limit(payload.limit)
     )
     result = await db.execute(stmt)
@@ -1002,7 +1017,7 @@ async def list_quiz_errors(
         )
         for r in rows
     ]
-    return ErrorsListResponse(course_id=payload.course_id, total=len(items), items=items)
+    return ErrorsListResponse(course_id=payload.course_id, total=total or 0, items=items)
 
 
 @router.post("/errors/clear", response_model=ClearErrorsResponse)

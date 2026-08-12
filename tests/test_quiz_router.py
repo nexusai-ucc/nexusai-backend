@@ -449,4 +449,66 @@ async def test_record_attempt_rejects_negative_course_id(client):
 
     response = await client.post("/api/v1/quiz/attempts", json=payload)
 
+
+# ─────────────────────────────────────────────────────────────
+# POST /errors/list — paginación (UX-19 / issue #389)
+# ─────────────────────────────────────────────────────────────
+
+def _stored_quiz_error_row(**kwargs):
+    defaults = dict(
+        id="00000000-0000-0000-0000-000000000001",
+        created_at=datetime.now(timezone.utc),
+        question_type="multiple_choice",
+        question="¿Cuál es la derivada de x^2?",
+        explanation="2x",
+        source_filename="apunte1.pdf",
+        source_document_id=None,
+        options=["2x", "x", "x^2", "0"],
+        correct_index=0,
+        user_selected_index=1,
+        user_answer=None,
+        ai_feedback=None,
+        ai_score=None,
+    )
+    defaults.update(kwargs)
+    return SimpleNamespace(**defaults)
+
+
+_ERRORS_LIST_PAYLOAD = {"course_id": 1, "user_id": 1}
+
+
+async def test_list_quiz_errors_total_reflects_real_count_not_page_size(client, mock_db):
+    """Regresión UX-19: `total` debe ser el COUNT(*) real, no `len(items)`
+    de la página devuelta — si no, el frontend nunca sabe que hay más."""
+    mock_db.scalar.return_value = 37  # el alumno tiene 37 errores en total
+    mock_db.execute.return_value = _mock_quiz_result([_stored_quiz_error_row(), _stored_quiz_error_row()])
+
+    response = await client.post(
+        "/api/v1/quiz/errors/list",
+        json={**_ERRORS_LIST_PAYLOAD, "limit": 2, "offset": 0},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data["items"]) == 2
+    assert data["total"] == 37
+
+
+async def test_list_quiz_errors_defaults_offset_to_zero(client, mock_db):
+    mock_db.scalar.return_value = 1
+    mock_db.execute.return_value = _mock_quiz_result([_stored_quiz_error_row()])
+
+    response = await client.post("/api/v1/quiz/errors/list", json=_ERRORS_LIST_PAYLOAD)
+
+    assert response.status_code == 200
+
+
+async def test_list_quiz_errors_rejects_negative_offset(client):
+    response = await client.post(
+        "/api/v1/quiz/errors/list",
+        json={**_ERRORS_LIST_PAYLOAD, "offset": -1},
+    )
+
+    assert response.status_code == 422
+
     assert response.status_code == 422
