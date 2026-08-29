@@ -288,6 +288,59 @@ async def test_get_document_status_not_found(client, mock_db):
 
 
 # ============================================================
+# GET /api/v1/documents/{id}/preview — CONT-08 (#357)
+# ============================================================
+
+async def test_document_preview_returns_extracted_text(client, mock_db):
+    doc = _make_doc(status="indexed")
+    mock_db.execute.return_value = _exec_result(scalar=doc)
+    mock_db.scalar.return_value = "  Este es el texto extraído del PDF.  "
+
+    response = await client.get(f"/api/v1/documents/{doc.id}/preview")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["preview"] == "Este es el texto extraído del PDF."
+    assert body["char_count"] == len("Este es el texto extraído del PDF.")
+    assert body["truncated"] is False
+    assert body["status"] == "indexed"
+
+
+async def test_document_preview_truncates_long_text(client, mock_db):
+    doc = _make_doc(status="indexed")
+    mock_db.execute.return_value = _exec_result(scalar=doc)
+    mock_db.scalar.return_value = "x" * 5000
+
+    response = await client.get(f"/api/v1/documents/{doc.id}/preview")
+
+    body = response.json()
+    assert body["char_count"] == 600
+    assert body["truncated"] is True
+
+
+async def test_document_preview_no_chunks_yet(client, mock_db):
+    """Documento sin chunks todavía (indexando o error) → preview None, sin 500."""
+    doc = _make_doc(status="indexing")
+    mock_db.execute.return_value = _exec_result(scalar=doc)
+    mock_db.scalar.return_value = None
+
+    response = await client.get(f"/api/v1/documents/{doc.id}/preview")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["preview"] is None
+    assert body["char_count"] == 0
+
+
+async def test_document_preview_not_found(client, mock_db):
+    mock_db.execute.return_value = _exec_result(scalar=None)
+
+    response = await client.get(f"/api/v1/documents/{uuid4()}/preview")
+
+    assert response.status_code == 404
+
+
+# ============================================================
 # DELETE /api/v1/documents/{id}
 # ============================================================
 
