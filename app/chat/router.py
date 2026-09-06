@@ -729,6 +729,42 @@ async def session_messages(
     )
 
 
+class SessionDeleteRequest(BaseModel):
+    user_id: int = Field(gt=0)
+    session_id: UUID
+
+
+class SessionDeleteResponse(BaseModel):
+    success: bool
+
+
+@router.post("/sessions/delete", response_model=SessionDeleteResponse)
+async def session_delete(
+    payload: SessionDeleteRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+) -> SessionDeleteResponse:
+    """Borra una sesión de chat puntual (ASIST-02, #350).
+
+    Mismo criterio de ownership que session_messages: valida que la sesión
+    sea del user_id de la request antes de borrar. El cascade sobre
+    `messages` ya está resuelto a nivel de FK (ON DELETE CASCADE en
+    chat_sessions.id), no hace falta borrarlos a mano.
+    """
+    session_stmt = select(ChatSession).where(ChatSession.id == payload.session_id)
+    res = await db.execute(session_stmt)
+    session = res.scalar_one_or_none()
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+    if session.user_id != payload.user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Session does not belong to user")
+
+    await db.delete(session)
+    await db.commit()
+
+    return SessionDeleteResponse(success=True)
+
+
 # ============================================================
 # Endpoint de smoke test: POST /echo
 # ============================================================
