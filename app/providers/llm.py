@@ -9,9 +9,19 @@ Soporta cualquier proveedor compatible con el SDK de OpenAI cambiando
   - Ollama local (dev):       http://localhost:11434/v1
   - Groq:                     https://api.groq.com/openai/v1
 
+Control del thinking (PERF-01): los flash 2.5+ de Gemini razonan internamente
+antes de emitir el primer token, y ese razonamiento invisible domina la
+latencia percibida. `LLM_REASONING_EFFORT` (default "none") se manda en todas
+las llamadas; cada call-site lo puede pisar con `reasoning_effort=` — hoy solo
+lo hace la generación de quiz/examen, con `LLM_REASONING_EFFORT_GENERATION`.
+Con el valor "default"/"auto"/"" no se manda el parámetro y el comportamiento
+vuelve a ser el previo a PERF-01.
+
 Retry: 3 intentos con backoff 1s → 2s para errores transitorios
 (RateLimitError, Timeout, ConnectionError, InternalServerError).
-Los errores definitivos (AuthenticationError, BadRequestError) propagan de inmediato.
+Los errores definitivos (AuthenticationError, BadRequestError) propagan de
+inmediato — sin reintentos. Ojo: no reintentar y no ceder el paso al siguiente
+eslabón son cosas distintas; ver _FALLBACK_TRIGGERS más abajo.
 
 Fallback automático (INFRA-01 / issue #307): si el proveedor primario agota
 sus 3 reintentos por cuota (429 RateLimitError) o caída del servidor (503
@@ -22,8 +32,8 @@ Sin esas 3 env vars, el fallback queda deshabilitado (comportamiento idéntico
 al anterior).
 
 Cadena de modelos intermedios (INFRA-03 / issue #343): Google AI Studio da
-cuota gratuita POR MODELO, no por cuenta — agotar `gemini-2.5-flash` no
-agota `gemini-2.5-flash-lite` ni `gemini-2.0-flash`. `LLM_INTERMEDIATE_MODELS`
+cuota gratuita POR MODELO, no por cuenta — agotar `gemini-3.5-flash` no
+agota `gemini-3.1-flash-lite` ni `gemini-3.8-flash`. `LLM_INTERMEDIATE_MODELS`
 (opcional, coma-separado) prueba esos modelos extra usando el MISMO client
 del primario (misma API key, mismo base_url — no son otro proveedor, solo
 otro modelo) antes de recién ahí pasar al proveedor secundario configurado.
@@ -48,14 +58,35 @@ from app.shared.retry import async_retry
 
 logger = logging.getLogger(__name__)
 
-# Errores que disparan el fallback al proveedor secundario: cuota agotada
-# (429 RESOURCE_EXHAUSTED en Gemini) o servidor caído (503). Deliberadamente
-# más angosto que _RETRYABLE_OPENAI de retry.py — timeouts/conexión no
-# disparan fallback porque probablemente afecten a ambos proveedores por igual.
+# Errores que disparan el fallback al siguiente eslabón de la cadena.
+# Deliberadamente más angosto que _RETRYABLE_OPENAI de retry.py — timeouts y
+# errores de conexión NO disparan fallback porque probablemente afecten a
+# todos los eslabones por igual.
+#
+#   RateLimitError (429)       → cuota agotada (RESOURCE_EXHAUSTED en Gemini).
+#   InternalServerError (503)  → modelo saturado o caído.
+#   NotFoundError (404)        → el modelo ya no existe. Google retira modelos
+#       viejos sin previo aviso: al 2026-09, gemini-2.0-flash y
+#       gemini-2.5-flash-lite —ambos sugeridos por el .env.example previo a
+#       PERF-01— devuelven 404. Sin este trigger, un eslabón intermedio muerto
+#       no cedía el paso al siguiente: cortaba la cadena entera y le propagaba
+#       un 503 al alumno.
+#   BadRequestError (400)      → el modelo rechaza un parámetro de la request
+#       (p. ej. `reasoning_effort`, que no todos los flash-lite aceptan). Es
+#       "este modelo no puede servir esta request", así que corresponde probar
+#       el siguiente. Contrapartida asumida: una request genuinamente mal
+#       formada ahora se reintenta una vez por eslabón antes de fallar. Con la
+#       config default (cadena de un solo eslabón) no cambia nada.
 _FALLBACK_TRIGGERS: tuple[type[BaseException], ...] = (
     openai.RateLimitError,
     openai.InternalServerError,
+    openai.NotFoundError,
+    openai.BadRequestError,
 )
+
+# Valores de reasoning_effort que significan "no mandes el parámetro, que el
+# modelo decida" — o sea, el comportamiento previo a PERF-01.
+_EFFORT_UNSET = frozenset({"", "default", "auto"})
 
 
 @dataclass
@@ -100,9 +131,17 @@ class LLMProvider:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> None:
         settings = get_settings()
         self.model: str = model or settings.llm_model
+
+        # Default de thinking para todas las llamadas — ver config.py::
+        # llm_reasoning_effort. Cada call-site lo puede pisar pasando
+        # `reasoning_effort=` a chat_completion/chat_stream.
+        self.reasoning_effort: str = (
+            reasoning_effort if reasoning_effort is not None else settings.llm_reasoning_effort
+        )
         self.client: AsyncOpenAI = AsyncOpenAI(
             api_key=api_key or settings.llm_api_key,
             base_url=base_url or settings.llm_base_url,
@@ -133,6 +172,28 @@ class LLMProvider:
             if m.strip()
         ]
 
+    def _with_reasoning_effort(
+        self,
+        kwargs: dict[str, Any],
+        override: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Agrega `reasoning_effort` al body de la request (PERF-01).
+
+        Va dentro de `extra_body` y no como kwarg nombrado porque el SDK de
+        OpenAI pineado en requirements.txt (1.51.0) todavía no lo expone como
+        parámetro tipado — `extra_body` lo manda igual, tal cual, en el JSON.
+
+        Respeta lo que ya venga puesto: si un call-site arma su propio
+        `extra_body` con un `reasoning_effort` adentro, no se lo pisa.
+        """
+        effort = override if override is not None else self.reasoning_effort
+        if not effort or effort.strip().lower() in _EFFORT_UNSET:
+            return kwargs
+
+        extra_body = dict(kwargs.get("extra_body") or {})
+        extra_body.setdefault("reasoning_effort", effort.strip().lower())
+        return {**kwargs, "extra_body": extra_body}
+
     def _fallback_chain(self) -> list[tuple[AsyncOpenAI, str]]:
         """Cadena completa a intentar en orden (INFRA-03):
 
@@ -152,6 +213,8 @@ class LLMProvider:
     async def chat_completion(
         self,
         messages: list[dict[str, str]],
+        *,
+        reasoning_effort: Optional[str] = None,
         **kwargs: Any,
     ) -> CompletionResult:
         """
@@ -164,6 +227,8 @@ class LLMProvider:
         Args:
             messages: lista en formato ChatML
                 [{"role": "system|user|assistant", "content": "..."}, ...]
+            reasoning_effort: pisa el default de `LLM_REASONING_EFFORT` solo
+                para esta llamada ("none" | "low" | "medium" | "high").
             **kwargs: parámetros adicionales del SDK (temperature, max_tokens, etc.)
 
         Returns:
@@ -177,7 +242,11 @@ class LLMProvider:
             openai.* — errores no-retryables, o el del último eslabón de la
             cadena si todos fallan.
         """
-        response = await self._run_completion_chain(self._fallback_chain(), messages, **kwargs)
+        response = await self._run_completion_chain(
+            self._fallback_chain(),
+            messages,
+            **self._with_reasoning_effort(kwargs, reasoning_effort),
+        )
         text = response.choices[0].message.content or ""
         usage = response.usage
         return CompletionResult(
@@ -263,6 +332,8 @@ class LLMProvider:
     async def chat_stream(
         self,
         messages: list[dict[str, str]],
+        *,
+        reasoning_effort: Optional[str] = None,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
         """
@@ -276,7 +347,9 @@ class LLMProvider:
             Strings con incrementos de texto. Algunos chunks pueden ser "" —
             el caller debe ignorarlos al armar SSE.
         """
-        stream = await self._create_stream(messages, **kwargs)
+        stream = await self._create_stream(
+            messages, **self._with_reasoning_effort(kwargs, reasoning_effort)
+        )
 
         async for chunk in stream:
             if not chunk.choices:
@@ -288,6 +361,8 @@ class LLMProvider:
     async def chat_completion_stream(
         self,
         messages: list[dict[str, str]],
+        *,
+        reasoning_effort: Optional[str] = None,
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
         """Streaming con conteo de tokens al final.
@@ -298,7 +373,9 @@ class LLMProvider:
         persistir métricas en la DB después del streaming.
         """
         stream = await self._create_stream(
-            messages, stream_options={"include_usage": True}, **kwargs
+            messages,
+            stream_options={"include_usage": True},
+            **self._with_reasoning_effort(kwargs, reasoning_effort),
         )
 
         async for chunk in stream:

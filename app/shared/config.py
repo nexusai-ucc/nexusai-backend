@@ -10,7 +10,26 @@ class Settings(BaseSettings):
     # LLM
     llm_api_key: str
     llm_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
-    llm_model: str = "gemini-2.0-flash"
+    llm_model: str = "gemini-3.5-flash"
+
+    # LLM — control del "thinking" de los modelos razonadores de Gemini (PERF-01).
+    #
+    # Los modelos de la familia flash 2.5+ razonan internamente ANTES de emitir
+    # el primer token. Ese razonamiento no se ve, no se streamea, y es el grueso
+    # de la latencia percibida: medido contra la API real, gemini-2.5-flash con
+    # thinking automático tardaba ~45s hasta el primer token en una consulta RAG
+    # típica, contra ~1-3s con el thinking apagado.
+    #
+    # Valores: "none" (sin razonamiento), "low", "medium", "high". Cualquier
+    # valor de _EFFORT_UNSET en providers/llm.py ("", "default", "auto") deja
+    # que el modelo decida, o sea el comportamiento previo a PERF-01.
+    #
+    # `llm_reasoning_effort` es el default de TODAS las llamadas.
+    # `llm_reasoning_effort_generation` lo pisa solo donde la calidad del
+    # output justifica pagar los segundos extra — hoy, la generación de
+    # preguntas de quiz y de examen (ver quiz/router.py::_run_quiz_generation).
+    llm_reasoning_effort: str = "none"
+    llm_reasoning_effort_generation: str = "low"
 
     # LLM — proveedor secundario (fallback automático, INFRA-01 / issue #307).
     # Opcionales: si los 3 no están seteados, el fallback queda deshabilitado
@@ -26,6 +45,18 @@ class Settings(BaseSettings):
     # ANTES de pasar al proveedor secundario. Vacío = comportamiento idéntico
     # a antes de INFRA-03 (salta directo del primario al secundario).
     llm_intermediate_models: Optional[str] = None
+
+    # Resúmenes de documentos (PERF-02) — ver documents/summarizer.py.
+    #
+    # summary_cache_ttl_sec: cuánto vive en Redis el resumen ya generado de un
+    #   documento. La cache key incluye el hash/fecha del archivo, así que
+    #   reemplazar un documento (CONT-07) invalida su entrada sola. 0 = sin cache.
+    # summary_max_concurrency: cuántos resúmenes de documento se piden al LLM en
+    #   paralelo dentro del resumen pre-parcial. Subirlo acelera cursos con mucho
+    #   material, pero contra la cuota gratuita de Gemini aumenta la chance de
+    #   429/503 — 4 es el compromiso elegido.
+    summary_cache_ttl_sec: int = 86400
+    summary_max_concurrency: int = 4
 
     # Embeddings
     embedding_api_key: str

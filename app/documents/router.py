@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Annotated, Optional
 from uuid import UUID
 
+import redis.asyncio as redis_async
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -45,6 +46,7 @@ from app.db.session import get_db, get_session_factory
 from app.documents.extractor import SUPPORTED_MIME_TYPES
 from app.documents.pipeline import index_document
 from app.documents.summarizer import summarize_document, summarize_pre_exam
+from app.infrastructure.redis_client import get_redis
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
 
@@ -601,11 +603,15 @@ async def summarize_document_endpoint(
     _body: Annotated[bytes, Depends(verify_hmac)],
     db: AsyncSession = Depends(get_db),
     llm: LLMProvider = Depends(get_llm_provider),
+    redis: redis_async.Redis = Depends(get_redis),
 ) -> SummarizeResponse:
     """Genera un resumen del documento usando el LLM (BUS-03).
 
     Recupera todos los chunks del documento en orden y los envía al LLM.
     El documento debe pertenecer al course_id recibido (aislamiento multi-curso).
+
+    PERF-02: el resultado se cachea en Redis por versión del archivo, así que
+    volver a pedir el resumen del mismo documento es instantáneo.
     """
     try:
         result = await summarize_document(
@@ -613,6 +619,7 @@ async def summarize_document_endpoint(
             course_id=payload.course_id,
             db=db,
             llm=llm,
+            cache=redis,
         )
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
@@ -648,13 +655,17 @@ async def pre_exam_summary_endpoint(
     _body: Annotated[bytes, Depends(verify_hmac)],
     db: AsyncSession = Depends(get_db),
     llm: LLMProvider = Depends(get_llm_provider),
+    redis: redis_async.Redis = Depends(get_redis),
 ) -> PreExamSummaryResponse:
     """Resumen de repaso combinando todo el material indexado relevante para
     un próximo examen (BUS-04). Opcionalmente acotado a una unidad/sección.
 
-    Reusa summarize_document por cada documento y hace una única síntesis
-    final. Si no hay documentos indexados (para el curso o la sección
-    elegida), devuelve summary="" sin llamar al LLM.
+    Resume cada documento y hace una única síntesis final. Si no hay
+    documentos indexados (para el curso o la sección elegida), devuelve
+    summary="" sin llamar al LLM.
+
+    PERF-02: los resúmenes por documento se piden en paralelo y se cachean en
+    Redis, así que el segundo pedido del mismo curso solo paga la síntesis.
     """
     try:
         result = await summarize_pre_exam(
@@ -662,6 +673,7 @@ async def pre_exam_summary_endpoint(
             db=db,
             llm=llm,
             section=payload.section,
+            cache=redis,
         )
     except RuntimeError as exc:
         raise HTTPException(

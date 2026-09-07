@@ -52,6 +52,7 @@ from app.documents.retriever import retrieve_context
 from app.gaps.recorder import WEAK_MATCH_THRESHOLD
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
+from app.shared.config import get_settings
 
 logger = logging.getLogger("nexusai.quiz")
 
@@ -560,6 +561,12 @@ async def _run_quiz_generation(
             messages,
             response_format={"type": "json_object"},
             temperature=0.6,
+            # PERF-01: única llamada del sistema que pisa el default global de
+            # thinking ("none"). Armar distractores plausibles y explicaciones
+            # correctas mejora con algo de razonamiento, y acá el alumno ya
+            # espera una pantalla de carga — no es una respuesta que se
+            # streamee token a token como el chat.
+            reasoning_effort=get_settings().llm_reasoning_effort_generation,
         )
     except Exception as exc:
         logger.error("Quiz LLM call failed: %s: %s", type(exc).__name__, exc, exc_info=True)
