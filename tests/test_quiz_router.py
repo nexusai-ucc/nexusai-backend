@@ -178,6 +178,76 @@ async def test_generate_rejects_invalid_difficulty_at_http_level(client):
 
 
 # ─────────────────────────────────────────────────────────────
+# POST /suggest-difficulty (SP-12 / #322)
+# ─────────────────────────────────────────────────────────────
+
+def _attempt_row(**kwargs):
+    defaults = dict(topic="derivadas", score=0.5, created_at=datetime.now(timezone.utc))
+    defaults.update(kwargs)
+    return SimpleNamespace(**defaults)
+
+
+_SUGGEST_PAYLOAD = {"course_id": 1, "user_id": 1}
+
+
+async def test_suggest_difficulty_no_history_returns_null(client, mock_db):
+    mock_db.execute.return_value = _mock_quiz_result([])
+
+    response = await client.post("/api/v1/quiz/suggest-difficulty", json=_SUGGEST_PAYLOAD)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["difficulty"] is None
+    assert data["based_on_attempts"] == 0
+
+
+async def test_suggest_difficulty_high_scores_suggest_hard(client, mock_db):
+    mock_db.execute.return_value = _mock_quiz_result([
+        _attempt_row(score=0.9), _attempt_row(score=1.0), _attempt_row(score=0.85),
+    ])
+
+    response = await client.post("/api/v1/quiz/suggest-difficulty", json=_SUGGEST_PAYLOAD)
+
+    data = response.json()
+    assert data["difficulty"] == "hard"
+    assert data["based_on_attempts"] == 3
+    assert "difícil" in data["reason"]
+
+
+async def test_suggest_difficulty_low_scores_suggest_easy(client, mock_db):
+    mock_db.execute.return_value = _mock_quiz_result([
+        _attempt_row(score=0.2), _attempt_row(score=0.3),
+    ])
+
+    response = await client.post("/api/v1/quiz/suggest-difficulty", json=_SUGGEST_PAYLOAD)
+
+    data = response.json()
+    assert data["difficulty"] == "easy"
+
+
+async def test_suggest_difficulty_mid_scores_suggest_medium(client, mock_db):
+    mock_db.execute.return_value = _mock_quiz_result([_attempt_row(score=0.6)])
+
+    response = await client.post("/api/v1/quiz/suggest-difficulty", json=_SUGGEST_PAYLOAD)
+
+    assert response.json()["difficulty"] == "medium"
+
+
+async def test_suggest_difficulty_filters_by_topic_case_insensitive(client, mock_db):
+    """El mock no valida la query en sí — esto confirma que el payload con
+    topic llega bien al endpoint y no rompe nada (el filtro real se prueba
+    end-to-end contra una DB real, fuera del alcance de este entorno)."""
+    mock_db.execute.return_value = _mock_quiz_result([_attempt_row(topic="Derivadas", score=0.9)])
+
+    response = await client.post("/api/v1/quiz/suggest-difficulty", json={
+        **_SUGGEST_PAYLOAD, "topic": "derivadas",
+    })
+
+    assert response.status_code == 200
+    assert response.json()["difficulty"] == "hard"
+
+
+# ─────────────────────────────────────────────────────────────
 # POST /study-plan — combina QuizError + UnansweredQuestion
 # ─────────────────────────────────────────────────────────────
 

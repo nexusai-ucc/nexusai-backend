@@ -310,6 +310,26 @@ class AttemptsListResponse(BaseModel):
     items: List[AttemptItem]
 
 
+class SuggestDifficultyRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    user_id: int = Field(gt=0)
+    # Sin topic: sugerencia sobre el historial general del curso (alumno
+    # practicando "de lo que sea"). Con topic: solo cuenta el historial de
+    # ESE tema — sin match ahí, no hay sugerencia (SP-12, ver criterio de
+    # aceptación: "sin historial previo en ese tema, comportamiento actual").
+    topic: Optional[str] = Field(default=None, max_length=200)
+
+
+class SuggestDifficultyResponse(BaseModel):
+    difficulty: Optional[str] = None
+    reason: Optional[str] = None
+    based_on_attempts: int = 0
+    # % de aciertos redondeado — se manda aparte (además de embebido en
+    # `reason`, que está fijo en español) para que el front arme el texto en
+    # inglés sin tener que parsear el string.
+    accuracy_pct: Optional[int] = None
+
+
 class StudyPlanRequest(BaseModel):
     course_id: int = Field(gt=0)
     user_id: int = Field(gt=0)
@@ -1312,6 +1332,63 @@ async def list_quiz_attempts(
     ]
     return AttemptsListResponse(course_id=payload.course_id, total=len(items), items=items)
 
+
+# SP-12 (#322): umbrales de sugerencia — el issue no fija un número exacto,
+# así que quedan documentados acá. >=80% de aciertos sugiere subir a hard,
+# <=40% sugiere bajar a easy; el resto se queda en medium (el default actual).
+_SUGGEST_HARD_THRESHOLD = 0.8
+_SUGGEST_EASY_THRESHOLD = 0.4
+_SUGGEST_ATTEMPT_LIMIT = 10
+
+
+@router.post("/suggest-difficulty", response_model=SuggestDifficultyResponse)
+async def suggest_difficulty(
+    payload: SuggestDifficultyRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+) -> SuggestDifficultyResponse:
+    """Sugiere una dificultad de partida para el generador de quiz (SP-12).
+
+    Solo lectura sobre `quiz_attempts` (ya persistido, SP-09/ANALYTICS-01) —
+    no hay tabla ni migración nueva. Es una SUGERENCIA, nunca una
+    restricción: el alumno siempre puede elegir otra dificultad a mano.
+    """
+    stmt = (
+        select(QuizAttempt)
+        .where(QuizAttempt.course_id == payload.course_id)
+        .where(QuizAttempt.user_id == payload.user_id)
+        .order_by(desc(QuizAttempt.created_at))
+        .limit(_SUGGEST_ATTEMPT_LIMIT)
+    )
+    if payload.topic:
+        stmt = stmt.where(func.lower(QuizAttempt.topic) == payload.topic.strip().lower())
+
+    rows = (await db.execute(stmt)).scalars().all()
+
+    if not rows:
+        return SuggestDifficultyResponse()
+
+    avg_score = sum(r.score for r in rows) / len(rows)
+    if avg_score >= _SUGGEST_HARD_THRESHOLD:
+        difficulty = "hard"
+    elif avg_score <= _SUGGEST_EASY_THRESHOLD:
+        difficulty = "easy"
+    else:
+        difficulty = "medium"
+
+    pct = round(avg_score * 100)
+    difficulty_label = {"easy": "fácil", "medium": "media", "hard": "difícil"}[difficulty]
+    reason = (
+        f"Basado en tus últimos {len(rows)} intento{'s' if len(rows) != 1 else ''} "
+        f"({pct}% de aciertos), te sugerimos dificultad {difficulty_label}."
+    )
+
+    return SuggestDifficultyResponse(
+        difficulty=difficulty,
+        reason=reason,
+        based_on_attempts=len(rows),
+        accuracy_pct=pct,
+    )
 
 
 @router.post("/study-plan", response_model=StudyPlanResponse)
