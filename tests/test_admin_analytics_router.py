@@ -55,16 +55,21 @@ def _one_result(row):
     return result
 
 
+def _feedback_row(total: int, helpful: int):
+    return SimpleNamespace(total=total, helpful=helpful)
+
+
 @pytest.fixture
 def mock_db():
-    """execute() se llama 6 veces en orden fijo dentro del endpoint:
+    """execute() se llama 7 veces en orden fijo dentro del endpoint:
 
     1) top_queries (get_top_questions)      -> .all()
     2) daily_message_counts (agrupado)      -> .all()
     3) quiz score distribution (agregado)   -> .one()
     4) gaps_ratio: gaps_detected             -> .scalar_one()
     5) gaps_ratio: questions_answered        -> .scalar_one()
-    6) topics_consulted (get_distinct_topic_count) -> .scalar_one()
+    6) feedback_ratio (agregado, ASIST-01)   -> .one()
+    7) topics_consulted (get_distinct_topic_count) -> .scalar_one()
     """
     db = AsyncMock()
     top_queries_result = MagicMock()
@@ -87,6 +92,7 @@ def mock_db():
         quiz_result,
         _scalar_result(2),   # gaps_detected
         _scalar_result(10),  # questions_answered
+        _one_result(_feedback_row(total=5, helpful=4)),  # feedback_ratio
         _scalar_result(4),   # topics_consulted
     ]
     return db
@@ -141,6 +147,38 @@ async def test_gaps_ratio_computed_from_counts(client):
     assert data == {"gaps_detected": 2, "questions_answered": 10, "ratio": 0.2}
 
 
+async def test_feedback_ratio_computed_from_counts(client):
+    response = await client.get("/api/v1/admin/analytics?course_id=1")
+
+    data = response.json()["feedback_ratio"]
+    assert data == {"helpful_count": 4, "total_rated": 5, "useful_pct": 80.0}
+
+
+async def test_feedback_ratio_is_zero_when_no_votes(mock_db):
+    db = mock_db
+    db.execute.side_effect = [
+        MagicMock(all=MagicMock(return_value=[])),
+        MagicMock(all=MagicMock(return_value=[])),
+        _one_result(_quiz_buckets_row(total=0, avg_score=None, bucket_counts=[0, 0, 0, 0, 0])),
+        _scalar_result(0),
+        _scalar_result(0),
+        _one_result(_feedback_row(total=0, helpful=0)),
+        _scalar_result(0),
+    ]
+
+    from app.admin.router import router
+
+    app = FastAPI()
+    app.include_router(router, prefix="/api/v1/admin")
+    app.dependency_overrides[verify_hmac] = lambda: b"test-body"
+    app.dependency_overrides[get_db] = lambda: db
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        response = await c.get("/api/v1/admin/analytics?course_id=1")
+
+    assert response.json()["feedback_ratio"] == {"helpful_count": 0, "total_rated": 0, "useful_pct": 0.0}
+
+
 async def test_gaps_ratio_is_zero_when_no_questions_answered(mock_db):
     db = mock_db
     db.execute.side_effect = [
@@ -149,6 +187,7 @@ async def test_gaps_ratio_is_zero_when_no_questions_answered(mock_db):
         _one_result(_quiz_buckets_row(total=0, avg_score=None, bucket_counts=[0, 0, 0, 0, 0])),
         _scalar_result(0),
         _scalar_result(0),
+        _one_result(_feedback_row(total=0, helpful=0)),  # feedback_ratio
         _scalar_result(0),  # topics_consulted
     ]
 

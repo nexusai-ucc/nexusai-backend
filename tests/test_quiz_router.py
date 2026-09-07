@@ -10,7 +10,7 @@ Misma estrategia de aislamiento que test_forums_router.py:
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
@@ -101,6 +101,11 @@ def mock_db():
             filename="apunte1.pdf",
             content="El teorema de Bayes relaciona probabilidades condicionales.",
             id="00000000-0000-0000-0000-000000000001",
+            # SP-11 (#315): mismo mock genérico reusado por el upsert de
+            # flashcards (_persist_flashcards) — content_hash no matchea el
+            # real así que el id de la flashcard queda None, pero no rompe
+            # el shape de la respuesta (los tests de flashcards no lo assertan).
+            content_hash="dummy-hash",
         )
     ]
     return db
@@ -794,3 +799,173 @@ async def test_list_quiz_errors_rejects_negative_offset(client):
     assert response.status_code == 422
 
     assert response.status_code == 422
+
+
+# ─────────────────────────────────────────────────────────────
+# Repetición espaciada de flashcards — SP-11 (#315)
+# ─────────────────────────────────────────────────────────────
+
+from app.db.models import FlashcardReview  # noqa: E402
+from app.quiz.router import _apply_sm2, _flashcard_content_hash  # noqa: E402
+
+
+def _new_review(**kwargs):
+    defaults = dict(ease_factor=2.5, interval_days=0, repetitions=0)
+    defaults.update(kwargs)
+    return FlashcardReview(**defaults)
+
+
+def test_sm2_first_correct_review_sets_interval_to_one_day():
+    review = _new_review()
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    _apply_sm2(review, knew_it=True, now=now)
+
+    assert review.repetitions == 1
+    assert review.interval_days == 1
+    assert review.next_review_at == now + timedelta(days=1)
+    assert review.ease_factor > 2.5  # quality=5 sube el ease
+
+
+def test_sm2_second_correct_review_sets_interval_to_six_days():
+    review = _new_review(repetitions=1, interval_days=1)
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    _apply_sm2(review, knew_it=True, now=now)
+
+    assert review.repetitions == 2
+    assert review.interval_days == 6
+
+
+def test_sm2_third_correct_review_multiplies_interval_by_ease_factor():
+    review = _new_review(repetitions=2, interval_days=6, ease_factor=2.5)
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    _apply_sm2(review, knew_it=True, now=now)
+
+    assert review.repetitions == 3
+    assert review.interval_days == round(6 * 2.5)
+
+
+def test_sm2_incorrect_review_resets_to_short_term():
+    review = _new_review(repetitions=5, interval_days=40, ease_factor=2.8)
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    _apply_sm2(review, knew_it=False, now=now)
+
+    assert review.repetitions == 0
+    assert review.interval_days == 1
+    assert review.next_review_at == now + timedelta(days=1)
+    assert review.ease_factor < 2.8  # quality=2 baja el ease
+
+
+def test_sm2_ease_factor_never_drops_below_minimum():
+    review = _new_review(ease_factor=1.3)
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    _apply_sm2(review, knew_it=False, now=now)
+
+    assert review.ease_factor == 1.3
+
+
+def test_flashcard_content_hash_is_stable_and_order_sensitive():
+    h1 = _flashcard_content_hash("¿Qué es una derivada?", "La tasa de cambio.")
+    h2 = _flashcard_content_hash("¿Qué es una derivada?", "La tasa de cambio.")
+    h3 = _flashcard_content_hash("otra pregunta", "otra respuesta")
+
+    assert h1 == h2
+    assert h1 != h3
+
+
+async def test_flashcards_summary_returns_due_and_total_counts(client, mock_db):
+    mock_db.scalar.side_effect = [7, 3]  # total_count, due_count
+
+    response = await client.post(
+        "/api/v1/quiz/flashcards/summary", json={"course_id": 1, "user_id": 1}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"due_count": 3, "total_count": 7}
+
+
+async def test_flashcards_due_returns_questions_shaped_like_generate(client, mock_db):
+    fc_id = uuid4()
+    fc = SimpleNamespace(
+        id=fc_id,
+        question="Teorema de Bayes",
+        explanation="Relaciona P(A|B) con P(B|A).",
+        source_filename="apunte1.pdf",
+        source_document_id=None,
+    )
+    due_result = MagicMock()
+    due_result.all.return_value = [(fc, None)]
+    mock_db.execute.return_value = due_result
+
+    response = await client.post(
+        "/api/v1/quiz/flashcards/due",
+        json={"course_id": 1, "user_id": 1, "limit": 5},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data["questions"]) == 1
+    q = data["questions"][0]
+    assert q["id"] == str(fc_id)
+    assert q["question_type"] == "flashcard"
+    assert q["question"] == "Teorema de Bayes"
+    assert q["options"] == []
+    assert q["correct_index"] == -1
+
+
+async def test_flashcards_review_batch_creates_new_review_and_applies_sm2(client, mock_db):
+    flashcard_id = uuid4()
+
+    valid_ids_result = MagicMock()
+    valid_ids_result.all.return_value = [SimpleNamespace(id=flashcard_id)]
+
+    review_lookup_result = MagicMock()
+    review_lookup_result.scalar_one_or_none.return_value = None
+
+    mock_db.execute.side_effect = [valid_ids_result, review_lookup_result]
+
+    response = await client.post(
+        "/api/v1/quiz/flashcards/review-batch",
+        json={
+            "course_id": 1,
+            "user_id": 1,
+            "reviews": [{"flashcard_id": str(flashcard_id), "knew_it": True}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"updated": 1}
+    mock_db.add.assert_called_once()
+    created = mock_db.add.call_args[0][0]
+    assert created.flashcard_id == flashcard_id
+    assert created.user_id == 1
+    assert created.repetitions == 1
+    assert created.interval_days == 1
+
+
+async def test_flashcards_review_batch_skips_flashcard_not_in_course(client, mock_db):
+    """flashcard_id que no pertenece a este course_id se ignora — no confiamos
+    ciegamente en un id mandado por el cliente."""
+    flashcard_id = uuid4()
+    other_course_flashcard_id = uuid4()
+
+    valid_ids_result = MagicMock()
+    valid_ids_result.all.return_value = [SimpleNamespace(id=other_course_flashcard_id)]
+    mock_db.execute.side_effect = [valid_ids_result]
+
+    response = await client.post(
+        "/api/v1/quiz/flashcards/review-batch",
+        json={
+            "course_id": 1,
+            "user_id": 1,
+            "reviews": [{"flashcard_id": str(flashcard_id), "knew_it": True}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"updated": 0}
+    mock_db.add.assert_not_called()

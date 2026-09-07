@@ -31,6 +31,7 @@ Uso del LLM:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import random
@@ -41,10 +42,11 @@ from typing import Annotated, Any, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from sqlalchemy import delete, desc, func, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.hmac import verify_hmac
-from app.db.models import Chunk, Document, QuizAttempt, QuizError, UnansweredQuestion
+from app.db.models import Chunk, Document, Flashcard, FlashcardReview, QuizAttempt, QuizError, UnansweredQuestion
 from app.db.session import get_db
 from app.documents.retriever import retrieve_context
 from app.gaps.recorder import WEAK_MATCH_THRESHOLD
@@ -91,6 +93,10 @@ class QuizRequest(BaseModel):
 
 
 class QuizQuestion(BaseModel):
+    # SP-11 (#315): id real de `flashcards`, solo poblado cuando
+    # question_type='flashcard' (persistidas para poder aplicar repetición
+    # espaciada). None para el resto de los tipos, que siguen siendo efímeros.
+    id: Optional[str] = Field(default=None)
     question_type: str = Field(default="multiple_choice")
     question: str = Field(min_length=1, max_length=500)
     options: List[str] = Field(default=[])   # 4 for MC, 2 for T/F, [] for open
@@ -366,9 +372,120 @@ class StudyPlanDismissResponse(BaseModel):
     affected: int
 
 
+class FlashcardsSummaryRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    user_id: int = Field(gt=0)
+    topic: Optional[str] = Field(default=None, max_length=200)
+
+
+class FlashcardsSummaryResponse(BaseModel):
+    due_count: int
+    total_count: int
+
+
+class FlashcardsDueRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    user_id: int = Field(gt=0)
+    topic: Optional[str] = Field(default=None, max_length=200)
+    limit: int = Field(default=10, ge=1, le=50)
+
+
+class FlashcardsDueResponse(BaseModel):
+    course_id: int
+    questions: List[QuizQuestion]
+
+
+class FlashcardReviewItem(BaseModel):
+    flashcard_id: str
+    knew_it: bool
+
+
+class FlashcardsReviewBatchRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    user_id: int = Field(gt=0)
+    reviews: List[FlashcardReviewItem] = Field(min_length=1, max_length=50)
+
+
+class FlashcardsReviewBatchResponse(BaseModel):
+    updated: int
+
+
 # ============================================================
 # Helpers
 # ============================================================
+
+def _flashcard_content_hash(question: str, explanation: str) -> str:
+    return hashlib.sha256(f"{question.strip()}\n{explanation.strip()}".encode()).hexdigest()
+
+
+async def _persist_flashcards(
+    db: AsyncSession,
+    course_id: int,
+    topic: Optional[str],
+    questions: list["QuizQuestion"],
+) -> None:
+    """Upsert de las flashcards generadas en `flashcards`, adjuntando el id real a cada una.
+
+    SP-11 (#315): les da identidad estable para poder aplicar repetición
+    espaciada. Dedup por (course_id, content_hash) vía ON CONFLICT DO NOTHING
+    — regenerar el mismo contenido no crea filas duplicadas.
+    """
+    hashes = [_flashcard_content_hash(q.question, q.explanation) for q in questions]
+    values = [
+        {
+            "id": uuid.uuid4(),
+            "course_id": course_id,
+            "topic": topic,
+            "content_hash": h,
+            "question": q.question,
+            "explanation": q.explanation,
+            "source_filename": q.source_filename or None,
+            "source_document_id": q.source_document_id,
+        }
+        for q, h in zip(questions, hashes)
+    ]
+    stmt = pg_insert(Flashcard).values(values).on_conflict_do_nothing(
+        index_elements=["course_id", "content_hash"]
+    )
+    await db.execute(stmt)
+    await db.commit()
+
+    id_rows = await db.execute(
+        select(Flashcard.id, Flashcard.content_hash).where(
+            Flashcard.course_id == course_id,
+            Flashcard.content_hash.in_(hashes),
+        )
+    )
+    hash_to_id = {row.content_hash: str(row.id) for row in id_rows.all()}
+    for q, h in zip(questions, hashes):
+        q.id = hash_to_id.get(h)
+
+
+# SP-11 (#315): fórmula SM-2 estándar (el algoritmo detrás de Anki),
+# simplificada porque la UI de autoevaluación es binaria ("Sabía"/"No
+# sabía") en vez de una escala 0-5. Mapeo de quality: knew_it=True → 5,
+# knew_it=False → 2 (no 0, para no destruir ease_factor de un solo
+# tropiezo — mismo criterio de apps de repetición espaciada con 2 botones).
+def _apply_sm2(review: FlashcardReview, knew_it: bool, now: datetime) -> None:
+    quality = 5 if knew_it else 2
+    if knew_it:
+        if review.repetitions == 0:
+            review.interval_days = 1
+        elif review.repetitions == 1:
+            review.interval_days = 6
+        else:
+            review.interval_days = max(1, round(review.interval_days * review.ease_factor))
+        review.repetitions += 1
+    else:
+        # Reseteo a corto plazo — criterio de aceptación explícito de SP-11.
+        review.repetitions = 0
+        review.interval_days = 1
+
+    new_ease = review.ease_factor + (0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02))
+    review.ease_factor = max(1.3, round(new_ease, 4))
+    review.last_reviewed_at = now
+    review.next_review_at = now + timedelta(days=review.interval_days)
+
 
 async def _sample_chunks_for_quiz(
     db: AsyncSession,
@@ -897,6 +1014,13 @@ async def generate_quiz(
         db=db,
         llm=llm,
     )
+
+    # SP-11 (#315): persistir flashcards generadas para darles identidad
+    # estable — habilita repetición espaciada (/flashcards/*). Solo aplica
+    # a este endpoint (el alumno practicando); /generate-exam no admite
+    # question_type='flashcard'.
+    if payload.question_type == "flashcard" and questions:
+        await _persist_flashcards(db, payload.course_id, payload.topic, questions)
 
     return QuizResponse(
         course_id=payload.course_id,
@@ -1600,4 +1724,158 @@ async def study_plan_dismiss(
     await db.commit()
 
     return StudyPlanDismissResponse(affected=affected)
+
+
+# ============================================================
+# Repetición espaciada de flashcards — SP-11 (#315)
+# ============================================================
+
+def _flashcard_due_filter(user_id: int):
+    """Condición ON del LEFT JOIN + WHERE reusada por summary/due: "toca hoy"
+    significa sin fila de review, o next_review_at NULL, o ya vencido."""
+    join_cond = (
+        (FlashcardReview.flashcard_id == Flashcard.id)
+        & (FlashcardReview.user_id == user_id)
+        & (FlashcardReview.deleted_at.is_(None))
+    )
+    due_cond = (
+        FlashcardReview.id.is_(None)
+        | FlashcardReview.next_review_at.is_(None)
+        | (FlashcardReview.next_review_at <= func.now())
+    )
+    return join_cond, due_cond
+
+
+@router.post("/flashcards/summary", response_model=FlashcardsSummaryResponse)
+async def flashcards_summary(
+    payload: FlashcardsSummaryRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+) -> FlashcardsSummaryResponse:
+    """Cuántas flashcards generadas hasta ahora "tocan hoy" vs. el total (SP-11)."""
+    base_filters = [Flashcard.course_id == payload.course_id]
+    if payload.topic:
+        base_filters.append(func.lower(Flashcard.topic) == payload.topic.strip().lower())
+
+    total_count = await db.scalar(
+        select(func.count()).select_from(Flashcard).where(*base_filters)
+    )
+
+    join_cond, due_cond = _flashcard_due_filter(payload.user_id)
+    due_count = await db.scalar(
+        select(func.count())
+        .select_from(Flashcard)
+        .outerjoin(FlashcardReview, join_cond)
+        .where(*base_filters)
+        .where(due_cond)
+    )
+
+    return FlashcardsSummaryResponse(due_count=due_count or 0, total_count=total_count or 0)
+
+
+@router.post("/flashcards/due", response_model=FlashcardsDueResponse)
+async def flashcards_due(
+    payload: FlashcardsDueRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+) -> FlashcardsDueResponse:
+    """Flashcards ya generadas que "tocan hoy", más vencidas primero (SP-11).
+
+    No llama al LLM — sirve del banco ya persistido por /generate. El
+    frontend completa con generación nueva solo si esto no alcanza para
+    la cantidad pedida (ver QuizPanel.jsx).
+    """
+    join_cond, due_cond = _flashcard_due_filter(payload.user_id)
+    stmt = (
+        select(Flashcard, FlashcardReview.next_review_at)
+        .outerjoin(FlashcardReview, join_cond)
+        .where(Flashcard.course_id == payload.course_id)
+        .where(due_cond)
+    )
+    if payload.topic:
+        stmt = stmt.where(func.lower(Flashcard.topic) == payload.topic.strip().lower())
+    stmt = stmt.order_by(FlashcardReview.next_review_at.asc().nulls_last()).limit(payload.limit)
+
+    rows = (await db.execute(stmt)).all()
+
+    questions = [
+        QuizQuestion(
+            id=str(fc.id),
+            question_type="flashcard",
+            question=fc.question,
+            options=[],
+            correct_index=-1,
+            explanation=fc.explanation,
+            source_filename=fc.source_filename or "",
+            source_document_id=fc.source_document_id,
+        )
+        for fc, _next_review_at in rows
+    ]
+
+    return FlashcardsDueResponse(course_id=payload.course_id, questions=questions)
+
+
+@router.post("/flashcards/review-batch", response_model=FlashcardsReviewBatchResponse)
+async def flashcards_review_batch(
+    payload: FlashcardsReviewBatchRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+) -> FlashcardsReviewBatchResponse:
+    """Aplica SM-2 sobre el resultado de autoevaluación de una sesión de flashcards (SP-11).
+
+    Se llama una sola vez al final de la sesión (mismo patrón que
+    /attempts + /errors), no por-tarjeta.
+    """
+    now = datetime.now(timezone.utc)
+
+    parsed_ids: dict[str, uuid.UUID] = {}
+    for item in payload.reviews:
+        try:
+            parsed_ids[item.flashcard_id] = uuid.UUID(item.flashcard_id)
+        except ValueError:
+            continue
+
+    if not parsed_ids:
+        return FlashcardsReviewBatchResponse(updated=0)
+
+    # Solo se aplica repaso sobre flashcards que realmente pertenecen a este
+    # curso — flashcard_id es dato del cliente, no confiar ciegamente.
+    valid_rows = await db.execute(
+        select(Flashcard.id).where(
+            Flashcard.id.in_(parsed_ids.values()),
+            Flashcard.course_id == payload.course_id,
+        )
+    )
+    valid_ids = {row.id for row in valid_rows.all()}
+
+    updated = 0
+    for item in payload.reviews:
+        flashcard_id = parsed_ids.get(item.flashcard_id)
+        if flashcard_id is None or flashcard_id not in valid_ids:
+            continue
+
+        review_stmt = select(FlashcardReview).where(
+            FlashcardReview.flashcard_id == flashcard_id,
+            FlashcardReview.user_id == payload.user_id,
+        )
+        review = (await db.execute(review_stmt)).scalar_one_or_none()
+        if review is None:
+            # Los defaults de mapped_column solo se aplican al hacer INSERT
+            # (flush), no al construir el objeto — _apply_sm2 los necesita
+            # en memoria YA, antes del commit, así que se setean acá a mano
+            # (mismos valores que los defaults declarados en el modelo).
+            review = FlashcardReview(
+                flashcard_id=flashcard_id,
+                user_id=payload.user_id,
+                ease_factor=2.5,
+                interval_days=0,
+                repetitions=0,
+            )
+            db.add(review)
+
+        _apply_sm2(review, item.knew_it, now)
+        updated += 1
+
+    await db.commit()
+    return FlashcardsReviewBatchResponse(updated=updated)
 

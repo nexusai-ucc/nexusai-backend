@@ -139,9 +139,16 @@ async def test_delete_reports_counts_from_each_operation(client, mock_db):
     chat_sessions_result = MagicMock(rowcount=2)  # no se reporta, pero se ejecuta
     quiz_errors_result = MagicMock(rowcount=3)
     quiz_attempts_result = MagicMock(rowcount=5)
+    flashcard_reviews_result = MagicMock(rowcount=2)
 
     mock_db.execute = AsyncMock(
-        side_effect=[messages_result, chat_sessions_result, quiz_errors_result, quiz_attempts_result]
+        side_effect=[
+            messages_result,
+            chat_sessions_result,
+            quiz_errors_result,
+            quiz_attempts_result,
+            flashcard_reviews_result,
+        ]
     )
     mock_db.commit = AsyncMock()
 
@@ -154,7 +161,8 @@ async def test_delete_reports_counts_from_each_operation(client, mock_db):
     assert body["messages_deleted"] == 4
     assert body["quiz_errors_deleted"] == 3
     assert body["quiz_attempts_anonymized"] == 5
-    assert mock_db.execute.call_count == 4
+    assert body["flashcard_reviews_anonymized"] == 2
+    assert mock_db.execute.call_count == 5
     mock_db.commit.assert_awaited_once()
 
 
@@ -173,8 +181,13 @@ async def test_delete_anonymizes_quiz_attempts_instead_of_deleting(client, mock_
 
     await client.request("DELETE", "/api/v1/privacy/data", params={"user_id": 7, "course_id": 3})
 
-    assert len(calls) == 4
+    assert len(calls) == 5
     # El 4to statement es un Update sobre QuizAttempt, no un Delete.
     fourth_stmt = calls[3]
     assert type(fourth_stmt).__name__ == "Update"
     assert "quiz_attempts" in str(fourth_stmt).lower()
+
+    # El 5to statement anonimiza flashcard_reviews (SP-11) — también Update, no Delete.
+    fifth_stmt = calls[4]
+    assert type(fifth_stmt).__name__ == "Update"
+    assert "flashcard_reviews" in str(fifth_stmt).lower()

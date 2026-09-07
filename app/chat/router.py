@@ -27,10 +27,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.analytics.logger import log_interaction
+from app.analytics.logger import hash_user_id, log_interaction
 from app.auth.hmac import verify_hmac
 from app.chat.schemas import ChatRequest, ChatResponse, MessageOut
-from app.db.models import ChatSession, Message
+from app.db.models import ChatSession, Message, MessageFeedback
 from app.db.session import get_db, get_session_factory
 from app.documents.retriever import format_context_for_prompt, retrieve_context
 from app.gaps.recorder import WEAK_MATCH_THRESHOLD, record_gap_if_needed
@@ -567,6 +567,11 @@ async def messages_stream(
                         "prompt_tokens": usage_seen.prompt_tokens if usage_seen else 0,
                         "completion_tokens": usage_seen.completion_tokens if usage_seen else 0,
                         "total_tokens": usage_seen.total_tokens if usage_seen else 0,
+                        # ASIST-01 (#321): id real ya asignado por el commit de más
+                        # arriba — permite que el frontend habilite el feedback
+                        # 👍/👎 sobre el mensaje recién streameado, sin esperar a
+                        # recargar el historial (que sí trae MessageOut.id).
+                        "assistant_message_id": str(assistant_message.id),
                     }) + "\n\n"
                 )
 
@@ -763,6 +768,60 @@ async def session_delete(
     await db.commit()
 
     return SessionDeleteResponse(success=True)
+
+
+# ============================================================
+# Feedback del alumno sobre una respuesta — ASIST-01 (#321)
+# ============================================================
+
+class MessageFeedbackRequest(BaseModel):
+    message_id: UUID
+    course_id: int = Field(gt=0)
+    user_id: int = Field(gt=0)
+    is_helpful: bool
+    comment: Optional[str] = Field(default=None, max_length=1000)
+
+
+class MessageFeedbackResponse(BaseModel):
+    ok: bool = True
+
+
+@router.post("/messages/feedback", response_model=MessageFeedbackResponse)
+async def submit_message_feedback(
+    payload: MessageFeedbackRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+) -> MessageFeedbackResponse:
+    """Guarda el voto 👍/👎 del alumno sobre una respuesta puntual del chat (ASIST-01).
+
+    Anónimo por diseño (mismo criterio que interaction_logs, DOC-D01): no
+    guarda user_id, solo un hash usado para permitir upsert cuando el alumno
+    cambia de voto sobre el mismo mensaje.
+    """
+    user_id_hash = hash_user_id(payload.user_id)
+
+    stmt = select(MessageFeedback).where(
+        MessageFeedback.message_id == payload.message_id,
+        MessageFeedback.user_id_hash == user_id_hash,
+    )
+    existing = (await db.execute(stmt)).scalar_one_or_none()
+
+    if existing is not None:
+        existing.is_helpful = payload.is_helpful
+        existing.comment = payload.comment
+    else:
+        db.add(
+            MessageFeedback(
+                message_id=payload.message_id,
+                course_id=payload.course_id,
+                is_helpful=payload.is_helpful,
+                comment=payload.comment,
+                user_id_hash=user_id_hash,
+            )
+        )
+
+    await db.commit()
+    return MessageFeedbackResponse()
 
 
 # ============================================================

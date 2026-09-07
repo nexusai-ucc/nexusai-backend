@@ -24,6 +24,9 @@ DELETE /api/v1/privacy/data?user_id=&course_id=
       app/admin/router.py), que filtra por course_id/created_at — nunca por
       user_id. Un DELETE le bajaría el promedio/total al curso cada vez que
       alguien pide el borrado. Anonimizar conserva la métrica intacta.
+    - flashcard_reviews → ANONIMIZA in-place (user_id=NULL, deleted_at=now()),
+      mismo criterio que quiz_attempts (SP-11, #315). No filtra por course_id
+      directo (la tabla no lo tiene) — se resuelve vía join con `flashcards`.
 
 Seguridad: igual que el resto de los routers, este endpoint confía en el
 `user_id` que manda el plugin dentro del body/query firmado con HMAC — la
@@ -44,7 +47,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime
 
 from app.auth.hmac import verify_hmac
-from app.db.models import ChatSession, Message, QuizAttempt, QuizError
+from app.db.models import ChatSession, Flashcard, FlashcardReview, Message, QuizAttempt, QuizError
 from app.db.session import get_db
 
 router = APIRouter()
@@ -95,6 +98,7 @@ class PrivacyDeleteResponse(BaseModel):
     messages_deleted: int
     quiz_errors_deleted: int
     quiz_attempts_anonymized: int
+    flashcard_reviews_anonymized: int
 
 
 def _validate_ids(user_id: int, course_id: int) -> None:
@@ -247,10 +251,28 @@ async def delete_personal_data(
     )
     quiz_attempts_anonymized = attempts_result.rowcount or 0
 
+    # flashcard_reviews no tiene course_id propio — se resuelve vía subquery
+    # sobre flashcards.course_id (SP-11, #315). Mismo criterio que
+    # quiz_attempts: anonimizar, no borrar (deja el estado SM-2 intacto,
+    # simplemente deja de ser atribuible a este alumno).
+    flashcard_reviews_result = await db.execute(
+        update(FlashcardReview)
+        .where(
+            FlashcardReview.user_id == user_id,
+            FlashcardReview.deleted_at.is_(None),
+            FlashcardReview.flashcard_id.in_(
+                select(Flashcard.id).where(Flashcard.course_id == course_id)
+            ),
+        )
+        .values(user_id=None, deleted_at=func.now())
+    )
+    flashcard_reviews_anonymized = flashcard_reviews_result.rowcount or 0
+
     await db.commit()
 
     return PrivacyDeleteResponse(
         messages_deleted=messages_deleted,
         quiz_errors_deleted=quiz_errors_deleted,
         quiz_attempts_anonymized=quiz_attempts_anonymized,
+        flashcard_reviews_anonymized=flashcard_reviews_anonymized,
     )

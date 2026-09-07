@@ -13,7 +13,9 @@ from app.db.models import InteractionLog
 logger = logging.getLogger("nexusai.analytics")
 
 
-def _hash_user_id(user_id: int) -> str:
+def hash_user_id(user_id: int) -> str:
+    """Hash SHA-256 de un user_id — reusado por otras tablas anónimas-por-diseño
+    (message_feedback, ASIST-01) para poder hacer upsert sin guardar identidad."""
     return hashlib.sha256(str(user_id).encode()).hexdigest()
 
 
@@ -41,7 +43,7 @@ async def log_interaction(
     try:
         log = InteractionLog(
             course_id=course_id,
-            user_id_hash=_hash_user_id(user_id),
+            user_id_hash=hash_user_id(user_id),
             user_message_id=user_message_id,
             question_char_count=len(question),
             answer_char_count=len(answer),

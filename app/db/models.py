@@ -316,6 +316,100 @@ class QuizError(Base):
     )
 
 
+class Flashcard(Base):
+    """Flashcard generada por el generador de quiz y persistida para repaso (SP-11, #315).
+
+    Antes las flashcards (question_type='flashcard' en /quiz/generate) eran
+    100% efímeras — un lote nuevo por LLM en cada request, sin ID ni tabla
+    propia. Para poder aplicar repetición espaciada hace falta identidad
+    estable: cada flashcard generada se upsertea acá por (course_id,
+    content_hash), así regenerar el mismo contenido no duplica filas.
+    """
+    __tablename__ = "flashcards"
+    __table_args__ = (
+        UniqueConstraint("course_id", "content_hash", name="uq_flashcards_course_content_hash"),
+        Index("ix_flashcards_course_id", "course_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    course_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    topic: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    explanation: Mapped[str] = mapped_column(Text, nullable=False)
+    source_filename: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # Texto suelto, no FK — mismo criterio que QuizError.source_document_id.
+    source_document_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class FlashcardReview(Base):
+    """Estado de repetición espaciada (SM-2) de una flashcard para un alumno (SP-11, #315).
+
+    Fórmula SM-2 simplificada aplicada en app/quiz/router.py — ver comentario
+    junto a `_apply_sm2`. NULL en next_review_at = nunca repasada = "toca hoy".
+    """
+    __tablename__ = "flashcard_reviews"
+    __table_args__ = (
+        UniqueConstraint("flashcard_id", "user_id", name="uq_flashcard_reviews_flashcard_user"),
+        Index("ix_flashcard_reviews_user_id_next_review_at", "user_id", "next_review_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    flashcard_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("flashcards.id", ondelete="CASCADE"), nullable=False
+    )
+    # Nullable: PRIV-01 anonimiza (no borra) igual que QuizAttempt.user_id —
+    # ver app/privacy/router.py::delete_personal_data.
+    user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    ease_factor: Mapped[float] = mapped_column(Float, nullable=False, default=2.5)
+    interval_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    repetitions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_review_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class MessageFeedback(Base):
+    """Voto 👍/👎 del alumno sobre una respuesta del chat (ASIST-01, #321).
+
+    Anónimo por diseño, mismo criterio que InteractionLog: no guarda
+    user_id, solo un hash SHA-256 usado únicamente para permitir que el
+    alumno cambie de voto (upsert por message_id+user_id_hash) — nunca
+    expuesto al docente. `course_id` va denormalizado porque `message_id`
+    puede quedar NULL si el alumno borra su historial (PRIV-01 hard-deletea
+    messages/chat_sessions) y el agregado del curso debe sobrevivir a eso.
+    """
+    __tablename__ = "message_feedback"
+    __table_args__ = (
+        UniqueConstraint("message_id", "user_id_hash", name="uq_message_feedback_message_user"),
+        Index("ix_message_feedback_course_id_created_at", "course_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    message_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("messages.id", ondelete="SET NULL"), nullable=True
+    )
+    course_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    is_helpful: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    comment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    user_id_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class CalendarAlert(Base):
     """Alerta de evento de calendario configurada por el alumno (CAL-02)."""
     __tablename__ = "calendar_alerts"

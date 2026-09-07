@@ -42,7 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.analytics.service import get_daily_message_counts, get_distinct_topic_count, get_top_questions
 from app.auth.hmac import verify_hmac
-from app.db.models import ChatSession, InteractionLog, Message, QuizAttempt, UnansweredQuestion
+from app.db.models import ChatSession, InteractionLog, Message, MessageFeedback, QuizAttempt, UnansweredQuestion
 from app.db.session import get_db
 
 router = APIRouter()
@@ -99,6 +99,13 @@ class GapsRatio(BaseModel):
     ratio: float
 
 
+class FeedbackRatio(BaseModel):
+    """% de respuestas del chat marcadas como útiles por los alumnos (ASIST-01)."""
+    helpful_count: int
+    total_rated: int
+    useful_pct: float
+
+
 class CourseAnalytics(BaseModel):
     course_id: int
     period_days: int
@@ -106,6 +113,7 @@ class CourseAnalytics(BaseModel):
     daily_message_counts: List[DailyMessageCount]
     quiz_score_distribution: QuizScoreDistribution
     gaps_ratio: GapsRatio
+    feedback_ratio: FeedbackRatio
     topics_consulted: int
 
 
@@ -263,6 +271,23 @@ async def _get_gaps_ratio(db: AsyncSession, course_id: int, since: datetime) -> 
     )
 
 
+async def _get_feedback_ratio(db: AsyncSession, course_id: int, since: datetime) -> FeedbackRatio:
+    stmt = select(
+        func.count().label("total"),
+        func.count().filter(MessageFeedback.is_helpful.is_(True)).label("helpful"),
+    ).where(
+        MessageFeedback.course_id == course_id,
+        MessageFeedback.created_at >= since,
+    )
+    row = (await db.execute(stmt)).one()
+
+    total = int(row.total)
+    helpful = int(row.helpful)
+    useful_pct = round(helpful / total * 100, 1) if total else 0.0
+
+    return FeedbackRatio(helpful_count=helpful, total_rated=total, useful_pct=useful_pct)
+
+
 @router.get("/analytics", response_model=CourseAnalytics)
 async def get_course_analytics(
     course_id: int = Query(..., gt=0),
@@ -283,6 +308,7 @@ async def get_course_analytics(
 
     quiz_score_distribution = await _get_quiz_score_distribution(db, course_id, since)
     gaps_ratio = await _get_gaps_ratio(db, course_id, since)
+    feedback_ratio = await _get_feedback_ratio(db, course_id, since)
     topics_consulted = await get_distinct_topic_count(db, course_id, since)
 
     return CourseAnalytics(
@@ -292,5 +318,6 @@ async def get_course_analytics(
         daily_message_counts=daily_message_counts,
         quiz_score_distribution=quiz_score_distribution,
         gaps_ratio=gaps_ratio,
+        feedback_ratio=feedback_ratio,
         topics_consulted=topics_consulted,
     )
