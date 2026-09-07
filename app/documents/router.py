@@ -40,7 +40,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.hmac import verify_hmac
-from app.db.models import Document
+from app.db.models import Chunk, Document
 from app.db.session import get_db, get_session_factory
 from app.documents.extractor import SUPPORTED_MIME_TYPES
 from app.documents.pipeline import index_document
@@ -368,6 +368,67 @@ async def list_documents_by_course(
     return DocumentListResponse(
         total=total or 0,
         items=[DocumentOut.from_orm(d) for d in documents],
+    )
+
+
+# CONT-08 (#357): cantidad de caracteres del texto extraído que se le muestra
+# al docente para que confirme de un vistazo que la extracción capturó
+# contenido real (y no, p. ej., un PDF escaneado sin OCR aprovechable).
+_PREVIEW_CHARS = 600
+
+
+class DocumentPreviewResponse(BaseModel):
+    document_id: str
+    filename: str
+    course_id: int
+    status: str
+    # None mientras el documento no esté indexado o si no se pudo extraer texto.
+    preview: Optional[str] = None
+    char_count: int = 0
+    truncated: bool = False
+
+
+@router.get("/{document_id}/preview", response_model=DocumentPreviewResponse)
+async def get_document_preview(
+    document_id: UUID,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+) -> DocumentPreviewResponse:
+    """Primeros caracteres del texto extraído de un documento (CONT-08 / #357).
+
+    Toma el contenido del primer chunk indexado — o sea, exactamente lo que
+    el asistente "ve" de ese material — y lo recorta a `_PREVIEW_CHARS`. Sirve
+    para que el docente confirme que la extracción funcionó sin tener que
+    preguntarle algo al chat.
+    """
+    result = await db.execute(select(Document).where(Document.id == document_id))
+    document = result.scalar_one_or_none()
+    if document is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    first_chunk = await db.scalar(
+        select(Chunk.content)
+        .where(Chunk.document_id == document_id, Chunk.chunk_index == 0)
+    )
+
+    if not first_chunk:
+        return DocumentPreviewResponse(
+            document_id=str(document.id),
+            filename=document.filename,
+            course_id=document.course_id,
+            status=document.status,
+        )
+
+    text = first_chunk.strip()
+    preview = text[:_PREVIEW_CHARS]
+    return DocumentPreviewResponse(
+        document_id=str(document.id),
+        filename=document.filename,
+        course_id=document.course_id,
+        status=document.status,
+        preview=preview,
+        char_count=len(preview),
+        truncated=len(text) > _PREVIEW_CHARS,
     )
 
 
