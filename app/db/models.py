@@ -227,6 +227,14 @@ class UnansweredQuestion(Base):
     archived_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # NULL = activo en el plan de estudio del alumno. SP-13 (#323): distinto
+    # de `archived_at` (archivado del DOCENTE, DOC-D08) — descartar un tema
+    # del propio plan no debe afectar lo que ve el docente en Gaps/Analytics.
+    # Si el alumno vuelve a preguntar algo equivalente, la fila nueva entra
+    # sin dismiss y el tema reaparece solo (ver app/quiz/router.py::study_plan).
+    student_dismissed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class QuizAttempt(Base):
@@ -299,6 +307,12 @@ class QuizError(Base):
     ai_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    # NULL = activo en el plan de estudio del alumno (SP-13, #323). El alumno
+    # marca "ya lo entendí" desde el Plan de estudio; una fila nueva sobre el
+    # mismo tema vuelve a entrar sin dismiss (ver app/quiz/router.py::study_plan).
+    dismissed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
 

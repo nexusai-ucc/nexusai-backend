@@ -13,6 +13,7 @@ import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import pytest
 from fastapi import FastAPI
@@ -182,6 +183,7 @@ async def test_generate_rejects_invalid_difficulty_at_http_level(client):
 
 def _quiz_error_row(**kwargs):
     defaults = dict(
+        id=uuid4(),
         source_filename="apunte1.pdf",
         question="¿Cuál es la derivada de x^2?",
         explanation="2x",
@@ -196,6 +198,7 @@ def _gap_row(**kwargs):
         question="que es una integral impropia",
         count=3,
         last_asked_at=datetime.now(timezone.utc),
+        ids=[uuid4(), uuid4(), uuid4()],
     )
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
@@ -310,6 +313,93 @@ async def test_study_plan_ignores_out_of_range_group_indices(client, mock_db, mo
     # "Tema inventado" no cita ningún grupo válido -> queda afuera.
     assert len(data["topics"]) == 1
     assert data["topics"][0]["topic"] == "Derivadas"
+
+
+# ─────────────────────────────────────────────────────────────
+# POST /study-plan — quiz_error_ids/gap_question_ids (SP-13 / #323)
+# ─────────────────────────────────────────────────────────────
+
+async def test_study_plan_topic_exposes_underlying_row_ids(client, mock_db, mock_llm):
+    """El topic es texto del LLM, no una clave estable — el descarte (SP-13)
+    opera sobre estos IDs reales, no sobre el texto."""
+    quiz_row = _quiz_error_row()
+    gap_row = _gap_row()
+    mock_db.execute.side_effect = [
+        _mock_quiz_result([quiz_row]),
+        _mock_gap_result([gap_row]),
+    ]
+    llm_response = {
+        "topics": [
+            {"topic": "Derivadas", "quiz_groups": [0], "gap_groups": [0]},
+        ]
+    }
+    mock_llm.chat_completion.return_value = MagicMock(text=json.dumps(llm_response))
+
+    response = await client.post("/api/v1/quiz/study-plan", json=_STUDY_PLAN_PAYLOAD)
+
+    data = response.json()
+    topic = data["topics"][0]
+    assert topic["quiz_error_ids"] == [str(quiz_row.id)]
+    assert set(topic["gap_question_ids"]) == {str(i) for i in gap_row.ids}
+
+
+# ─────────────────────────────────────────────────────────────
+# POST /study-plan/dismiss (SP-13 / #323)
+# ─────────────────────────────────────────────────────────────
+
+_DISMISS_ID_1 = str(uuid4())
+_DISMISS_ID_2 = str(uuid4())
+
+
+async def test_study_plan_dismiss_updates_quiz_errors_only(client, mock_db):
+    mock_db.execute.return_value = MagicMock(rowcount=2)
+
+    response = await client.post("/api/v1/quiz/study-plan/dismiss", json={
+        "course_id": 1,
+        "user_id": 1,
+        "quiz_error_ids": [_DISMISS_ID_1, _DISMISS_ID_2],
+        "gap_question_ids": [],
+    })
+
+    assert response.status_code == 200
+    assert response.json()["affected"] == 2
+    # Un solo UPDATE (quiz_error_ids) — gap_question_ids vacío no dispara
+    # una segunda query con un IN () vacío.
+    mock_db.execute.assert_called_once()
+    stmt_sql = str(mock_db.execute.call_args.args[0]).lower()
+    assert "quiz_errors" in stmt_sql
+    assert "dismissed_at" in stmt_sql
+
+
+async def test_study_plan_dismiss_updates_both_tables(client, mock_db):
+    mock_db.execute.return_value = MagicMock(rowcount=1)
+
+    response = await client.post("/api/v1/quiz/study-plan/dismiss", json={
+        "course_id": 1,
+        "user_id": 1,
+        "quiz_error_ids": [_DISMISS_ID_1],
+        "gap_question_ids": [_DISMISS_ID_2],
+    })
+
+    assert response.status_code == 200
+    assert response.json()["affected"] == 2  # 1 + 1
+    assert mock_db.execute.call_count == 2
+    second_stmt_sql = str(mock_db.execute.call_args_list[1].args[0]).lower()
+    assert "unanswered_questions" in second_stmt_sql
+    assert "student_dismissed_at" in second_stmt_sql
+
+
+async def test_study_plan_dismiss_noop_without_ids(client, mock_db):
+    response = await client.post("/api/v1/quiz/study-plan/dismiss", json={
+        "course_id": 1,
+        "user_id": 1,
+        "quiz_error_ids": [],
+        "gap_question_ids": [],
+    })
+
+    assert response.status_code == 200
+    assert response.json()["affected"] == 0
+    mock_db.execute.assert_not_called()
 
 
 # ─────────────────────────────────────────────────────────────

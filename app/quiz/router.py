@@ -40,7 +40,7 @@ from typing import Annotated, Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, ValidationError, field_validator
-from sqlalchemy import delete, desc, func, select
+from sqlalchemy import delete, desc, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.hmac import verify_hmac
@@ -322,11 +322,28 @@ class StudyPlanTopic(BaseModel):
     gap_count: int
     reason: str
     suggested_quiz_topic: str
+    # SP-13 (#323): IDs reales de fila que sustentan este tema — el `topic`
+    # es texto generado por el LLM en cada llamada, no una clave estable, así
+    # que "descartar este tema" opera sobre estos IDs (mismo patrón que
+    # `question_ids` en app/gaps/router.py::GapItem).
+    quiz_error_ids: List[str] = Field(default_factory=list)
+    gap_question_ids: List[str] = Field(default_factory=list)
 
 
 class StudyPlanResponse(BaseModel):
     course_id: int
     topics: List[StudyPlanTopic]
+
+
+class StudyPlanDismissRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    user_id: int = Field(gt=0)
+    quiz_error_ids: List[str] = Field(default_factory=list)
+    gap_question_ids: List[str] = Field(default_factory=list)
+
+
+class StudyPlanDismissResponse(BaseModel):
+    affected: int
 
 
 # ============================================================
@@ -1324,6 +1341,7 @@ async def study_plan(
         .where(QuizError.course_id == payload.course_id)
         .where(QuizError.user_id == payload.user_id)
         .where(QuizError.created_at >= since)
+        .where(QuizError.dismissed_at.is_(None))  # SP-13: descartado por el alumno
         .order_by(desc(QuizError.created_at))
         .limit(300)
     )
@@ -1335,10 +1353,14 @@ async def study_plan(
             norm_question.label("question"),
             func.count().label("count"),
             func.max(UnansweredQuestion.created_at).label("last_asked_at"),
+            # SP-13: IDs reales detrás del grupo, para poder descartar el tema
+            # sin depender del texto (ver StudyPlanTopic.gap_question_ids).
+            func.array_agg(UnansweredQuestion.id).label("ids"),
         )
         .where(UnansweredQuestion.course_id == payload.course_id)
         .where(UnansweredQuestion.user_id == payload.user_id)
         .where(UnansweredQuestion.created_at >= since)
+        .where(UnansweredQuestion.student_dismissed_at.is_(None))
         .group_by(norm_question)
         .order_by(desc("count"), desc("last_asked_at"))
         .limit(20)
@@ -1352,13 +1374,17 @@ async def study_plan(
     quiz_groups: dict[str, dict[str, Any]] = {}
     for r in quiz_rows:
         key = r.source_filename or "__general__"
-        g = quiz_groups.setdefault(key, {"filename": r.source_filename, "count": 0, "samples": []})
+        g = quiz_groups.setdefault(key, {"filename": r.source_filename, "count": 0, "samples": [], "ids": []})
         g["count"] += 1
+        g["ids"].append(str(r.id))
         if len(g["samples"]) < 3:
             g["samples"].append({"question": r.question, "explanation": r.explanation})
     top_quiz_groups = sorted(quiz_groups.values(), key=lambda g: g["count"], reverse=True)[:5]
 
-    top_gap_groups = [{"question": row.question, "count": int(row.count)} for row in gap_rows]
+    top_gap_groups = [
+        {"question": row.question, "count": int(row.count), "ids": [str(i) for i in row.ids]}
+        for row in gap_rows
+    ]
 
     prompt_blocks = []
     for i, g in enumerate(top_quiz_groups):
@@ -1435,6 +1461,8 @@ async def study_plan(
         gap_count = sum(top_gap_groups[j]["count"] for j in gap_idx)
         if quiz_error_count == 0 and gap_count == 0:
             continue
+        quiz_error_ids = [id_ for i in quiz_idx for id_ in top_quiz_groups[i]["ids"]]
+        gap_question_ids = [id_ for j in gap_idx for id_ in top_gap_groups[j]["ids"]]
         topics.append(
             StudyPlanTopic(
                 topic=str(item["topic"]),
@@ -1442,10 +1470,57 @@ async def study_plan(
                 gap_count=gap_count,
                 reason=str(item.get("reason") or ""),
                 suggested_quiz_topic=str(item.get("suggested_quiz_topic") or item["topic"]),
+                quiz_error_ids=quiz_error_ids,
+                gap_question_ids=gap_question_ids,
             )
         )
 
     topics.sort(key=lambda t: t.quiz_error_count + t.gap_count, reverse=True)
 
     return StudyPlanResponse(course_id=payload.course_id, topics=topics[:6])
+
+
+@router.post("/study-plan/dismiss", response_model=StudyPlanDismissResponse)
+async def study_plan_dismiss(
+    payload: StudyPlanDismissRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+) -> StudyPlanDismissResponse:
+    """Descarta un tema puntual del plan de estudio (SP-13, issue #323).
+
+    Opera sobre los IDs reales de fila (`quiz_error_ids`/`gap_question_ids`,
+    devueltos por /study-plan) — el `topic` que ve el alumno es texto
+    generado por el LLM en cada llamada, no una clave estable. Mismo patrón
+    que app/gaps/router.py::gaps_archive, pero con columnas propias
+    (`QuizError.dismissed_at` / `UnansweredQuestion.student_dismissed_at`)
+    que NO tocan `archived_at` (archivado del docente, DOC-D08) — descartar
+    del lado del alumno no debe cambiar lo que ve el docente en Gaps/Analytics.
+    """
+    affected = 0
+
+    if payload.quiz_error_ids:
+        quiz_ids = [uuid.UUID(i) for i in payload.quiz_error_ids]
+        result = await db.execute(
+            update(QuizError)
+            .where(QuizError.course_id == payload.course_id)
+            .where(QuizError.user_id == payload.user_id)
+            .where(QuizError.id.in_(quiz_ids))
+            .values(dismissed_at=datetime.now(timezone.utc))
+        )
+        affected += result.rowcount
+
+    if payload.gap_question_ids:
+        gap_ids = [uuid.UUID(i) for i in payload.gap_question_ids]
+        result = await db.execute(
+            update(UnansweredQuestion)
+            .where(UnansweredQuestion.course_id == payload.course_id)
+            .where(UnansweredQuestion.user_id == payload.user_id)
+            .where(UnansweredQuestion.id.in_(gap_ids))
+            .values(student_dismissed_at=datetime.now(timezone.utc))
+        )
+        affected += result.rowcount
+
+    await db.commit()
+
+    return StudyPlanDismissResponse(affected=affected)
 
