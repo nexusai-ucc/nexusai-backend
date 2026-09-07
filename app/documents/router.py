@@ -36,7 +36,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.hmac import verify_hmac
@@ -310,6 +310,124 @@ async def upload_document(
             file_bytes=file_bytes,
             embeddings=embeddings,
         )
+    )
+
+    return doc_data
+
+
+class DocumentReplaceRequest(BaseModel):
+    """CONT-07: reemplaza el contenido de un documento existente, manteniendo
+    su document_id (las citas viejas del chat siguen apuntando al mismo id)."""
+
+    filename: str = Field(min_length=1, max_length=255)
+    mime_type: str = Field(default="application/pdf")
+    content_b64: str = Field(min_length=1)
+
+
+@router.post("/{document_id}/replace", response_model=DocumentOut, status_code=status.HTTP_202_ACCEPTED)
+async def replace_document(
+    document_id: UUID,
+    payload: DocumentReplaceRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+    embeddings: EmbeddingProvider = Depends(get_embedding_provider),
+) -> DocumentOut:
+    """Reemplaza el archivo de un documento existente sin cambiar su id.
+
+    A diferencia de POST "", no valida colisión de nombre (es una actualización
+    de la propia fila, no un documento nuevo). Borra los chunks viejos y hace
+    commit ANTES de disparar la re-indexación: `index_document()` tiene un
+    guard (CONT-04) que salta la indexación si el documento ya tiene chunks
+    persistidos — si no se borran primero, el archivo nuevo nunca se indexa.
+    """
+    result = await db.execute(select(Document).where(Document.id == document_id))
+    document = result.scalar_one_or_none()
+    if document is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    if payload.mime_type not in SUPPORTED_MIME_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=(
+                f"Tipo de archivo no soportado: {payload.mime_type!r}. "
+                f"Tipos aceptados: {sorted(SUPPORTED_MIME_TYPES)}"
+            ),
+        )
+
+    try:
+        file_bytes = base64.b64decode(payload.content_b64, validate=True)
+    except (ValueError, base64.binascii.Error) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid base64 content: {exc}",
+        )
+
+    if not file_bytes:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File is empty")
+
+    if len(file_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File too large: {len(file_bytes)} bytes (max {MAX_UPLOAD_BYTES})",
+        )
+
+    expected_magic = _MAGIC_BYTES.get(payload.mime_type)
+    if expected_magic is not None and not file_bytes.startswith(expected_magic):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"El archivo no parece ser del tipo declarado ({payload.mime_type!r}): "
+                "los primeros bytes no coinciden con el formato esperado."
+            ),
+        )
+
+    # Borrar chunks viejos ANTES de tocar el documento — ver docstring (CONT-04).
+    await db.execute(delete(Chunk).where(Chunk.document_id == document_id))
+    await db.commit()
+
+    file_hash = hashlib.sha256(payload.content_b64.encode()).hexdigest()
+    old_storage_path = document.storage_path
+    old_filename = document.filename
+
+    document.filename = payload.filename
+    document.mime_type = payload.mime_type
+    document.file_hash = file_hash
+    document.status = "pending"
+    document.error_message = None
+    await db.commit()
+
+    # Guardar el archivo nuevo en disco. Si el nombre cambió, el storage_name
+    # también cambia (incluye el filename) — borrar el archivo viejo para no
+    # dejar basura huérfana.
+    safe_name = Path(payload.filename).name or "file"
+    storage_name = f"{document.id}_{safe_name}"
+    try:
+        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        (UPLOADS_DIR / storage_name).write_bytes(file_bytes)
+        document.storage_path = storage_name
+        await db.commit()
+        if old_storage_path and old_storage_path != storage_name:
+            (UPLOADS_DIR / old_storage_path).unlink(missing_ok=True)
+    except Exception as exc:
+        logger.warning(
+            "Could not save replacement file to disk for document %s: %s",
+            document.id, exc,
+        )
+
+    await db.refresh(document)
+    doc_data = DocumentOut.from_orm(document)
+
+    asyncio.create_task(
+        _index_document_task(
+            document_id=document.id,
+            file_bytes=file_bytes,
+            embeddings=embeddings,
+        )
+    )
+
+    logger.info(
+        "Document %s replaced: %r -> %r",
+        document.id, old_filename, payload.filename,
     )
 
     return doc_data

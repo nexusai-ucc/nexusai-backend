@@ -1,5 +1,5 @@
 """
-Tests del router de documentos (POST, GET, DELETE).
+Tests del router de documentos (POST, GET, DELETE, POST /replace).
 
 Estrategia de aislamiento:
   - Mini FastAPI solo con el documents router (sin lifespan de main.py).
@@ -56,6 +56,7 @@ def _make_doc(**kwargs) -> SimpleNamespace:
         status="pending",
         error_message=None,
         file_hash=_PDF_HASH,
+        storage_path=None,
         created_at=now,
         updated_at=now,
     )
@@ -362,3 +363,72 @@ async def test_delete_document_not_found(client, mock_db):
 
     assert response.status_code == 404
     mock_db.delete.assert_not_called()
+
+
+# ============================================================
+# POST /api/v1/documents/{id}/replace — CONT-07 (#356)
+# ============================================================
+
+_REPLACE_PAYLOAD: dict = {
+    "filename": "apuntes-v2.pdf",
+    "mime_type": "application/pdf",
+    "content_b64": _PDF_B64,
+}
+
+
+async def test_replace_document_not_found(client, mock_db):
+    mock_db.execute.return_value = _exec_result(scalar=None)
+
+    response = await client.post(f"/api/v1/documents/{uuid4()}/replace", json=_REPLACE_PAYLOAD)
+
+    assert response.status_code == 404
+
+
+async def test_replace_document_rejects_unsupported_mime_type(client, mock_db):
+    doc = _make_doc(status="indexed")
+    mock_db.execute.return_value = _exec_result(scalar=doc)
+
+    payload = {**_REPLACE_PAYLOAD, "mime_type": "image/png"}
+    response = await client.post(f"/api/v1/documents/{doc.id}/replace", json=payload)
+
+    assert response.status_code == 415
+
+
+async def test_replace_document_rejects_invalid_base64(client, mock_db):
+    doc = _make_doc(status="indexed")
+    mock_db.execute.return_value = _exec_result(scalar=doc)
+
+    payload = {**_REPLACE_PAYLOAD, "content_b64": "!!!esto-no-es-base64!!!"}
+    response = await client.post(f"/api/v1/documents/{doc.id}/replace", json=payload)
+
+    assert response.status_code == 400
+
+
+async def test_replace_document_keeps_same_id_and_resets_status(client, mock_db):
+    """El id no cambia — las citas viejas del chat siguen apuntando al mismo documento."""
+    doc = _make_doc(status="error", error_message="algo falló antes")
+    mock_db.execute.return_value = _exec_result(scalar=doc)
+
+    response = await client.post(f"/api/v1/documents/{doc.id}/replace", json=_REPLACE_PAYLOAD)
+
+    assert response.status_code == 202
+    data = response.json()
+    assert data["id"] == str(doc.id)
+    assert data["filename"] == "apuntes-v2.pdf"
+    assert data["status"] == "pending"
+    assert data["error_message"] is None
+
+
+async def test_replace_document_deletes_old_chunks_before_reindexing(client, mock_db):
+    """CONT-04 guard: index_document() salta la indexación si ya hay chunks
+    persistidos — hay que borrarlos (y hacer commit) antes de disparar la
+    re-indexación, si no el archivo nuevo nunca se indexa."""
+    doc = _make_doc(status="indexed")
+    mock_db.execute.return_value = _exec_result(scalar=doc)
+
+    await client.post(f"/api/v1/documents/{doc.id}/replace", json=_REPLACE_PAYLOAD)
+
+    # Dos execute(): el SELECT del documento y el DELETE de chunks viejos.
+    assert mock_db.execute.call_count == 2
+    delete_call_sql = str(mock_db.execute.call_args_list[1].args[0]).lower()
+    assert "chunk" in delete_call_sql
