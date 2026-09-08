@@ -435,6 +435,65 @@ async def replace_document(
     return doc_data
 
 
+@router.post("/{document_id}/reindex", response_model=DocumentOut, status_code=status.HTTP_202_ACCEPTED)
+async def reindex_document(
+    document_id: UUID,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+    embeddings: EmbeddingProvider = Depends(get_embedding_provider),
+) -> DocumentOut:
+    """Re-corre la indexación de un documento ya subido, sin pedir un archivo
+    nuevo (CONT-09, #358) — a diferencia de `replace_document`, lee los bytes
+    ya guardados en disco (`Document.storage_path`, poblado desde el upload
+    original) en vez de recibir contenido en el body.
+
+    Pensado para el caso "el docente edita el archivo en Moodle nativo, o
+    simplemente quiere forzar un re-index" sin tener que re-subir nada.
+    """
+    result = await db.execute(select(Document).where(Document.id == document_id))
+    document = result.scalar_one_or_none()
+    if document is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    if not document.storage_path:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Este documento no tiene un archivo guardado para reindexar. Usá 'Reemplazar' para subir uno nuevo.",
+        )
+
+    file_path = UPLOADS_DIR / document.storage_path
+    if not file_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="El archivo original ya no está disponible en el servidor. Usá 'Reemplazar' para subir uno nuevo.",
+        )
+    file_bytes = file_path.read_bytes()
+
+    # Borrar chunks viejos ANTES de tocar el documento — mismo guard CONT-04
+    # que replace_document(): index_document() salta la indexación si el
+    # documento ya tiene chunks persistidos.
+    await db.execute(delete(Chunk).where(Chunk.document_id == document_id))
+    await db.commit()
+
+    document.status = "pending"
+    document.error_message = None
+    await db.commit()
+    await db.refresh(document)
+    doc_data = DocumentOut.from_orm(document)
+
+    asyncio.create_task(
+        _index_document_task(
+            document_id=document.id,
+            file_bytes=file_bytes,
+            embeddings=embeddings,
+        )
+    )
+
+    logger.info("Document %s reindexed", document.id)
+
+    return doc_data
+
+
 @router.get("/{document_id}", response_model=DocumentOut)
 async def get_document_status(
     document_id: UUID,

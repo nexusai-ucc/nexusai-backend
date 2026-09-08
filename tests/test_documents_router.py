@@ -432,3 +432,59 @@ async def test_replace_document_deletes_old_chunks_before_reindexing(client, moc
     assert mock_db.execute.call_count == 2
     delete_call_sql = str(mock_db.execute.call_args_list[1].args[0]).lower()
     assert "chunk" in delete_call_sql
+
+
+# ============================================================
+# POST /{document_id}/reindex — CONT-09 (#358)
+# ============================================================
+
+async def test_reindex_document_not_found(client, mock_db):
+    mock_db.execute.return_value = _exec_result(scalar=None)
+
+    response = await client.post(f"/api/v1/documents/{uuid4()}/reindex")
+
+    assert response.status_code == 404
+
+
+async def test_reindex_document_without_storage_path_returns_409(client, mock_db):
+    doc = _make_doc(status="indexed", storage_path=None)
+    mock_db.execute.return_value = _exec_result(scalar=doc)
+
+    response = await client.post(f"/api/v1/documents/{doc.id}/reindex")
+
+    assert response.status_code == 409
+
+
+async def test_reindex_document_missing_file_on_disk_returns_409(client, mock_db, tmp_path, monkeypatch):
+    """storage_path apunta a un archivo, pero ya no está en disco (borrado a
+    mano, migración de servidor, etc.) — mismo 409 que sin storage_path."""
+    doc = _make_doc(status="indexed", storage_path="does-not-exist.pdf")
+    mock_db.execute.return_value = _exec_result(scalar=doc)
+    monkeypatch.setattr("app.documents.router.UPLOADS_DIR", tmp_path)
+
+    response = await client.post(f"/api/v1/documents/{doc.id}/reindex")
+
+    assert response.status_code == 409
+
+
+async def test_reindex_document_success_resets_status_and_deletes_old_chunks(client, mock_db, tmp_path, monkeypatch):
+    """Reindexar lee el archivo YA guardado en disco (no recibe contenido
+    nuevo) — borra los chunks viejos (guard CONT-04), vuelve el status a
+    'pending' y limpia error_message previo, y dispara la re-indexación."""
+    doc = _make_doc(status="error", error_message="algo falló antes", storage_path="stored.pdf")
+    mock_db.execute.return_value = _exec_result(scalar=doc)
+    monkeypatch.setattr("app.documents.router.UPLOADS_DIR", tmp_path)
+    (tmp_path / "stored.pdf").write_bytes(_PDF_BYTES)
+
+    response = await client.post(f"/api/v1/documents/{doc.id}/reindex")
+
+    assert response.status_code == 202
+    data = response.json()
+    assert data["id"] == str(doc.id)
+    assert data["status"] == "pending"
+    assert data["error_message"] is None
+
+    # Dos execute(): el SELECT del documento y el DELETE de chunks viejos.
+    assert mock_db.execute.call_count == 2
+    delete_call_sql = str(mock_db.execute.call_args_list[1].args[0]).lower()
+    assert "chunk" in delete_call_sql

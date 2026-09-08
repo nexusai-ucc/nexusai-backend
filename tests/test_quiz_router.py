@@ -969,3 +969,76 @@ async def test_flashcards_review_batch_skips_flashcard_not_in_course(client, moc
     assert response.status_code == 200
     assert response.json() == {"updated": 0}
     mock_db.add.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────
+# Racha de estudio — SP-16 (#354)
+# ─────────────────────────────────────────────────────────────
+
+from datetime import date  # noqa: E402
+from app.quiz.router import _compute_streak  # noqa: E402
+
+
+def _day_row(dt):
+    return SimpleNamespace(day=dt)
+
+
+def _days_result(rows):
+    result = MagicMock()
+    result.all.return_value = rows
+    return result
+
+
+def test_compute_streak_empty_history_is_zero():
+    today = date(2026, 9, 8)
+    assert _compute_streak(set(), today) == 0
+
+
+def test_compute_streak_counts_consecutive_days_ending_today():
+    today = date(2026, 9, 8)
+    active = {date(2026, 9, 8), date(2026, 9, 7), date(2026, 9, 6)}
+    assert _compute_streak(active, today) == 3
+
+
+def test_compute_streak_stays_alive_if_last_activity_was_yesterday():
+    today = date(2026, 9, 8)
+    active = {date(2026, 9, 7), date(2026, 9, 6)}
+    assert _compute_streak(active, today) == 2
+
+
+def test_compute_streak_resets_after_a_two_day_gap():
+    today = date(2026, 9, 8)
+    active = {date(2026, 9, 5), date(2026, 9, 4)}  # última actividad hace 3 días
+    assert _compute_streak(active, today) == 0
+
+
+def test_compute_streak_ignores_non_consecutive_older_days():
+    today = date(2026, 9, 8)
+    active = {date(2026, 9, 8), date(2026, 9, 7), date(2026, 9, 4)}  # hueco el 9/5-9/6
+    assert _compute_streak(active, today) == 2
+
+
+async def test_streak_endpoint_combines_quiz_and_chat_activity(client, mock_db):
+    # Relativo a "ahora" (no una fecha hardcodeada) para no depender de en
+    # qué día real corra la suite — el endpoint usa datetime.now() interno.
+    now = datetime.now(timezone.utc)
+    mock_db.execute.side_effect = [
+        _days_result([_day_row(now)]),                       # quiz: hoy
+        _days_result([_day_row(now - timedelta(days=1))]),   # chat: ayer
+    ]
+
+    response = await client.post("/api/v1/quiz/streak", json={"course_id": 1, "user_id": 1})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["current_streak"] == 2
+    assert data["practiced_today"] is True
+
+
+async def test_streak_endpoint_no_activity_returns_zero(client, mock_db):
+    mock_db.execute.side_effect = [_days_result([]), _days_result([])]
+
+    response = await client.post("/api/v1/quiz/streak", json={"course_id": 1, "user_id": 1})
+
+    assert response.status_code == 200
+    assert response.json() == {"current_streak": 0, "practiced_today": False}

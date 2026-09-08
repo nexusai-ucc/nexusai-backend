@@ -36,7 +36,7 @@ import json
 import logging
 import random
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -46,7 +46,17 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.hmac import verify_hmac
-from app.db.models import Chunk, Document, Flashcard, FlashcardReview, QuizAttempt, QuizError, UnansweredQuestion
+from app.db.models import (
+    ChatSession,
+    Chunk,
+    Document,
+    Flashcard,
+    FlashcardReview,
+    Message,
+    QuizAttempt,
+    QuizError,
+    UnansweredQuestion,
+)
 from app.db.session import get_db
 from app.documents.retriever import retrieve_context
 from app.gaps.recorder import WEAK_MATCH_THRESHOLD
@@ -409,6 +419,16 @@ class FlashcardsReviewBatchRequest(BaseModel):
 
 class FlashcardsReviewBatchResponse(BaseModel):
     updated: int
+
+
+class StreakRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    user_id: int = Field(gt=0)
+
+
+class StreakResponse(BaseModel):
+    current_streak: int
+    practiced_today: bool
 
 
 # ============================================================
@@ -1885,4 +1905,80 @@ async def flashcards_review_batch(
 
     await db.commit()
     return FlashcardsReviewBatchResponse(updated=updated)
+
+
+# ============================================================
+# Racha de estudio — SP-16 (#354)
+# ============================================================
+
+def _compute_streak(active_dates: set[date], today: date) -> int:
+    """Días consecutivos de actividad terminando hoy o ayer.
+
+    Si la actividad más reciente es de hace 2+ días, la racha se considera
+    rota (0) — criterio de aceptación explícito ("se resetea si el alumno
+    deja de usar el asistente un día"). Si hubo actividad hoy o ayer
+    (el alumno puede no haber practicado TODAVÍA hoy y seguir con la racha
+    viva desde ayer), cuenta hacia atrás mientras los días sean consecutivos.
+    """
+    if not active_dates:
+        return 0
+
+    most_recent = max(active_dates)
+    if (today - most_recent).days > 1:
+        return 0
+
+    streak = 0
+    cursor = most_recent
+    while cursor in active_dates:
+        streak += 1
+        cursor -= timedelta(days=1)
+    return streak
+
+
+@router.post("/streak", response_model=StreakResponse)
+async def study_streak(
+    payload: StreakRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+) -> StreakResponse:
+    """Días consecutivos de actividad del alumno en el curso (SP-16, #354).
+
+    Combina dos señales ya persistidas, sin tabla ni migración nueva:
+    - QuizAttempt.user_id/course_id/created_at — anonimizado por PRIV-01
+      cae solo del filtro (user_id queda NULL), mismo criterio que
+      suggest_difficulty/list_quiz_attempts.
+    - Message.created_at (role='user') join ChatSession.user_id/course_id.
+      InteractionLog NO sirve acá: es anónimo por diseño (solo
+      user_id_hash, sin user_id real) — no hay forma de agrupar por
+      alumno. Sesiones multi-curso (ChatSession.course_id == 0, Feature B)
+      se excluyen: no pertenecen a un curso puntual.
+    """
+    quiz_days_stmt = (
+        select(func.date_trunc("day", QuizAttempt.created_at).label("day"))
+        .where(
+            QuizAttempt.user_id == payload.user_id,
+            QuizAttempt.course_id == payload.course_id,
+        )
+        .distinct()
+    )
+    chat_days_stmt = (
+        select(func.date_trunc("day", Message.created_at).label("day"))
+        .join(ChatSession, Message.session_id == ChatSession.id)
+        .where(
+            ChatSession.user_id == payload.user_id,
+            ChatSession.course_id == payload.course_id,
+            Message.role == "user",
+        )
+        .distinct()
+    )
+
+    quiz_rows = (await db.execute(quiz_days_stmt)).all()
+    chat_rows = (await db.execute(chat_days_stmt)).all()
+
+    active_dates = {row.day.date() for row in quiz_rows} | {row.day.date() for row in chat_rows}
+
+    today = datetime.now(timezone.utc).date()
+    streak = _compute_streak(active_dates, today)
+
+    return StreakResponse(current_streak=streak, practiced_today=today in active_dates)
 
