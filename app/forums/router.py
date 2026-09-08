@@ -511,3 +511,180 @@ async def suggest_reply(
         has_course_material=has_material,
         sources_used=sources_used,
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# FOR-05 (#366) — Heurística de urgencia/frustración
+# ─────────────────────────────────────────────────────────────
+
+_URGENCY_KEYWORDS = [
+    "urgente", "urgencia", "urgent",
+    "ayuda", "help",
+    "no entiendo", "i don't understand", "i dont understand",
+    "no puedo", "i can't", "i cant",
+    "desesperad", "desperate",
+    "frustrad", "frustrat",
+    "perdido", "perdida", "lost",
+    "confundid", "confused",
+    "por favor", "please help",
+]
+
+
+def detect_urgency(text: str) -> bool:
+    """Heurística simple de urgencia/frustración — sin LLM, determinística y
+    fácil de verificar con casos de prueba reales (el issue permite
+    explícitamente "una llamada LLM o una heurística simple"; una heurística
+    es más barata y no depende de la disponibilidad del proveedor).
+
+    Marca "urgente" solo si se combinan AL MENOS 2 señales de las 3 — evita
+    falsos positivos por una sola palabra clave suelta o un simple signo de
+    pregunta en un post neutral:
+      1. Palabra clave de urgencia/frustración/pedido de ayuda.
+      2. Densidad alta de "!"/"?" (3 o más en el post).
+      3. Un tramo largo en mayúsculas sostenidas ("grito", 15+ caracteres).
+    """
+    if not text or not text.strip():
+        return False
+
+    lower = text.lower()
+    signals = 0
+
+    if any(kw in lower for kw in _URGENCY_KEYWORDS):
+        signals += 1
+
+    if (text.count("!") + text.count("?")) >= 3:
+        signals += 1
+
+    if _re.search(r"[A-ZÁÉÍÓÚÑ]{15,}", text):
+        signals += 1
+
+    return signals >= 2
+
+
+# ─────────────────────────────────────────────────────────────
+# FOR-06 (#367) — Digest semanal del foro
+# ─────────────────────────────────────────────────────────────
+#
+# Un solo endpoint combinado con FOR-05: ambas issues comparten la misma
+# ventana de datos (últimos N días) y el mismo momento de revisión del
+# docente ("no tener que entrar hilo por hilo"), así que la señal de
+# urgencia por hilo viaja junto con el resumen general en la misma
+# respuesta, sin duplicar el fetch de discusiones.
+#
+# Este backend NO tiene copia de foros/hilos/posts (solo embeddings para
+# duplicados, ForumPostEmbedding) — PHP arma la lista de discusiones con
+# actividad reciente consultando directo las tablas nativas de Moodle
+# (que sí tienen timestamps) y la manda acá. Stateless, no escribe en DB.
+
+_MAX_DISCUSSIONS_IN_DIGEST = 15
+_MAX_POSTS_PER_DISCUSSION_IN_DIGEST = 20
+
+
+class DigestDiscussion(BaseModel):
+    discussion_id: int = Field(gt=0)
+    discussion_name: str = Field(max_length=300)
+    forum_name: str = Field(max_length=300)
+    posts: List[ThreadPost] = Field(min_length=1, max_length=_MAX_POSTS_PER_DISCUSSION_IN_DIGEST)
+
+
+class WeeklyDigestRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    days: int = Field(default=7, ge=1, le=30)
+    discussions: List[DigestDiscussion] = Field(default_factory=list, max_length=_MAX_DISCUSSIONS_IN_DIGEST)
+
+
+class DigestDiscussionResult(BaseModel):
+    discussion_id: int
+    discussion_name: str
+    forum_name: str
+    post_count: int
+    urgent: bool  # FOR-05: al menos un post del hilo disparó la heurística
+
+
+class WeeklyDigestResponse(BaseModel):
+    course_id: int
+    period_days: int
+    discussion_count: int
+    discussions: List[DigestDiscussionResult]
+    summary: Optional[str] = None  # None si no hubo actividad en la ventana
+
+
+def _build_digest_prompt(discussions: List[DigestDiscussion]) -> str:
+    blocks = []
+    for d in discussions:
+        thread_text, _, _ = _build_summarize_prompt(d.posts)
+        blocks.append(f'=== Hilo: "{d.discussion_name}" (foro: {d.forum_name}) ===\n{thread_text}')
+    return "\n\n".join(blocks)
+
+
+_DIGEST_SYSTEM = """\
+Sos un asistente académico que arma un resumen semanal de la actividad de \
+los foros de un curso, para que el docente no tenga que revisar cada hilo \
+por separado. Respondé en español salvo que la mayoría de los posts estén \
+en inglés. Sé conciso y priorizá lo accionable: qué necesita la atención \
+del docente, qué se resolvió solo entre los alumnos.
+"""
+
+_DIGEST_USER_TMPL = """\
+Estos son los hilos de foro con actividad nueva en los últimos {days} días.
+
+{threads_text}
+
+Escribí un resumen de 3-6 oraciones de la actividad de la semana, agrupando \
+temas relacionados si los hay y señalando qué hilos parecen necesitar una \
+respuesta del docente. Devolvé solo el texto del resumen, sin JSON ni \
+encabezados."""
+
+
+@router.post("/weekly-digest", response_model=WeeklyDigestResponse)
+async def weekly_digest(
+    payload: WeeklyDigestRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    llm: LLMProvider = Depends(get_llm_provider),
+) -> WeeklyDigestResponse:
+    """Resumen semanal del foro (FOR-06) + señal de urgencia por hilo (FOR-05).
+
+    Sin discusiones con actividad → respuesta vacía sin llamar al LLM
+    (nada que resumir, no tiene sentido gastar una llamada).
+    """
+    if not payload.discussions:
+        return WeeklyDigestResponse(
+            course_id=payload.course_id,
+            period_days=payload.days,
+            discussion_count=0,
+            discussions=[],
+            summary=None,
+        )
+
+    discussion_results = [
+        DigestDiscussionResult(
+            discussion_id=d.discussion_id,
+            discussion_name=d.discussion_name,
+            forum_name=d.forum_name,
+            post_count=len(d.posts),
+            urgent=any(detect_urgency(p.content) for p in d.posts),
+        )
+        for d in payload.discussions
+    ]
+
+    threads_text = _build_digest_prompt(payload.discussions)
+    messages = [
+        {"role": "system", "content": _DIGEST_SYSTEM},
+        {"role": "user", "content": _DIGEST_USER_TMPL.format(days=payload.days, threads_text=threads_text)},
+    ]
+
+    try:
+        result = await llm.chat_completion(messages)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="El LLM no está disponible temporalmente",
+        ) from exc
+
+    return WeeklyDigestResponse(
+        course_id=payload.course_id,
+        period_days=payload.days,
+        discussion_count=len(payload.discussions),
+        discussions=discussion_results,
+        summary=result.text.strip(),
+    )

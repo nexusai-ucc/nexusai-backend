@@ -20,6 +20,7 @@ from httpx import ASGITransport, AsyncClient
 from app.auth.hmac import verify_hmac
 from app.db.session import get_db
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
+from app.providers.llm import LLMProvider, get_llm_provider
 
 
 # ─────────────────────────────────────────────────────────────
@@ -80,7 +81,14 @@ def mock_embeddings():
 
 
 @pytest.fixture
-async def client(mock_db, mock_embeddings):
+def mock_llm():
+    llm = AsyncMock(spec=LLMProvider)
+    llm.chat_completion.return_value = MagicMock(text="Resumen de la semana.")
+    return llm
+
+
+@pytest.fixture
+async def client(mock_db, mock_embeddings, mock_llm):
     from app.forums.router import router
 
     app = FastAPI()
@@ -88,6 +96,7 @@ async def client(mock_db, mock_embeddings):
     app.dependency_overrides[verify_hmac] = lambda: b"test-body"
     app.dependency_overrides[get_db] = lambda: mock_db
     app.dependency_overrides[get_embedding_provider] = lambda: mock_embeddings
+    app.dependency_overrides[get_llm_provider] = lambda: mock_llm
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         yield c
@@ -254,3 +263,138 @@ async def test_similar_posts_propagates_embedding_error(client, mock_embeddings)
     response = await client.post("/api/v1/forums/similar-posts", json=_SIMILAR_PAYLOAD)
 
     assert response.status_code == 503
+
+
+# ─────────────────────────────────────────────────────────────
+# FOR-05 (#366) — heurística de urgencia/frustración
+# ─────────────────────────────────────────────────────────────
+
+from app.forums.router import detect_urgency  # noqa: E402
+
+
+def test_detect_urgency_true_for_clearly_urgent_post():
+    text = "URGENTE necesito ayuda para el examen de mañana, no entiendo nada!!!"
+    assert detect_urgency(text) is True
+
+
+def test_detect_urgency_true_for_frustrated_english_post():
+    text = "I'm so desperate, I can't understand this at all, please help!!!"
+    assert detect_urgency(text) is True
+
+
+def test_detect_urgency_false_for_neutral_question():
+    text = "¿Podrían confirmar la fecha del parcial?"
+    assert detect_urgency(text) is False
+
+
+def test_detect_urgency_false_for_neutral_thanks_message():
+    text = "Gracias por la clase de hoy, muy clara la explicación."
+    assert detect_urgency(text) is False
+
+
+def test_detect_urgency_false_for_single_signal_only():
+    # Una sola palabra clave, sin más señales, no alcanza (evita falsos positivos).
+    text = "Necesito ayuda con el ejercicio 3 cuando puedas."
+    assert detect_urgency(text) is False
+
+
+def test_detect_urgency_false_for_empty_or_blank_text():
+    assert detect_urgency("") is False
+    assert detect_urgency("   ") is False
+
+
+def test_detect_urgency_true_for_sustained_caps_plus_keyword():
+    # "URGENTISIMOOOOO" es una sola palabra en mayúsculas de 16 caracteres
+    # (señal 3: grito sostenido) que además contiene "urgent" (señal 1).
+    text = "URGENTISIMOOOOO alguien me ayuda"
+    assert detect_urgency(text) is True
+
+
+# ─────────────────────────────────────────────────────────────
+# FOR-06 (#367) — digest semanal del foro
+# ─────────────────────────────────────────────────────────────
+
+_DIGEST_PAYLOAD = {
+    "course_id": 1,
+    "days": 7,
+    "discussions": [
+        {
+            "discussion_id": 100,
+            "discussion_name": "Dudas sobre el TP2",
+            "forum_name": "Consultas generales",
+            "posts": [
+                {"post_id": 1, "author": "Ana", "content": "¿Cuándo entrega el TP2?"},
+                {"post_id": 2, "author": "Docente", "content": "El viernes que viene."},
+            ],
+        },
+        {
+            "discussion_id": 101,
+            "discussion_name": "No entiendo nada del parcial",
+            "forum_name": "Consultas generales",
+            "posts": [
+                {"post_id": 3, "author": "Juan", "content": "URGENTE no entiendo nada del parcial, ayuda por favor!!!"},
+            ],
+        },
+    ],
+}
+
+
+async def test_weekly_digest_returns_summary_and_per_discussion_urgency(client, mock_llm):
+    response = await client.post("/api/v1/forums/weekly-digest", json=_DIGEST_PAYLOAD)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["discussion_count"] == 2
+    assert data["summary"] == "Resumen de la semana."
+
+    by_id = {d["discussion_id"]: d for d in data["discussions"]}
+    assert by_id[100]["urgent"] is False
+    assert by_id[101]["urgent"] is True
+    assert by_id[100]["post_count"] == 2
+    assert by_id[101]["post_count"] == 1
+
+    mock_llm.chat_completion.assert_awaited_once()
+
+
+async def test_weekly_digest_skips_llm_call_when_no_discussions(client, mock_llm):
+    payload = {**_DIGEST_PAYLOAD, "discussions": []}
+
+    response = await client.post("/api/v1/forums/weekly-digest", json=payload)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data == {
+        "course_id": 1,
+        "period_days": 7,
+        "discussion_count": 0,
+        "discussions": [],
+        "summary": None,
+    }
+    mock_llm.chat_completion.assert_not_awaited()
+
+
+async def test_weekly_digest_propagates_llm_error(client, mock_llm):
+    mock_llm.chat_completion.side_effect = Exception("provider down")
+
+    response = await client.post("/api/v1/forums/weekly-digest", json=_DIGEST_PAYLOAD)
+
+    assert response.status_code == 503
+
+
+async def test_weekly_digest_rejects_too_many_discussions(client):
+    payload = {
+        **_DIGEST_PAYLOAD,
+        "discussions": [
+            {
+                "discussion_id": i,
+                "discussion_name": f"Hilo {i}",
+                "forum_name": "Foro",
+                "posts": [{"post_id": i, "author": "A", "content": "hola"}],
+            }
+            for i in range(20)
+        ],
+    }
+
+    response = await client.post("/api/v1/forums/weekly-digest", json=payload)
+
+    assert response.status_code == 422
