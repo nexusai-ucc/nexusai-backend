@@ -10,7 +10,7 @@ Misma estrategia de aislamiento que test_documents_router.py:
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
@@ -398,3 +398,112 @@ async def test_weekly_digest_rejects_too_many_discussions(client):
     response = await client.post("/api/v1/forums/weekly-digest", json=payload)
 
     assert response.status_code == 422
+
+
+# ─────────────────────────────────────────────────────────────
+# FOR-07 (#378) — webhook externo del digest semanal
+# ─────────────────────────────────────────────────────────────
+
+async def test_weekly_digest_posts_to_webhook_when_configured(client, mock_db, mock_llm):
+    mock_db.execute.return_value.scalar_one_or_none.return_value = "https://hooks.slack.com/services/xxx"
+
+    with patch("app.forums.router.httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client_cls.return_value.__aenter__.return_value = mock_client
+
+        response = await client.post("/api/v1/forums/weekly-digest", json=_DIGEST_PAYLOAD)
+
+    assert response.status_code == 200
+    mock_client.post.assert_awaited_once_with(
+        "https://hooks.slack.com/services/xxx", json={"text": "Resumen de la semana."}
+    )
+
+
+async def test_weekly_digest_does_not_call_webhook_when_not_configured(client, mock_db, mock_llm):
+    mock_db.execute.return_value.scalar_one_or_none.return_value = None
+
+    with patch("app.forums.router.httpx.AsyncClient") as mock_client_cls:
+        response = await client.post("/api/v1/forums/weekly-digest", json=_DIGEST_PAYLOAD)
+
+    assert response.status_code == 200
+    mock_client_cls.assert_not_called()
+
+
+async def test_weekly_digest_webhook_failure_does_not_break_response(client, mock_db, mock_llm):
+    """Criterio de aceptación explícito: un fallo del webhook no debe romper
+    la generación del digest en la UI."""
+    mock_db.execute.return_value.scalar_one_or_none.return_value = "https://hooks.slack.com/services/xxx"
+
+    with patch("app.forums.router.httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = Exception("webhook host unreachable")
+        mock_client_cls.return_value.__aenter__.return_value = mock_client
+
+        response = await client.post("/api/v1/forums/weekly-digest", json=_DIGEST_PAYLOAD)
+
+    assert response.status_code == 200
+    assert response.json()["summary"] == "Resumen de la semana."
+
+
+async def test_weekly_digest_does_not_call_webhook_when_no_activity(client, mock_db, mock_llm):
+    mock_db.execute.return_value.scalar_one_or_none.return_value = "https://hooks.slack.com/services/xxx"
+    payload = {**_DIGEST_PAYLOAD, "discussions": []}
+
+    with patch("app.forums.router.httpx.AsyncClient") as mock_client_cls:
+        response = await client.post("/api/v1/forums/weekly-digest", json=payload)
+
+    assert response.status_code == 200
+    mock_client_cls.assert_not_called()
+
+
+async def test_save_webhook_config_upserts_url(client, mock_db):
+    mock_db.execute.return_value.fetchone.return_value = SimpleNamespace(
+        webhook_url="https://hooks.slack.com/services/xxx"
+    )
+
+    response = await client.post(
+        "/api/v1/forums/webhook-config/save",
+        json={"course_id": 1, "webhook_url": "https://hooks.slack.com/services/xxx"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"webhook_url": "https://hooks.slack.com/services/xxx"}
+    mock_db.commit.assert_called_once()
+
+
+async def test_save_webhook_config_empty_url_deletes(client, mock_db):
+    response = await client.post(
+        "/api/v1/forums/webhook-config/save",
+        json={"course_id": 1, "webhook_url": ""},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"webhook_url": None}
+    mock_db.commit.assert_called_once()
+
+
+async def test_save_webhook_config_rejects_non_http_url(client):
+    response = await client.post(
+        "/api/v1/forums/webhook-config/save",
+        json={"course_id": 1, "webhook_url": "javascript:alert(1)"},
+    )
+
+    assert response.status_code == 422
+
+
+async def test_get_webhook_config_returns_saved_url(client, mock_db):
+    mock_db.execute.return_value.scalar_one_or_none.return_value = "https://hooks.slack.com/services/xxx"
+
+    response = await client.post("/api/v1/forums/webhook-config/get", json={"course_id": 1})
+
+    assert response.status_code == 200
+    assert response.json() == {"webhook_url": "https://hooks.slack.com/services/xxx"}
+
+
+async def test_get_webhook_config_returns_none_when_not_configured(client, mock_db):
+    mock_db.execute.return_value.scalar_one_or_none.return_value = None
+
+    response = await client.post("/api/v1/forums/webhook-config/get", json={"course_id": 1})
+
+    assert response.status_code == 200
+    assert response.json() == {"webhook_url": None}

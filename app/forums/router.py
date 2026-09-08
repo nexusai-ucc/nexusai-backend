@@ -36,22 +36,27 @@ from __future__ import annotations
 
 import hashlib
 import json as _json
+import logging
 import re as _re
 import uuid
 from typing import Annotated, List, Optional
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Path, status
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.hmac import verify_hmac
-from app.db.models import ForumPostEmbedding
+from app.db.models import ForumPostEmbedding, ForumWebhookConfig
 from app.db.session import get_db
 from app.documents.retriever import format_context_for_prompt, retrieve_context
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
 from app.shared.config import get_settings
+
+_logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -641,6 +646,7 @@ async def weekly_digest(
     payload: WeeklyDigestRequest,
     _body: Annotated[bytes, Depends(verify_hmac)],
     llm: LLMProvider = Depends(get_llm_provider),
+    db: AsyncSession = Depends(get_db),
 ) -> WeeklyDigestResponse:
     """Resumen semanal del foro (FOR-06) + señal de urgencia por hilo (FOR-05).
 
@@ -681,10 +687,106 @@ async def weekly_digest(
             detail="El LLM no está disponible temporalmente",
         ) from exc
 
+    summary = result.text.strip()
+
+    # FOR-07 (#378): si el docente configuró un webhook para este curso,
+    # reenviar el resumen ahí además de mostrarlo en el panel. Un fallo acá
+    # NUNCA debe romper la respuesta al frontend — se loguea y se ignora.
+    await _notify_webhook_if_configured(db, payload.course_id, summary)
+
     return WeeklyDigestResponse(
         course_id=payload.course_id,
         period_days=payload.days,
         discussion_count=len(payload.discussions),
         discussions=discussion_results,
-        summary=result.text.strip(),
+        summary=summary,
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# FOR-07 (#378) — Webhook externo para el digest semanal
+# ─────────────────────────────────────────────────────────────
+#
+# El plugin Moodle no tiene ninguna tabla de configuración por-curso
+# propia (ver migración 022_forum_webhook_configs) — la URL vive acá, y
+# el POST saliente a Slack/Discord/Teams se dispara desde este mismo
+# backend (httpx ya es dependencia, sin librería nueva).
+
+_WEBHOOK_POST_TIMEOUT = 8.0
+
+
+class WebhookConfigSaveRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    webhook_url: str = Field(default="", max_length=2000)  # "" = borrar config
+
+
+class WebhookConfigSaveResponse(BaseModel):
+    webhook_url: Optional[str]
+
+
+class WebhookConfigGetRequest(BaseModel):
+    course_id: int = Field(gt=0)
+
+
+class WebhookConfigGetResponse(BaseModel):
+    webhook_url: Optional[str]
+
+
+async def _notify_webhook_if_configured(db: AsyncSession, course_id: int, summary: Optional[str]) -> None:
+    if not summary:
+        return  # nada que notificar (mismo criterio que "sin discusiones, sin LLM")
+
+    row = await db.execute(
+        select(ForumWebhookConfig.webhook_url).where(ForumWebhookConfig.course_id == course_id)
+    )
+    webhook_url = row.scalar_one_or_none()
+    if not webhook_url:
+        return
+
+    try:
+        async with httpx.AsyncClient(timeout=_WEBHOOK_POST_TIMEOUT) as client:
+            await client.post(webhook_url, json={"text": summary})
+    except Exception:
+        _logger.warning("FOR-07: fallo al notificar el webhook del curso %s", course_id, exc_info=True)
+
+
+@router.post("/webhook-config/save", response_model=WebhookConfigSaveResponse)
+async def save_webhook_config(
+    payload: WebhookConfigSaveRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+) -> WebhookConfigSaveResponse:
+    """Guarda (o borra, con webhook_url="") la URL de webhook del curso."""
+    if not payload.webhook_url:
+        await db.execute(delete(ForumWebhookConfig).where(ForumWebhookConfig.course_id == payload.course_id))
+        await db.commit()
+        return WebhookConfigSaveResponse(webhook_url=None)
+
+    if not _re.match(r"^https?://", payload.webhook_url):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="webhook_url debe ser http(s)")
+
+    stmt = (
+        pg_insert(ForumWebhookConfig)
+        .values(id=uuid.uuid4(), course_id=payload.course_id, webhook_url=payload.webhook_url)
+        .on_conflict_do_update(
+            constraint="uq_forum_webhook_configs_course",
+            set_={"webhook_url": payload.webhook_url},
+        )
+        .returning(ForumWebhookConfig.webhook_url)
+    )
+    result = await db.execute(stmt)
+    await db.commit()
+    row = result.fetchone()
+    return WebhookConfigSaveResponse(webhook_url=row.webhook_url)
+
+
+@router.post("/webhook-config/get", response_model=WebhookConfigGetResponse)
+async def get_webhook_config(
+    payload: WebhookConfigGetRequest,
+    _body: Annotated[bytes, Depends(verify_hmac)],
+    db: AsyncSession = Depends(get_db),
+) -> WebhookConfigGetResponse:
+    row = await db.execute(
+        select(ForumWebhookConfig.webhook_url).where(ForumWebhookConfig.course_id == payload.course_id)
+    )
+    return WebhookConfigGetResponse(webhook_url=row.scalar_one_or_none())

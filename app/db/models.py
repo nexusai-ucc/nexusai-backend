@@ -429,3 +429,22 @@ class CalendarAlert(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class ForumWebhookConfig(Base):
+    """URL de webhook (Slack/Discord/Teams) configurada por el docente para
+    recibir el digest semanal del foro (FOR-07, #378). Una config por curso."""
+    __tablename__ = "forum_webhook_configs"
+    __table_args__ = (
+        UniqueConstraint("course_id", name="uq_forum_webhook_configs_course"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    course_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    webhook_url: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
