@@ -1875,17 +1875,26 @@ async def flashcards_review_batch(
     )
     valid_ids = {row.id for row in valid_rows.all()}
 
+    # Un solo SELECT en bulk para todos los reviews existentes de este batch,
+    # en vez de uno por item — y la base para el upsert de abajo, que evita la
+    # race condition de un SELECT-luego-INSERT contra uq_flashcard_reviews_flashcard_user
+    # (dos requests idénticas concurrentes -p.ej. un retry- ya no chocan con
+    # un IntegrityError sin capturar).
+    existing_rows = await db.execute(
+        select(FlashcardReview).where(
+            FlashcardReview.flashcard_id.in_(valid_ids),
+            FlashcardReview.user_id == payload.user_id,
+        )
+    )
+    existing_by_flashcard = {r.flashcard_id: r for r in existing_rows.scalars().all()}
+
     updated = 0
     for item in payload.reviews:
         flashcard_id = parsed_ids.get(item.flashcard_id)
         if flashcard_id is None or flashcard_id not in valid_ids:
             continue
 
-        review_stmt = select(FlashcardReview).where(
-            FlashcardReview.flashcard_id == flashcard_id,
-            FlashcardReview.user_id == payload.user_id,
-        )
-        review = (await db.execute(review_stmt)).scalar_one_or_none()
+        review = existing_by_flashcard.get(flashcard_id)
         if review is None:
             # Los defaults de mapped_column solo se aplican al hacer INSERT
             # (flush), no al construir el objeto — _apply_sm2 los necesita
@@ -1898,9 +1907,30 @@ async def flashcards_review_batch(
                 interval_days=0,
                 repetitions=0,
             )
-            db.add(review)
 
         _apply_sm2(review, item.knew_it, now)
+
+        upsert_values = {
+            "ease_factor": review.ease_factor,
+            "interval_days": review.interval_days,
+            "repetitions": review.repetitions,
+            "last_reviewed_at": review.last_reviewed_at,
+            "next_review_at": review.next_review_at,
+        }
+        stmt = (
+            pg_insert(FlashcardReview)
+            .values(
+                id=uuid.uuid4(),
+                flashcard_id=flashcard_id,
+                user_id=payload.user_id,
+                **upsert_values,
+            )
+            .on_conflict_do_update(
+                constraint="uq_flashcard_reviews_flashcard_user",
+                set_=upsert_values,
+            )
+        )
+        await db.execute(stmt)
         updated += 1
 
     await db.commit()
@@ -1954,7 +1984,7 @@ async def study_streak(
       se excluyen: no pertenecen a un curso puntual.
     """
     quiz_days_stmt = (
-        select(func.date_trunc("day", QuizAttempt.created_at).label("day"))
+        select(func.date_trunc("day", QuizAttempt.created_at, "UTC").label("day"))
         .where(
             QuizAttempt.user_id == payload.user_id,
             QuizAttempt.course_id == payload.course_id,
@@ -1962,7 +1992,7 @@ async def study_streak(
         .distinct()
     )
     chat_days_stmt = (
-        select(func.date_trunc("day", Message.created_at).label("day"))
+        select(func.date_trunc("day", Message.created_at, "UTC").label("day"))
         .join(ChatSession, Message.session_id == ChatSession.id)
         .where(
             ChatSession.user_id == payload.user_id,

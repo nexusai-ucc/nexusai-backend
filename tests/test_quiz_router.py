@@ -923,10 +923,10 @@ async def test_flashcards_review_batch_creates_new_review_and_applies_sm2(client
     valid_ids_result = MagicMock()
     valid_ids_result.all.return_value = [SimpleNamespace(id=flashcard_id)]
 
-    review_lookup_result = MagicMock()
-    review_lookup_result.scalar_one_or_none.return_value = None
+    existing_reviews_result = MagicMock()
+    existing_reviews_result.scalars.return_value.all.return_value = []
 
-    mock_db.execute.side_effect = [valid_ids_result, review_lookup_result]
+    mock_db.execute.side_effect = [valid_ids_result, existing_reviews_result, MagicMock()]
 
     response = await client.post(
         "/api/v1/quiz/flashcards/review-batch",
@@ -939,12 +939,15 @@ async def test_flashcards_review_batch_creates_new_review_and_applies_sm2(client
 
     assert response.status_code == 200
     assert response.json() == {"updated": 1}
-    mock_db.add.assert_called_once()
-    created = mock_db.add.call_args[0][0]
-    assert created.flashcard_id == flashcard_id
-    assert created.user_id == 1
-    assert created.repetitions == 1
-    assert created.interval_days == 1
+    # El review nuevo se persiste vía upsert (ON CONFLICT DO UPDATE), no
+    # db.add() — evita la race condition de un SELECT-luego-INSERT contra
+    # uq_flashcard_reviews_flashcard_user.
+    upsert_stmt = mock_db.execute.call_args_list[-1][0][0]
+    params = upsert_stmt.compile().params
+    assert params["flashcard_id"] == flashcard_id
+    assert params["user_id"] == 1
+    assert params["repetitions"] == 1
+    assert params["interval_days"] == 1
 
 
 async def test_flashcards_review_batch_skips_flashcard_not_in_course(client, mock_db):
@@ -955,7 +958,9 @@ async def test_flashcards_review_batch_skips_flashcard_not_in_course(client, moc
 
     valid_ids_result = MagicMock()
     valid_ids_result.all.return_value = [SimpleNamespace(id=other_course_flashcard_id)]
-    mock_db.execute.side_effect = [valid_ids_result]
+    existing_reviews_result = MagicMock()
+    existing_reviews_result.scalars.return_value.all.return_value = []
+    mock_db.execute.side_effect = [valid_ids_result, existing_reviews_result]
 
     response = await client.post(
         "/api/v1/quiz/flashcards/review-batch",

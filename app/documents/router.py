@@ -144,6 +144,54 @@ class DocumentListResponse(BaseModel):
 
 
 # ============================================================
+# Validación de archivo — compartida entre upload_document y replace_document
+# ============================================================
+
+def _decode_and_validate_file(mime_type: str, content_b64: str) -> bytes:
+    """Decodea y valida un archivo en base64: mime-type soportado, base64
+    válido, no vacío, dentro del tamaño máximo y con magic bytes coherentes
+    con el mime-type declarado. Lanza HTTPException si algo no cumple.
+    """
+    if mime_type not in SUPPORTED_MIME_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=(
+                f"Tipo de archivo no soportado: {mime_type!r}. "
+                f"Tipos aceptados: {sorted(SUPPORTED_MIME_TYPES)}"
+            ),
+        )
+
+    try:
+        file_bytes = base64.b64decode(content_b64, validate=True)
+    except (ValueError, base64.binascii.Error) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid base64 content: {exc}",
+        )
+
+    if not file_bytes:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File is empty")
+
+    if len(file_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File too large: {len(file_bytes)} bytes (max {MAX_UPLOAD_BYTES})",
+        )
+
+    expected_magic = _MAGIC_BYTES.get(mime_type)
+    if expected_magic is not None and not file_bytes.startswith(expected_magic):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"El archivo no parece ser del tipo declarado ({mime_type!r}): "
+                "los primeros bytes no coinciden con el formato esperado."
+            ),
+        )
+
+    return file_bytes
+
+
+# ============================================================
 # Background task wrapper
 # ============================================================
 
@@ -207,7 +255,7 @@ async def upload_document(
             ),
         )
 
-    # CONT-04: calcular hash antes de decodificar para early-return barato.
+    # CONT-04: calcular hash antes de decodificar/validar para early-return barato.
     file_hash = hashlib.sha256(payload.content_b64.encode()).hexdigest()
 
     # Si ya existe un documento indexado con el mismo contenido, devolverlo sin re-indexar.
@@ -243,37 +291,7 @@ async def upload_document(
             ),
         )
 
-    try:
-        file_bytes = base64.b64decode(payload.content_b64, validate=True)
-    except (ValueError, base64.binascii.Error) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid base64 content: {exc}",
-        )
-
-    if not file_bytes:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="File is empty",
-        )
-
-    if len(file_bytes) > MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"File too large: {len(file_bytes)} bytes (max {MAX_UPLOAD_BYTES})",
-        )
-
-    # Verificación de magic bytes por tipo de archivo.
-    # TXT no tiene magic bytes → None = skip check.
-    expected_magic = _MAGIC_BYTES.get(payload.mime_type)
-    if expected_magic is not None and not file_bytes.startswith(expected_magic):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                f"El archivo no parece ser del tipo declarado ({payload.mime_type!r}): "
-                "los primeros bytes no coinciden con el formato esperado."
-            ),
-        )
+    file_bytes = _decode_and_validate_file(payload.mime_type, payload.content_b64)
 
     document = Document(
         course_id=payload.course_id,
@@ -347,41 +365,7 @@ async def replace_document(
     if document is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
-    if payload.mime_type not in SUPPORTED_MIME_TYPES:
-        raise HTTPException(
-            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail=(
-                f"Tipo de archivo no soportado: {payload.mime_type!r}. "
-                f"Tipos aceptados: {sorted(SUPPORTED_MIME_TYPES)}"
-            ),
-        )
-
-    try:
-        file_bytes = base64.b64decode(payload.content_b64, validate=True)
-    except (ValueError, base64.binascii.Error) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid base64 content: {exc}",
-        )
-
-    if not file_bytes:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File is empty")
-
-    if len(file_bytes) > MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"File too large: {len(file_bytes)} bytes (max {MAX_UPLOAD_BYTES})",
-        )
-
-    expected_magic = _MAGIC_BYTES.get(payload.mime_type)
-    if expected_magic is not None and not file_bytes.startswith(expected_magic):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                f"El archivo no parece ser del tipo declarado ({payload.mime_type!r}): "
-                "los primeros bytes no coinciden con el formato esperado."
-            ),
-        )
+    file_bytes = _decode_and_validate_file(payload.mime_type, payload.content_b64)
 
     # Borrar chunks viejos ANTES de tocar el documento — ver docstring (CONT-04).
     await db.execute(delete(Chunk).where(Chunk.document_id == document_id))
