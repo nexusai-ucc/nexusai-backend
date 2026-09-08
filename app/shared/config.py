@@ -58,6 +58,19 @@ class Settings(BaseSettings):
     summary_cache_ttl_sec: int = 86400
     summary_max_concurrency: int = 4
 
+    # Voz — transcripción de audio a texto (VOICE-01, issue #314).
+    #
+    # Ningún proveedor ya configurado (Gemini activo, OpenAI fallback) expone
+    # transcripción utilizable desde acá: Gemini no la tiene en el shim
+    # OpenAI-compat que usamos para chat, y el fallback OpenAI está
+    # deshabilitado en este entorno. Groq sí expone un endpoint de
+    # transcripción compatible con el SDK de OpenAI (mismo SDK, otro
+    # base_url) — ver app/providers/transcription.py. Opcional: sin
+    # `groq_api_key`, el endpoint de voz devuelve un 503 explícito en vez de
+    # fallar al armar el cliente.
+    groq_api_key: Optional[str] = None
+    groq_stt_model: str = "whisper-large-v3"
+
     # Embeddings
     embedding_api_key: str
     embedding_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
