@@ -247,13 +247,11 @@ async def test_similar_posts_excludes_post_id(client, mock_db, mock_embeddings):
     response = await client.post("/api/v1/forums/similar-posts", json=payload)
 
     assert response.status_code == 200
-    # Verificar que se pasó el parámetro a execute (el SQL incluye :exclude_post_id)
-    call_kwargs = mock_db.execute.call_args
-    assert call_kwargs is not None
-    params = call_kwargs[0][1] if len(call_kwargs[0]) > 1 else call_kwargs[1].get("params", {})
-    # El parámetro pasa como dict posicional en text()
-    executed_params = mock_db.execute.call_args[0][1]
-    assert executed_params["exclude_post_id"] == 10
+    # similar_posts usa el ORM de SQLAlchemy (select().where(...)), no text()
+    # con params separados — el exclude_post_id queda bindeado directo en el
+    # WHERE del statement compilado, no como segundo arg posicional de execute().
+    stmt = mock_db.execute.call_args[0][0]
+    assert 10 in stmt.compile().params.values()
 
 
 async def test_similar_posts_propagates_embedding_error(client, mock_embeddings):

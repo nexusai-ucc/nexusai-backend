@@ -73,9 +73,10 @@ def test_format_single_chunk_includes_filename_and_index():
         )
     ]
     output = format_context_for_prompt(chunks)
-    assert "FRAGMENTO 1" in output
-    assert "apunte-derivadas.pdf" in output
-    assert "chunk #3" in output
+    # Formato actual (desde bfa5c72): '[Fuente: "filename"]\ncontenido' — sin
+    # numeración de fragmento ni chunk_index en el texto (chat/router.py
+    # instruye al LLM a citar con este mismo formato entre comillas).
+    assert '[Fuente: "apunte-derivadas.pdf"]' in output
     assert "derivada mide" in output
 
 
@@ -85,11 +86,15 @@ def test_format_multiple_chunks_are_numbered_sequentially():
         for i in range(3)
     ]
     output = format_context_for_prompt(chunks)
-    assert "FRAGMENTO 1" in output
-    assert "FRAGMENTO 2" in output
-    assert "FRAGMENTO 3" in output
+    assert '[Fuente: "doc0.pdf"]' in output
+    assert '[Fuente: "doc1.pdf"]' in output
+    assert '[Fuente: "doc2.pdf"]' in output
     # Aparecen en el mismo orden que se pasaron.
-    assert output.index("FRAGMENTO 1") < output.index("FRAGMENTO 2") < output.index("FRAGMENTO 3")
+    assert (
+        output.index('[Fuente: "doc0.pdf"]')
+        < output.index('[Fuente: "doc1.pdf"]')
+        < output.index('[Fuente: "doc2.pdf"]')
+    )
 
 
 def test_format_truncates_very_long_content():
