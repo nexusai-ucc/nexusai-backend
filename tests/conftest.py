@@ -37,6 +37,10 @@ os.environ.setdefault("NEXUSAI_SHARED_SECRET", "test-shared-secret-32-chars-long
 os.environ.setdefault("NEXUSAI_API_KEY", "test-api-key-32-chars-long-okok")
 os.environ.setdefault("HMAC_REPLAY_WINDOW_SEC", "300")
 os.environ.setdefault("RATE_LIMIT_PER_USER_DAILY", "50")
+# Moderación deshabilitada por default en tests existentes (que no la
+# ejercitan) — test_moderation.py la habilita explícitamente vía
+# app.dependency_overrides / monkeypatch de get_settings donde corresponde.
+os.environ.setdefault("MODERATION_ENABLED", "false")
 
 
 # ============================================================

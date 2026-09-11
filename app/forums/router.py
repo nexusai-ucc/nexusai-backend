@@ -48,6 +48,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.analytics.logger import log_moderation_block
 from app.auth.hmac import verify_hmac
 from app.db.models import ForumPostEmbedding, ForumWebhookConfig
 from app.db.session import get_db
@@ -55,6 +56,7 @@ from app.documents.retriever import format_context_for_prompt, retrieve_context
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
 from app.shared.config import get_settings
+from app.shared.moderation import moderate_text
 
 _logger = logging.getLogger(__name__)
 
@@ -466,6 +468,20 @@ async def suggest_reply(
       2. Construye el prompt con el hilo + material recuperado.
       3. El LLM genera la respuesta sugerida.
     """
+    # ----- Moderación de contenido — antes de gastar tokens en RAG/LLM y
+    # antes de que una respuesta generada a partir de este post llegue a
+    # otro alumno del foro. Ver app/shared/moderation.py. -----
+    moderation = await moderate_text(payload.question, llm=llm)
+    if not moderation.allowed:
+        log_moderation_block(
+            endpoint="forums.suggest_reply",
+            course_id=payload.course_id,
+            user_id=None,  # el post no trae user_id — PHP no lo envía en este endpoint
+            source=moderation.source,
+            categories=moderation.categories,
+        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=moderation.blocked_message)
+
     # 1. RAG: buscar material del curso relevante a la pregunta.
     try:
         chunks = await retrieve_context(

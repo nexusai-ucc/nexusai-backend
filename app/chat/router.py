@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.analytics.logger import hash_user_id, log_interaction
+from app.analytics.logger import hash_user_id, log_interaction, log_moderation_block
 from app.auth.hmac import verify_hmac
 from app.chat.schemas import ChatRequest, ChatResponse, MessageOut
 from app.db.models import ChatSession, Message, MessageFeedback
@@ -38,6 +38,7 @@ from app.infrastructure.redis_client import get_redis
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, StreamToken, StreamUsage, get_llm_provider
 from app.shared.config import get_settings
+from app.shared.moderation import moderate_text
 from app.shared.rate_limit import check_rate_limit
 
 import redis.asyncio as redis_async
@@ -184,6 +185,19 @@ async def messages(
         limit=settings.rate_limit_per_user_minute,
         window_sec=60,
     )
+
+    # ----- Moderación de contenido — antes de cualquier escritura o gasto de
+    # tokens (retrieval/LLM). Ver app/shared/moderation.py. -----
+    moderation = await moderate_text(payload.question, llm=llm)
+    if not moderation.allowed:
+        log_moderation_block(
+            endpoint="chat.messages",
+            course_id=payload.course_id,
+            user_id=payload.user_id,
+            source=moderation.source,
+            categories=moderation.categories,
+        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=moderation.blocked_message)
 
     session = await _get_or_create_session(db, payload)
 
@@ -380,6 +394,19 @@ async def messages_stream(
         limit=settings.rate_limit_per_user_minute,
         window_sec=60,
     )
+
+    # ----- Moderación de contenido — antes de abrir el stream (que ya
+    # implica costo de RAG/LLM). Ver app/shared/moderation.py. -----
+    moderation = await moderate_text(payload.question, llm=llm)
+    if not moderation.allowed:
+        log_moderation_block(
+            endpoint="chat.stream",
+            course_id=payload.course_id,
+            user_id=payload.user_id,
+            source=moderation.source,
+            categories=moderation.categories,
+        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=moderation.blocked_message)
 
     is_multicourse = bool(payload.course_ids and len(payload.course_ids) > 1)
     course_names_int: dict[int, str] = {}

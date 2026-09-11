@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import uuid
 
@@ -59,3 +60,37 @@ async def log_interaction(
         await db.commit()
     except Exception as exc:
         logger.warning("log_interaction failed (non-fatal): %s", exc)
+
+
+def log_moderation_block(
+    *,
+    endpoint: str,
+    course_id: int,
+    user_id: int | None,
+    source: str,
+    categories: list[str],
+) -> None:
+    """Loguea (structured JSON, mismo formato que chat/router.py) un bloqueo
+    de contenido por la capa de moderación — ver app/shared/moderation.py.
+
+    `user_id` es opcional: algunos endpoints (p. ej. forums.suggest_reply) no
+    reciben el user_id del alumno en el payload.
+
+    No persiste en DB: es un evento de seguridad, no una interacción exitosa,
+    y no requiere una migración de schema para un piloto. Si más adelante se
+    necesita un dashboard de estos eventos, agregar una tabla dedicada
+    (ver InteractionLog) en vez de forzarlo en el modelo actual.
+    """
+    logger.info(
+        json.dumps(
+            {
+                "event": "content_moderation_blocked",
+                "endpoint": endpoint,
+                "course_id": course_id,
+                "user_id_hash": hash_user_id(user_id) if user_id is not None else None,
+                "source": source,
+                "categories": categories,
+            },
+            ensure_ascii=False,
+        )
+    )
