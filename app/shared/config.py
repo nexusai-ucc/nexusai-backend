@@ -94,10 +94,13 @@ class Settings(BaseSettings):
 
     # Alertas mínimas (ver ADR-012 y app/shared/alerting.py).
     #
-    # alert_webhook_url: URL de un webhook entrante (Slack "Incoming Webhook"
-    #   o Discord) donde se postean las notificaciones. Sin configurar, las
-    #   alertas quedan solo logueadas (WARNING) — no rompe nada, solo pierde
-    #   visibilidad automática.
+    # alert_smtp_*/alert_email_to: envío por email vía SMTP (pensado para
+    #   Gmail con una App Password — no la contraseña normal de la cuenta,
+    #   Gmail bloquea login SMTP directo). Sin `alert_smtp_user` +
+    #   `alert_smtp_password` + `alert_email_to` configuradas, las alertas
+    #   quedan solo logueadas (WARNING) — no rompe nada, solo pierde
+    #   visibilidad automática. Nunca hardcodear la password acá: siempre
+    #   por variable de entorno.
     #
     # error_rate_*: ventana fija (mismo patrón que rate_limit.py) para avisar
     #   si hay una ráfaga de respuestas 5xx.
@@ -110,7 +113,11 @@ class Settings(BaseSettings):
     # llm_slow_*: latencia del LLM. Una respuesta lenta no es un error (sigue
     #   devolviendo 200), así que no la detecta el conteo de 5xx — necesita
     #   su propio umbral.
-    alert_webhook_url: Optional[str] = None
+    alert_smtp_host: str = "smtp.gmail.com"
+    alert_smtp_port: int = 465
+    alert_smtp_user: Optional[str] = None
+    alert_smtp_password: Optional[str] = None
+    alert_email_to: Optional[str] = None
 
     error_rate_window_sec: int = 60
     error_rate_threshold: int = 10

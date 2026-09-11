@@ -2,14 +2,13 @@
 /health que corre por cron. Es un script standalone (no vive en app.*), así
 que se carga directo desde el path por importlib en vez de un import normal.
 
-No se testea un webhook real ni una conexión de red real — se mockea
-`urllib.request.urlopen`.
+No se testea un email real ni una conexión de red real — se mockea
+`urllib.request.urlopen` (chequeo de /health) y `smtplib.SMTP_SSL` (envío).
 """
 
 from __future__ import annotations
 
 import importlib.util
-import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -98,34 +97,56 @@ def test_write_then_read_state_roundtrip(tmp_path):
 
 
 # ============================================================
-# send_webhook
+# send_email
 # ============================================================
 
-def test_send_webhook_noop_without_url(capsys):
-    health_check_alert.send_webhook("", "mensaje de alerta", timeout=1.0)
+def _smtp_config(**overrides) -> dict:
+    config = {
+        "smtp_host": "smtp.gmail.com",
+        "smtp_port": 465,
+        "smtp_user": "nexusai.alertas@gmail.com",
+        "smtp_password": "app-password-falsa",
+        "email_to": "santiagotricherri@gmail.com",
+        "timeout_sec": 1.0,
+    }
+    config.update(overrides)
+    return config
+
+
+def test_send_email_noop_without_smtp_config(capsys):
+    config = _smtp_config(smtp_user="", smtp_password="", email_to="")
+
+    with patch("health_check_alert.smtplib.SMTP_SSL") as mock_smtp_cls:
+        health_check_alert.send_email(config, "asunto", "cuerpo del mensaje")
+
+    mock_smtp_cls.assert_not_called()
     captured = capsys.readouterr()
-    assert "mensaje de alerta" in captured.err
+    assert "cuerpo del mensaje" in captured.err
 
 
-def test_send_webhook_posts_json_body():
-    with patch("health_check_alert.urllib.request.urlopen") as mock_urlopen:
-        health_check_alert.send_webhook(
-            "https://hooks.slack.com/services/xxx", "mensaje de alerta", timeout=1.0
-        )
+def test_send_email_logs_in_and_sends_message():
+    config = _smtp_config()
 
-    mock_urlopen.assert_called_once()
-    request_obj = mock_urlopen.call_args[0][0]
-    body = json.loads(request_obj.data.decode("utf-8"))
-    assert body == {"text": "mensaje de alerta", "content": "mensaje de alerta"}
+    with patch("health_check_alert.smtplib.SMTP_SSL") as mock_smtp_cls:
+        mock_smtp = MagicMock()
+        mock_smtp_cls.return_value.__enter__.return_value = mock_smtp
+
+        health_check_alert.send_email(config, "asunto", "cuerpo del mensaje")
+
+    mock_smtp_cls.assert_called_once_with("smtp.gmail.com", 465, timeout=1.0)
+    mock_smtp.login.assert_called_once_with("nexusai.alertas@gmail.com", "app-password-falsa")
+    mock_smtp.send_message.assert_called_once()
+    sent_msg = mock_smtp.send_message.call_args[0][0]
+    assert sent_msg["To"] == "santiagotricherri@gmail.com"
+    assert sent_msg["Subject"] == "asunto"
 
 
-def test_send_webhook_failure_does_not_raise():
-    with patch(
-        "health_check_alert.urllib.request.urlopen",
-        side_effect=Exception("webhook host unreachable"),
-    ):
+def test_send_email_failure_does_not_raise():
+    config = _smtp_config()
+
+    with patch("health_check_alert.smtplib.SMTP_SSL", side_effect=Exception("smtp unreachable")):
         # No debe lanzar.
-        health_check_alert.send_webhook("https://hooks.slack.com/services/xxx", "m", timeout=1.0)
+        health_check_alert.send_email(config, "asunto", "cuerpo")
 
 
 # ============================================================
@@ -135,7 +156,11 @@ def test_send_webhook_failure_does_not_raise():
 def _config(tmp_path, **overrides):
     config = {
         "health_url": "http://x/health",
-        "webhook_url": "https://hooks.slack.com/services/xxx",
+        "smtp_host": "smtp.gmail.com",
+        "smtp_port": 465,
+        "smtp_user": "nexusai.alertas@gmail.com",
+        "smtp_password": "app-password-falsa",
+        "email_to": "santiagotricherri@gmail.com",
         "failure_threshold": 3,
         "timeout_sec": 1.0,
         "state_file": tmp_path / "state.json",
@@ -145,11 +170,12 @@ def _config(tmp_path, **overrides):
 
 
 def test_main_healthy_resets_state(tmp_path):
-    health_check_alert.write_state(config_path := tmp_path / "state.json", {"consecutive_failures": 2, "alerted": False})
+    config_path = tmp_path / "state.json"
+    health_check_alert.write_state(config_path, {"consecutive_failures": 2, "alerted": False})
 
     with patch("health_check_alert._env_config", return_value=_config(tmp_path, state_file=config_path)), \
          patch("health_check_alert.check_health", return_value=True), \
-         patch("health_check_alert.send_webhook") as mock_send:
+         patch("health_check_alert.send_email") as mock_send:
         exit_code = health_check_alert.main()
 
     assert exit_code == 0
@@ -163,11 +189,11 @@ def test_main_recovery_sends_notice(tmp_path):
 
     with patch("health_check_alert._env_config", return_value=_config(tmp_path, state_file=config_path)), \
          patch("health_check_alert.check_health", return_value=True), \
-         patch("health_check_alert.send_webhook") as mock_send:
+         patch("health_check_alert.send_email") as mock_send:
         health_check_alert.main()
 
     mock_send.assert_called_once()
-    assert "OK" in mock_send.call_args[0][1]
+    assert "recuperó" in mock_send.call_args[0][1]
 
 
 def test_main_failure_below_threshold_does_not_alert(tmp_path):
@@ -175,7 +201,7 @@ def test_main_failure_below_threshold_does_not_alert(tmp_path):
 
     with patch("health_check_alert._env_config", return_value=_config(tmp_path, state_file=config_path, failure_threshold=3)), \
          patch("health_check_alert.check_health", return_value=False), \
-         patch("health_check_alert.send_webhook") as mock_send:
+         patch("health_check_alert.send_email") as mock_send:
         exit_code = health_check_alert.main()
 
     assert exit_code == 1
@@ -189,7 +215,7 @@ def test_main_failure_crossing_threshold_alerts_once(tmp_path):
 
     with patch("health_check_alert._env_config", return_value=_config(tmp_path, state_file=config_path, failure_threshold=3)), \
          patch("health_check_alert.check_health", return_value=False), \
-         patch("health_check_alert.send_webhook") as mock_send:
+         patch("health_check_alert.send_email") as mock_send:
         health_check_alert.main()
 
     mock_send.assert_called_once()
@@ -202,7 +228,7 @@ def test_main_stays_down_does_not_realert(tmp_path):
 
     with patch("health_check_alert._env_config", return_value=_config(tmp_path, state_file=config_path, failure_threshold=3)), \
          patch("health_check_alert.check_health", return_value=False), \
-         patch("health_check_alert.send_webhook") as mock_send:
+         patch("health_check_alert.send_email") as mock_send:
         health_check_alert.main()
 
     mock_send.assert_not_called()

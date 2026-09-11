@@ -1,26 +1,31 @@
-"""Alertas mínimas viables: notificación por webhook + umbral en ventana fija.
+"""Alertas mínimas viables: notificación por email (Gmail SMTP) + umbral en
+ventana fija.
 
 Ver ADR-012 (docs/adr/012-alertas-monitoreo-minimo.md). Dos piezas:
 
-  - `send_alert`: dispara una notificación best-effort a un webhook
-    configurable (Slack/Discord). Sin `ALERT_WEBHOOK_URL` seteada, solo
-    loguea — no rompe nada.
+  - `send_alert`: manda un email best-effort vía SMTP (pensado para Gmail
+    con una App Password, pero cualquier SMTP con auth sirve cambiando
+    `ALERT_SMTP_HOST`/`ALERT_SMTP_PORT`). Sin `ALERT_SMTP_USER` +
+    `ALERT_SMTP_PASSWORD` + `ALERT_EMAIL_TO` configuradas, solo loguea — no
+    rompe nada.
 
   - `record_event_and_maybe_alert`: cuenta eventos en una ventana fija de
     Redis (mismo patrón que app.shared.rate_limit) y dispara `send_alert`
     como máximo UNA vez por ventana al cruzar el umbral, para no floodear
-    el webhook mientras el problema persiste. La reusan
+    la casilla mientras el problema persiste. La reusan
     app.shared.error_monitoring (5xx) y app.chat.router (fallas/latencia
     del LLM).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import smtplib
 import time
+from email.message import EmailMessage
 from typing import Optional
 
-import httpx
 import redis.asyncio as redis_async
 
 from app.shared.config import get_settings
@@ -28,29 +33,59 @@ from app.shared.config import get_settings
 logger = logging.getLogger("nexusai.alerts")
 
 
-async def send_alert(title: str, message: str) -> None:
-    """Postea una alerta al webhook configurado. Best-effort: nunca propaga.
+def _send_email_sync(
+    *,
+    smtp_host: str,
+    smtp_port: int,
+    smtp_user: str,
+    smtp_password: str,
+    email_to: str,
+    subject: str,
+    body: str,
+) -> None:
+    """Parte bloqueante (smtplib no es async) — se corre en un thread aparte
+    vía `asyncio.to_thread` para no trabar el event loop de FastAPI."""
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = smtp_user
+    msg["To"] = email_to
+    msg.set_content(body)
 
-    El body incluye `text` (Slack) y `content` (Discord) — ambos formatos de
-    webhook entrante leen el campo que entienden e ignoran el resto, así que
-    un solo POST sirve para cualquiera de los dos sin tener que detectar el
-    proveedor por la URL.
+    with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=10) as smtp:
+        smtp.login(smtp_user, smtp_password)
+        smtp.send_message(msg)
+
+
+async def send_alert(title: str, message: str) -> None:
+    """Manda un email de alerta. Best-effort: nunca propaga una excepción.
+
+    Requiere `ALERT_SMTP_USER` (la cuenta de Gmail remitente),
+    `ALERT_SMTP_PASSWORD` (App Password de esa cuenta, no la contraseña
+    normal) y `ALERT_EMAIL_TO` (destinatario). Sin las tres, solo loguea.
     """
     settings = get_settings()
-    full_message = f"{title}: {message}"
 
-    if not settings.alert_webhook_url:
-        logger.warning("ALERTA (sin ALERT_WEBHOOK_URL configurada): %s", full_message)
+    if not (settings.alert_smtp_user and settings.alert_smtp_password and settings.alert_email_to):
+        logger.warning(
+            "ALERTA (falta ALERT_SMTP_USER/ALERT_SMTP_PASSWORD/ALERT_EMAIL_TO): %s: %s",
+            title,
+            message,
+        )
         return
 
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            await client.post(
-                settings.alert_webhook_url,
-                json={"text": full_message, "content": full_message},
-            )
+        await asyncio.to_thread(
+            _send_email_sync,
+            smtp_host=settings.alert_smtp_host,
+            smtp_port=settings.alert_smtp_port,
+            smtp_user=settings.alert_smtp_user,
+            smtp_password=settings.alert_smtp_password,
+            email_to=settings.alert_email_to,
+            subject=title,
+            body=message,
+        )
     except Exception as exc:
-        logger.warning("No se pudo enviar la alerta al webhook: %s", exc)
+        logger.warning("No se pudo enviar el email de alerta: %s", exc)
 
 
 async def record_event_and_maybe_alert(

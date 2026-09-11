@@ -1,7 +1,7 @@
 """Tests de la lógica de detección de umbral de app.shared.alerting (ADR-012).
 
-No se testea el webhook real — se mockea `httpx.AsyncClient` igual que en
-test_forums_router.py.
+No se testea el envío real de email — se mockea `smtplib.SMTP_SSL` (vía
+`_send_email_sync`, que corre en un thread aparte con `asyncio.to_thread`).
 """
 
 from __future__ import annotations
@@ -28,43 +28,52 @@ def _fake_redis(incr_result: int, set_result: bool = True) -> MagicMock:
     return redis_mock
 
 
+def _configured_settings() -> MagicMock:
+    settings = MagicMock()
+    settings.alert_smtp_host = "smtp.gmail.com"
+    settings.alert_smtp_port = 465
+    settings.alert_smtp_user = "nexusai.alertas@gmail.com"
+    settings.alert_smtp_password = "app-password-falsa"
+    settings.alert_email_to = "santiagotricherri@gmail.com"
+    return settings
+
+
 # ============================================================
 # send_alert
 # ============================================================
 
-async def test_send_alert_posts_to_configured_webhook():
-    with patch("app.shared.alerting.get_settings") as mock_settings, \
-         patch("app.shared.alerting.httpx.AsyncClient") as mock_client_cls:
-        mock_settings.return_value.alert_webhook_url = "https://hooks.slack.com/services/xxx"
-        mock_client = AsyncMock()
-        mock_client_cls.return_value.__aenter__.return_value = mock_client
-
+async def test_send_alert_sends_email_when_smtp_configured():
+    with patch("app.shared.alerting.get_settings", return_value=_configured_settings()), \
+         patch("app.shared.alerting._send_email_sync") as mock_send_sync:
         await alerting.send_alert("Título", "Mensaje")
 
-    mock_client.post.assert_awaited_once_with(
-        "https://hooks.slack.com/services/xxx",
-        json={"text": "Título: Mensaje", "content": "Título: Mensaje"},
+    mock_send_sync.assert_called_once_with(
+        smtp_host="smtp.gmail.com",
+        smtp_port=465,
+        smtp_user="nexusai.alertas@gmail.com",
+        smtp_password="app-password-falsa",
+        email_to="santiagotricherri@gmail.com",
+        subject="Título",
+        body="Mensaje",
     )
 
 
-async def test_send_alert_without_webhook_url_only_logs():
-    with patch("app.shared.alerting.get_settings") as mock_settings, \
-         patch("app.shared.alerting.httpx.AsyncClient") as mock_client_cls:
-        mock_settings.return_value.alert_webhook_url = None
+async def test_send_alert_without_smtp_config_only_logs():
+    settings = MagicMock()
+    settings.alert_smtp_user = None
+    settings.alert_smtp_password = None
+    settings.alert_email_to = None
 
+    with patch("app.shared.alerting.get_settings", return_value=settings), \
+         patch("app.shared.alerting._send_email_sync") as mock_send_sync:
         await alerting.send_alert("Título", "Mensaje")
 
-    mock_client_cls.assert_not_called()
+    mock_send_sync.assert_not_called()
 
 
-async def test_send_alert_webhook_failure_does_not_propagate():
-    with patch("app.shared.alerting.get_settings") as mock_settings, \
-         patch("app.shared.alerting.httpx.AsyncClient") as mock_client_cls:
-        mock_settings.return_value.alert_webhook_url = "https://hooks.slack.com/services/xxx"
-        mock_client = AsyncMock()
-        mock_client.post.side_effect = Exception("webhook host unreachable")
-        mock_client_cls.return_value.__aenter__.return_value = mock_client
-
+async def test_send_alert_smtp_failure_does_not_propagate():
+    with patch("app.shared.alerting.get_settings", return_value=_configured_settings()), \
+         patch("app.shared.alerting._send_email_sync", side_effect=Exception("smtp unreachable")):
         # No debe lanzar.
         await alerting.send_alert("Título", "Mensaje")
 
