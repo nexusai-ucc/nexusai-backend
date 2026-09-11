@@ -97,10 +97,15 @@ class Settings(BaseSettings):
     # alert_smtp_*/alert_email_to: envío por email vía SMTP (pensado para
     #   Gmail con una App Password — no la contraseña normal de la cuenta,
     #   Gmail bloquea login SMTP directo). Sin `alert_smtp_user` +
-    #   `alert_smtp_password` + `alert_email_to` configuradas, las alertas
-    #   quedan solo logueadas (WARNING) — no rompe nada, solo pierde
-    #   visibilidad automática. Nunca hardcodear la password acá: siempre
-    #   por variable de entorno.
+    #   `alert_smtp_password` configuradas, las alertas quedan solo
+    #   logueadas (WARNING) — no rompe nada, solo pierde visibilidad
+    #   automática. Nunca hardcodear la password acá: siempre por variable
+    #   de entorno (`ALERT_SMTP_PASSWORD`).
+    #
+    #   `alert_email_to` sí tiene default (el mail del responsable del
+    #   piloto) porque no es un secreto — solo el destino de una
+    #   notificación. Se puede pisar por env var (`ALERT_EMAIL_TO`) si
+    #   cambia quién recibe las alertas.
     #
     # error_rate_*: ventana fija (mismo patrón que rate_limit.py) para avisar
     #   si hay una ráfaga de respuestas 5xx.
@@ -117,7 +122,7 @@ class Settings(BaseSettings):
     alert_smtp_port: int = 465
     alert_smtp_user: Optional[str] = None
     alert_smtp_password: Optional[str] = None
-    alert_email_to: Optional[str] = None
+    alert_email_to: str = "santiagotricherri@gmail.com"
 
     error_rate_window_sec: int = 60
     error_rate_threshold: int = 10

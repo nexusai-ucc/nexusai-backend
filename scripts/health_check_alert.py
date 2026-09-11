@@ -16,7 +16,6 @@ Uso típico (crontab -e), cada minuto:
     * * * * * NEXUSAI_HEALTH_URL=https://api.<ip>.nip.io/health \
               NEXUSAI_ALERT_SMTP_USER=tu-cuenta@gmail.com \
               NEXUSAI_ALERT_SMTP_PASSWORD=xxxxxxxxxxxxxxxx \
-              NEXUSAI_ALERT_EMAIL_TO=destino@example.com \
               /usr/bin/python3 /opt/nexusai/services/api/scripts/health_check_alert.py \
               >> /var/log/nexusai-health.log 2>&1
 
@@ -33,9 +32,9 @@ Variables de entorno:
     NEXUSAI_HEALTH_URL               default: http://localhost:8001/health
     NEXUSAI_ALERT_SMTP_HOST          default: smtp.gmail.com
     NEXUSAI_ALERT_SMTP_PORT          default: 465
-    NEXUSAI_ALERT_SMTP_USER          default: "" (sin esto + password + email_to, solo loguea a stderr)
+    NEXUSAI_ALERT_SMTP_USER          default: "" (sin esto + password, solo loguea a stderr)
     NEXUSAI_ALERT_SMTP_PASSWORD      default: ""
-    NEXUSAI_ALERT_EMAIL_TO           default: ""
+    NEXUSAI_ALERT_EMAIL_TO           default: santiagotricherri@gmail.com
     NEXUSAI_HEALTH_FAILURE_THRESHOLD default: 3   (chequeos consecutivos fallidos antes de avisar)
     NEXUSAI_HEALTH_TIMEOUT_SEC       default: 5
     NEXUSAI_HEALTH_STATE_FILE        default: /tmp/nexusai_health_watch_state.json
@@ -59,7 +58,7 @@ def _env_config() -> dict:
         "smtp_port": int(os.environ.get("NEXUSAI_ALERT_SMTP_PORT", "465")),
         "smtp_user": os.environ.get("NEXUSAI_ALERT_SMTP_USER", ""),
         "smtp_password": os.environ.get("NEXUSAI_ALERT_SMTP_PASSWORD", ""),
-        "email_to": os.environ.get("NEXUSAI_ALERT_EMAIL_TO", ""),
+        "email_to": os.environ.get("NEXUSAI_ALERT_EMAIL_TO", "santiagotricherri@gmail.com"),
         "failure_threshold": int(os.environ.get("NEXUSAI_HEALTH_FAILURE_THRESHOLD", "3")),
         "timeout_sec": float(os.environ.get("NEXUSAI_HEALTH_TIMEOUT_SEC", "5")),
         "state_file": Path(

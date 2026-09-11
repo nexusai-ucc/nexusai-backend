@@ -5,9 +5,9 @@ Ver ADR-012 (docs/adr/012-alertas-monitoreo-minimo.md). Dos piezas:
 
   - `send_alert`: manda un email best-effort vía SMTP (pensado para Gmail
     con una App Password, pero cualquier SMTP con auth sirve cambiando
-    `ALERT_SMTP_HOST`/`ALERT_SMTP_PORT`). Sin `ALERT_SMTP_USER` +
-    `ALERT_SMTP_PASSWORD` + `ALERT_EMAIL_TO` configuradas, solo loguea — no
-    rompe nada.
+    `ALERT_SMTP_HOST`/`ALERT_SMTP_PORT`). El destinatario (`ALERT_EMAIL_TO`)
+    ya tiene default; sin `ALERT_SMTP_USER` + `ALERT_SMTP_PASSWORD`
+    (la cuenta remitente) configuradas, solo loguea — no rompe nada.
 
   - `record_event_and_maybe_alert`: cuenta eventos en una ventana fija de
     Redis (mismo patrón que app.shared.rate_limit) y dispara `send_alert`
@@ -59,15 +59,16 @@ def _send_email_sync(
 async def send_alert(title: str, message: str) -> None:
     """Manda un email de alerta. Best-effort: nunca propaga una excepción.
 
-    Requiere `ALERT_SMTP_USER` (la cuenta de Gmail remitente),
+    Requiere `ALERT_SMTP_USER` (la cuenta de Gmail remitente) y
     `ALERT_SMTP_PASSWORD` (App Password de esa cuenta, no la contraseña
-    normal) y `ALERT_EMAIL_TO` (destinatario). Sin las tres, solo loguea.
+    normal). El destinatario (`ALERT_EMAIL_TO`) ya tiene default — solo
+    falta la cuenta remitente para que esto ande. Sin esas dos, solo loguea.
     """
     settings = get_settings()
 
-    if not (settings.alert_smtp_user and settings.alert_smtp_password and settings.alert_email_to):
+    if not (settings.alert_smtp_user and settings.alert_smtp_password):
         logger.warning(
-            "ALERTA (falta ALERT_SMTP_USER/ALERT_SMTP_PASSWORD/ALERT_EMAIL_TO): %s: %s",
+            "ALERTA (falta ALERT_SMTP_USER/ALERT_SMTP_PASSWORD): %s: %s",
             title,
             message,
         )
