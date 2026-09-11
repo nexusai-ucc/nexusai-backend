@@ -38,6 +38,10 @@ from app.infrastructure.redis_client import get_redis
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, StreamToken, StreamUsage, get_llm_provider
 from app.shared.config import get_settings
+from app.shared.error_monitoring import (
+    record_llm_failure_and_maybe_alert,
+    record_llm_slow_and_maybe_alert,
+)
 from app.shared.rate_limit import check_rate_limit
 
 import redis.asyncio as redis_async
@@ -251,6 +255,7 @@ async def messages(
     llm_messages.append({"role": "user", "content": payload.question})
 
     # ----- BACK-11: Llamada al LLM (con retry interno en LLMProvider) -----
+    llm_start = time.perf_counter()
     try:
         result = await llm.chat_completion(llm_messages)
     except Exception as exc:
@@ -258,10 +263,14 @@ async def messages(
             "LLM call failed",
             extra={"error": str(exc), "type": type(exc).__name__},
         )
+        await record_llm_failure_and_maybe_alert(redis, endpoint="messages", error=exc)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="El asistente no está disponible temporalmente",
         ) from exc
+
+    llm_latency_ms = (time.perf_counter() - llm_start) * 1000
+    await record_llm_slow_and_maybe_alert(redis, endpoint="messages", latency_ms=llm_latency_ms)
 
     # ----- BACK-12: Persistir mensaje del asistente con token counts -----
     assistant_message = Message(
@@ -491,6 +500,7 @@ async def messages_stream(
                 # Stream del LLM.
                 full_text_parts: list[str] = []
                 usage_seen: StreamUsage | None = None
+                llm_start = time.perf_counter()
 
                 async for chunk in llm.chat_completion_stream(llm_messages):
                     if isinstance(chunk, StreamToken):
@@ -505,6 +515,10 @@ async def messages_stream(
                         usage_seen = chunk
 
                 full_text = "".join(full_text_parts)
+                llm_latency_ms = (time.perf_counter() - llm_start) * 1000
+                await record_llm_slow_and_maybe_alert(
+                    redis, endpoint="stream", latency_ms=llm_latency_ms
+                )
 
                 # Persistir el mensaje completo del asistente.
                 assistant_message = Message(
@@ -598,6 +612,12 @@ async def messages_stream(
                     extra={"error": str(exc), "type": type(exc).__name__},
                     exc_info=True,
                 )
+                # Este except también puede capturar fallas de DB/retrieval, no
+                # solo del LLM — pero en la práctica el LLM es la causa más
+                # probable acá (retrieval ya tiene su propio try/except arriba),
+                # y contar de más algo que no era LLM es un falso positivo
+                # aceptable para un piloto.
+                await record_llm_failure_and_maybe_alert(redis, endpoint="stream", error=exc)
                 yield (
                     "data: " + json.dumps({
                         "type": "error",

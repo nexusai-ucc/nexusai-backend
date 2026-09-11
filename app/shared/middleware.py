@@ -12,6 +12,9 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
+from app.infrastructure.redis_client import get_redis
+from app.shared.error_monitoring import record_5xx_and_maybe_alert
+
 logger = logging.getLogger("nexusai.access")
 
 
@@ -46,5 +49,16 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
                 ensure_ascii=False,
             )
         )
+
+        if response.status_code >= 500:
+            try:
+                redis = await get_redis()
+                await record_5xx_and_maybe_alert(
+                    redis, status_code=response.status_code, path=request.url.path
+                )
+            except Exception as exc:
+                # No dejar que un fallo de alertas (p. ej. Redis caído) tumbe
+                # la response real que ya se generó.
+                logger.warning("record_5xx_and_maybe_alert falló: %s", exc)
 
         return response

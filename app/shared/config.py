@@ -92,6 +92,45 @@ class Settings(BaseSettings):
     rate_limit_per_user_daily: int = 50
     rate_limit_per_user_minute: int = 20
 
+    # Alertas mínimas (ver ADR-012 y app/shared/alerting.py).
+    #
+    # alert_webhook_url: URL de un webhook entrante (Slack "Incoming Webhook"
+    #   o Discord) donde se postean las notificaciones. Sin configurar, las
+    #   alertas quedan solo logueadas (WARNING) — no rompe nada, solo pierde
+    #   visibilidad automática.
+    #
+    # error_rate_*: ventana fija (mismo patrón que rate_limit.py) para avisar
+    #   si hay una ráfaga de respuestas 5xx.
+    #
+    # llm_failure_*: ídem pero contando fallas del LLM específicamente (el
+    #   proveedor agotó su cadena de fallback completa), que llegan al
+    #   cliente como 503 pero conviene diferenciar de un 5xx genérico porque
+    #   la causa y la acción a tomar son otras (cuota/proveedor caído).
+    #
+    # llm_slow_*: latencia del LLM. Una respuesta lenta no es un error (sigue
+    #   devolviendo 200), así que no la detecta el conteo de 5xx — necesita
+    #   su propio umbral.
+    alert_webhook_url: Optional[str] = None
+
+    error_rate_window_sec: int = 60
+    error_rate_threshold: int = 10
+
+    llm_failure_window_sec: int = 300
+    llm_failure_threshold: int = 3
+
+    # Cuota/presupuesto del proveedor de IA: una RateLimitError (429) que se
+    # propaga hasta el caller significa que la cadena ENTERA (primario +
+    # intermedios + secundario, ver providers/llm.py) devolvió "cuota
+    # agotada". Umbral bajo (1) porque, a diferencia de una falla transitoria
+    # cualquiera, esto ya implica que ningún eslabón configurado puede
+    # responder — vale la pena avisar de inmediato.
+    llm_quota_window_sec: int = 600
+    llm_quota_threshold: int = 1
+
+    llm_slow_threshold_ms: int = 15_000
+    llm_slow_window_sec: int = 300
+    llm_slow_threshold_count: int = 5
+
     # API
     api_port: int = 8001
 
