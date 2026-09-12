@@ -80,7 +80,9 @@ def mock_llm():
 @pytest.fixture
 def mock_redis():
     pipe = MagicMock()
-    pipe.execute = AsyncMock(return_value=[1, True])  # 1 request en la ventana, bajo el límite
+    pipe.execute = AsyncMock(
+        return_value=[1, True]
+    )  # 1 request en la ventana, bajo el límite
     redis_mock = MagicMock()
     redis_mock.pipeline.return_value = pipe
     return redis_mock
@@ -98,7 +100,9 @@ async def client(mock_db, mock_embeddings, mock_llm, mock_redis):
     app.dependency_overrides[get_llm_provider] = lambda: mock_llm
     app.dependency_overrides[get_redis] = lambda: mock_redis
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as c:
         yield c
 
 
@@ -130,7 +134,9 @@ async def test_messages_blocks_inappropriate_question_before_llm_answer(
     assert mock_llm.chat_completion.await_count == 1
 
 
-async def test_messages_allows_acceptable_question(client, mock_db, mock_embeddings, mock_llm):
+async def test_messages_allows_acceptable_question(
+    client, mock_db, mock_embeddings, mock_llm
+):
     with patch("app.shared.moderation.get_settings", return_value=_fake_settings()):
         mock_llm.chat_completion.side_effect = [
             MagicMock(text='{"flagged": false, "categories": []}'),  # clasificador

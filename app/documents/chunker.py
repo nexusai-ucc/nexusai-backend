@@ -20,7 +20,9 @@ class Chunk:
     token_count: int
 
 
-def chunk_text(text: str, max_tokens: int = 512, overlap_tokens: int = 64) -> List[Chunk]:
+def chunk_text(
+    text: str, max_tokens: int = 512, overlap_tokens: int = 64
+) -> List[Chunk]:
     """Split text into overlapping token chunks using cl100k_base tokenization."""
     if max_tokens <= 0:
         raise ValueError("max_tokens must be greater than 0")

@@ -46,7 +46,7 @@ Ver ADR-003 (decisión multi-provider) y ADR-004 (Gemini MVP / OpenAI prod).
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, AsyncIterator, Optional, Union
 
@@ -140,7 +140,9 @@ class LLMProvider:
         # llm_reasoning_effort. Cada call-site lo puede pisar pasando
         # `reasoning_effort=` a chat_completion/chat_stream.
         self.reasoning_effort: str = (
-            reasoning_effort if reasoning_effort is not None else settings.llm_reasoning_effort
+            reasoning_effort
+            if reasoning_effort is not None
+            else settings.llm_reasoning_effort
         )
         self.client: AsyncOpenAI = AsyncOpenAI(
             api_key=api_key or settings.llm_api_key,
@@ -207,6 +209,9 @@ class LLMProvider:
         chain = [(self.client, self.model)]
         chain.extend((self.client, m) for m in self.intermediate_models)
         if self.fallback_client:
+            # Invariante de __init__: fallback_client solo se crea si
+            # llm_fallback_model también estaba seteado.
+            assert self.fallback_model is not None
             chain.append((self.fallback_client, self.fallback_model))
         return chain
 
@@ -265,9 +270,12 @@ class LLMProvider:
     ) -> Any:
         """Chat completion no-streaming con retry, contra el client/model dados."""
         return await async_retry(
+            # El SDK espera TypedDicts con "role" literal; dicts planos
+            # funcionan bien en runtime (se serializan igual) pero mypy no
+            # los matchea estructuralmente.
             lambda: client.chat.completions.create(
                 model=model,
-                messages=messages,
+                messages=messages,  # type: ignore[arg-type]
                 stream=False,
                 **kwargs,
             )
@@ -286,14 +294,19 @@ class LLMProvider:
         el comportamiento es idéntico al de antes de INFRA-01/INFRA-03."""
         for i, (client, model) in enumerate(chain):
             try:
-                return await LLMProvider._create_completion(client, model, messages, **kwargs)
+                return await LLMProvider._create_completion(
+                    client, model, messages, **kwargs
+                )
             except _FALLBACK_TRIGGERS as exc:
                 if i == len(chain) - 1:
                     raise
                 next_model = chain[i + 1][1]
                 logger.warning(
                     "LLM fallback activado: %s agotado (%s: %s). Pasando a %s.",
-                    model, type(exc).__name__, exc, next_model,
+                    model,
+                    type(exc).__name__,
+                    exc,
+                    next_model,
                 )
 
     async def _create_stream(
@@ -316,7 +329,7 @@ class LLMProvider:
             try:
                 return await client.chat.completions.create(
                     model=model,
-                    messages=messages,
+                    messages=messages,  # type: ignore[arg-type]
                     stream=True,
                     **kwargs,
                 )
@@ -326,7 +339,10 @@ class LLMProvider:
                 next_model = chain[i + 1][1]
                 logger.warning(
                     "LLM fallback activado (stream): %s agotado (%s: %s). Pasando a %s.",
-                    model, type(exc).__name__, exc, next_model,
+                    model,
+                    type(exc).__name__,
+                    exc,
+                    next_model,
                 )
 
     async def chat_stream(
@@ -396,6 +412,7 @@ class LLMProvider:
 # ============================================================
 # FastAPI Dependency
 # ============================================================
+
 
 @lru_cache(maxsize=1)
 def _cached_provider() -> LLMProvider:

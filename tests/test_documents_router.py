@@ -70,13 +70,16 @@ def _exec_result(scalar=None, scalars_all=None) -> MagicMock:
     """MagicMock que simula el valor de retorno de db.execute()."""
     r = MagicMock()
     r.scalar_one_or_none.return_value = scalar
-    r.scalars.return_value.all.return_value = scalars_all if scalars_all is not None else []
+    r.scalars.return_value.all.return_value = (
+        scalars_all if scalars_all is not None else []
+    )
     return r
 
 
 # ============================================================
 # Fixtures
 # ============================================================
+
 
 @pytest.fixture
 def mock_db():
@@ -88,9 +91,7 @@ def mock_db():
     """
     db = AsyncMock()
     db.execute.return_value = _exec_result()
-    db.add = MagicMock(
-        side_effect=lambda doc: setattr(doc, "id", doc.id or uuid4())
-    )
+    db.add = MagicMock(side_effect=lambda doc: setattr(doc, "id", doc.id or uuid4()))
     return db
 
 
@@ -112,7 +113,9 @@ async def client(mock_db, mock_embeddings):
     app.dependency_overrides[get_db] = lambda: mock_db
     app.dependency_overrides[get_embedding_provider] = lambda: mock_embeddings
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as c:
         yield c
 
 
@@ -126,6 +129,7 @@ def _no_bg_task():
 # ============================================================
 # POST /api/v1/documents — validaciones
 # ============================================================
+
 
 async def test_upload_rejects_unsupported_mime_type(client):
     payload = {**_BASE_PAYLOAD, "mime_type": "image/png"}
@@ -143,6 +147,7 @@ async def test_upload_rejects_invalid_base64(client):
 # ============================================================
 # POST /api/v1/documents — happy path (nuevo documento)
 # ============================================================
+
 
 async def test_upload_new_document_returns_202(client, mock_db):
     """Documento nuevo: crea el record en DB y devuelve 202 con status=pending."""
@@ -182,7 +187,10 @@ async def test_upload_without_section_defaults_to_none(client, mock_db):
 # POST /api/v1/documents — persistencia en disco (reindex/download)
 # ============================================================
 
-async def test_upload_persists_file_to_disk_after_transient_failure(client, mock_db, tmp_path, monkeypatch):
+
+async def test_upload_persists_file_to_disk_after_transient_failure(
+    client, mock_db, tmp_path, monkeypatch
+):
     """Un blip transitorio de disco en el primer intento no debe perder el
     archivo — el reintento (_persist_file_to_disk) lo guarda igual."""
     monkeypatch.setattr("app.documents.router.UPLOADS_DIR", tmp_path)
@@ -209,7 +217,9 @@ async def test_upload_persists_file_to_disk_after_transient_failure(client, mock
     assert calls["n"] == 2  # falló una vez, se recuperó en el reintento
 
 
-async def test_upload_persistent_disk_failure_still_returns_success(client, mock_db, tmp_path, monkeypatch, caplog):
+async def test_upload_persistent_disk_failure_still_returns_success(
+    client, mock_db, tmp_path, monkeypatch, caplog
+):
     """Si el disco sigue fallando después de reintentar, el upload/indexación
     NO se rompe (usa los bytes en memoria) — pero ahora queda logueado como
     error (antes: warning atrapado en silencio, sin exc_info)."""
@@ -265,6 +275,7 @@ async def test_upload_persist_db_commit_failure_still_returns_success(
 # POST /api/v1/documents — dedup CONT-04
 # ============================================================
 
+
 async def test_upload_existing_hash_returns_200(client, mock_db):
     """Si el mismo archivo ya está indexado, devuelve 200 con el doc existente."""
     existing = _make_doc(status="indexed")
@@ -283,6 +294,7 @@ async def test_upload_existing_hash_returns_200(client, mock_db):
 # ============================================================
 # GET /api/v1/documents — lista por curso
 # ============================================================
+
 
 async def test_list_documents_empty(client, mock_db):
     """Curso sin documentos → lista vacía."""
@@ -319,7 +331,9 @@ async def test_list_documents_includes_timestamps(client, mock_db):
     assert items[1]["error_message"] == "embedding falló"
 
 
-async def test_list_documents_total_reflects_course_count_not_page_size(client, mock_db):
+async def test_list_documents_total_reflects_course_count_not_page_size(
+    client, mock_db
+):
     """UX-17 (#387): total es la cantidad real de documentos del curso, no
     la cantidad de items ya recortada por limit — así el frontend sabe si
     hay más para paginar."""
@@ -354,6 +368,7 @@ async def test_list_documents_without_limit_uses_default_cap(client, mock_db):
 # GET /api/v1/documents/{id} — estado individual
 # ============================================================
 
+
 async def test_get_document_status_found(client, mock_db):
     doc = _make_doc(status="indexing")
     mock_db.execute.return_value = _exec_result(scalar=doc)
@@ -375,6 +390,7 @@ async def test_get_document_status_not_found(client, mock_db):
 # ============================================================
 # GET /api/v1/documents/{id}/preview — CONT-08 (#357)
 # ============================================================
+
 
 async def test_document_preview_returns_extracted_text(client, mock_db):
     doc = _make_doc(status="indexed")
@@ -429,6 +445,7 @@ async def test_document_preview_not_found(client, mock_db):
 # DELETE /api/v1/documents/{id}
 # ============================================================
 
+
 async def test_delete_document_returns_204(client, mock_db):
     doc = _make_doc(status="indexed")
     mock_db.execute.return_value = _exec_result(scalar=doc)
@@ -463,7 +480,9 @@ _REPLACE_PAYLOAD: dict = {
 async def test_replace_document_not_found(client, mock_db):
     mock_db.execute.return_value = _exec_result(scalar=None)
 
-    response = await client.post(f"/api/v1/documents/{uuid4()}/replace", json=_REPLACE_PAYLOAD)
+    response = await client.post(
+        f"/api/v1/documents/{uuid4()}/replace", json=_REPLACE_PAYLOAD
+    )
 
     assert response.status_code == 404
 
@@ -493,7 +512,9 @@ async def test_replace_document_keeps_same_id_and_resets_status(client, mock_db)
     doc = _make_doc(status="error", error_message="algo falló antes")
     mock_db.execute.return_value = _exec_result(scalar=doc)
 
-    response = await client.post(f"/api/v1/documents/{doc.id}/replace", json=_REPLACE_PAYLOAD)
+    response = await client.post(
+        f"/api/v1/documents/{doc.id}/replace", json=_REPLACE_PAYLOAD
+    )
 
     assert response.status_code == 202
     data = response.json()
@@ -503,7 +524,9 @@ async def test_replace_document_keeps_same_id_and_resets_status(client, mock_db)
     assert data["error_message"] is None
 
 
-async def test_replace_document_keeps_old_file_when_new_save_fails(client, mock_db, tmp_path, monkeypatch):
+async def test_replace_document_keeps_old_file_when_new_save_fails(
+    client, mock_db, tmp_path, monkeypatch
+):
     """Si el guardado del archivo nuevo falla (persistentemente, tras
     reintentar), NO debe borrarse el archivo viejo — perderíamos el único
     que sí está bien guardado en disco."""
@@ -517,7 +540,9 @@ async def test_replace_document_keeps_old_file_when_new_save_fails(client, mock_
 
     monkeypatch.setattr(Path, "write_bytes", always_fails)
 
-    response = await client.post(f"/api/v1/documents/{doc.id}/replace", json=_REPLACE_PAYLOAD)
+    response = await client.post(
+        f"/api/v1/documents/{doc.id}/replace", json=_REPLACE_PAYLOAD
+    )
 
     assert response.status_code == 202
     assert (tmp_path / "old-stored.pdf").exists()  # no se borró
@@ -542,6 +567,7 @@ async def test_replace_document_deletes_old_chunks_before_reindexing(client, moc
 # POST /{document_id}/reindex — CONT-09 (#358)
 # ============================================================
 
+
 async def test_reindex_document_not_found(client, mock_db):
     mock_db.execute.return_value = _exec_result(scalar=None)
 
@@ -559,7 +585,9 @@ async def test_reindex_document_without_storage_path_returns_409(client, mock_db
     assert response.status_code == 409
 
 
-async def test_reindex_document_missing_file_on_disk_returns_409(client, mock_db, tmp_path, monkeypatch):
+async def test_reindex_document_missing_file_on_disk_returns_409(
+    client, mock_db, tmp_path, monkeypatch
+):
     """storage_path apunta a un archivo, pero ya no está en disco (borrado a
     mano, migración de servidor, etc.) — mismo 409 que sin storage_path."""
     doc = _make_doc(status="indexed", storage_path="does-not-exist.pdf")
@@ -571,11 +599,15 @@ async def test_reindex_document_missing_file_on_disk_returns_409(client, mock_db
     assert response.status_code == 409
 
 
-async def test_reindex_document_success_resets_status_and_deletes_old_chunks(client, mock_db, tmp_path, monkeypatch):
+async def test_reindex_document_success_resets_status_and_deletes_old_chunks(
+    client, mock_db, tmp_path, monkeypatch
+):
     """Reindexar lee el archivo YA guardado en disco (no recibe contenido
     nuevo) — borra los chunks viejos (guard CONT-04), vuelve el status a
     'pending' y limpia error_message previo, y dispara la re-indexación."""
-    doc = _make_doc(status="error", error_message="algo falló antes", storage_path="stored.pdf")
+    doc = _make_doc(
+        status="error", error_message="algo falló antes", storage_path="stored.pdf"
+    )
     mock_db.execute.return_value = _exec_result(scalar=doc)
     monkeypatch.setattr("app.documents.router.UPLOADS_DIR", tmp_path)
     (tmp_path / "stored.pdf").write_bytes(_PDF_BYTES)

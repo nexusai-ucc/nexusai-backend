@@ -81,7 +81,11 @@ async def _cache_get(cache: Any, key: str) -> Optional[dict]:
     try:
         raw = await cache.get(key)
     except Exception as exc:
-        logger.warning("Cache de resúmenes no disponible en lectura: %s: %s", type(exc).__name__, exc)
+        logger.warning(
+            "Cache de resúmenes no disponible en lectura: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
         return None
 
     if not raw:
@@ -104,7 +108,11 @@ async def _cache_set(cache: Any, key: str, value: dict, ttl_sec: int) -> None:
     try:
         await cache.setex(key, ttl_sec, json.dumps(value, ensure_ascii=False))
     except Exception as exc:
-        logger.warning("Cache de resúmenes no disponible en escritura: %s: %s", type(exc).__name__, exc)
+        logger.warning(
+            "Cache de resúmenes no disponible en escritura: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
 
 
 async def _load_document_for_summary(
@@ -126,15 +134,15 @@ async def _load_document_for_summary(
         LookupError: si el documento no existe, no pertenece al course_id, o
                      no tiene chunks indexados.
     """
-    doc_result = await db.execute(
-        select(Document).where(Document.id == document_id)
-    )
+    doc_result = await db.execute(select(Document).where(Document.id == document_id))
     document = doc_result.scalar_one_or_none()
 
     if document is None:
         raise LookupError(f"Document {document_id} not found")
     if document.course_id != course_id:
-        raise LookupError(f"Document {document_id} does not belong to course {course_id}")
+        raise LookupError(
+            f"Document {document_id} does not belong to course {course_id}"
+        )
 
     chunks_result = await db.execute(
         select(Chunk.content, Chunk.chunk_index)
@@ -323,7 +331,9 @@ async def summarize_pre_exam(
         try:
             loaded.append(await _load_document_for_summary(doc_id, course_id, db))
         except LookupError as exc:
-            logger.warning("Pre-exam summary: skipping document %s (%s): %s", doc_id, filename, exc)
+            logger.warning(
+                "Pre-exam summary: skipping document %s (%s): %s", doc_id, filename, exc
+            )
             continue
 
     if not loaded:
@@ -347,7 +357,9 @@ async def summarize_pre_exam(
                 # mismo criterio que antes de PERF-02.
                 logger.warning(
                     "Pre-exam summary: skipping document %s (%s): %s",
-                    document.id, document.filename, exc,
+                    document.id,
+                    document.filename,
+                    exc,
                 )
                 return None
 

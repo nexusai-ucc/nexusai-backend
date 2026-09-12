@@ -83,7 +83,9 @@ async def test_permite_hasta_el_limite_diario(fake_redis_counter: FakeRedis) -> 
     # Ninguna de las 50 llamadas anteriores debería haber lanzado.
 
 
-async def test_bloquea_al_superar_el_limite_diario(fake_redis_counter: FakeRedis) -> None:
+async def test_bloquea_al_superar_el_limite_diario(
+    fake_redis_counter: FakeRedis,
+) -> None:
     """La consulta número 51 (con limit=50) debe devolver 429 con scope=daily."""
     for _ in range(50):
         await check_rate_limit(

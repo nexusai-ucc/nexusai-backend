@@ -149,7 +149,10 @@ def _ocr_pdf(file_bytes: bytes) -> list[str]:
 
 def _extract_docx(file_bytes: bytes) -> str:
     try:
-        from docx import Document  # python-docx — importación lazy para no afectar startup
+        from docx import (
+            Document,
+        )  # python-docx — importación lazy para no afectar startup
+
         doc = Document(BytesIO(file_bytes))
     except Exception as exc:
         raise ValueError(

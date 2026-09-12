@@ -40,7 +40,9 @@ async def client(mock_llm):
     app.dependency_overrides[verify_hmac] = lambda: b"test-body"
     app.dependency_overrides[get_llm_provider] = lambda: mock_llm
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as c:
         yield c
 
 
@@ -71,7 +73,9 @@ async def test_evaluate_allows_acceptable_answer(client, mock_llm):
     with patch("app.shared.moderation.get_settings", return_value=_fake_settings()):
         mock_llm.chat_completion.side_effect = [
             MagicMock(text='{"flagged": false, "categories": []}'),
-            MagicMock(text='{"correct": true, "score": 0.9, "feedback": "Buena respuesta."}'),
+            MagicMock(
+                text='{"correct": true, "score": 0.9, "feedback": "Buena respuesta."}'
+            ),
         ]
 
         response = await client.post("/api/v1/quiz/evaluate", json=_EVALUATE_PAYLOAD)

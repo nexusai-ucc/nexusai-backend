@@ -10,7 +10,6 @@ POST /api/v1/calendar/alerts/mark-notified Marca alerta como notificada
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
 from typing import Annotated, List
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -29,6 +28,7 @@ router = APIRouter()
 # ============================================================
 # Schemas
 # ============================================================
+
 
 class SaveAlertRequest(BaseModel):
     user_id: int = Field(gt=0)
@@ -83,6 +83,7 @@ class MarkNotifiedResponse(BaseModel):
 # Endpoints
 # ============================================================
 
+
 @router.post("/save", response_model=SaveAlertResponse)
 async def save_alert(
     payload: SaveAlertRequest,
@@ -127,6 +128,7 @@ async def save_alert(
     result = await db.execute(stmt)
     await db.commit()
     row = result.fetchone()
+    assert row is not None  # RETURNING de un upsert siempre devuelve una fila.
     return SaveAlertResponse(id=str(row.id), days_before=row.days_before)
 
 
@@ -146,7 +148,9 @@ async def list_alerts(
 
     return AlertsListResponse(
         alerts=[
-            AlertItem(event_id=r.event_id, days_before=r.days_before, notified=r.notified)
+            AlertItem(
+                event_id=r.event_id, days_before=r.days_before, notified=r.notified
+            )
             for r in rows
         ]
     )
@@ -161,9 +165,7 @@ async def alerts_due(
     stmt = select(CalendarAlert).where(
         CalendarAlert.days_before > 0,
         CalendarAlert.notified.is_(False),
-        text(
-            "to_timestamp(event_timestamp) - days_before * interval '1 day' <= now()"
-        ),
+        text("to_timestamp(event_timestamp) - days_before * interval '1 day' <= now()"),
     )
     result = await db.execute(stmt)
     rows = result.scalars().all()
@@ -192,7 +194,9 @@ async def mark_notified(
     try:
         alert_uuid = uuid.UUID(payload.alert_id)
     except ValueError:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="alert_id inválido")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="alert_id inválido"
+        )
 
     await db.execute(
         update(CalendarAlert)

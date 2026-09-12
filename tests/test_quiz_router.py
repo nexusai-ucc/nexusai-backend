@@ -24,12 +24,13 @@ from app.auth.hmac import verify_hmac
 from app.db.session import get_db
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
-from app.quiz.router import ExamGenerateRequest, FocusTopic, QuizRequest, _build_quiz_prompt
+from app.quiz.router import ExamGenerateRequest, QuizRequest, _build_quiz_prompt
 
 
 # ─────────────────────────────────────────────────────────────
 # Validación de QuizRequest
 # ─────────────────────────────────────────────────────────────
+
 
 def test_quiz_request_accepts_flashcard_type():
     req = QuizRequest(course_id=1, user_id=1, question_type="flashcard")
@@ -56,11 +57,15 @@ def test_quiz_request_rejects_invalid_difficulty():
 # _build_quiz_prompt — lógica pura, sin DB ni LLM
 # ─────────────────────────────────────────────────────────────
 
-_CHUNKS = [("apunte1.pdf", "El teorema de Bayes relaciona probabilidades condicionales.")]
+_CHUNKS = [
+    ("apunte1.pdf", "El teorema de Bayes relaciona probabilidades condicionales.")
+]
 
 
 def test_build_quiz_prompt_flashcard_schema():
-    messages = _build_quiz_prompt(_CHUNKS, num_questions=3, topic=None, question_type="flashcard")
+    messages = _build_quiz_prompt(
+        _CHUNKS, num_questions=3, topic=None, question_type="flashcard"
+    )
     user_msg = messages[1]["content"]
     assert '"question_type": "flashcard"' in user_msg
     assert '"correct_index": -1' in user_msg
@@ -70,25 +75,38 @@ def test_build_quiz_prompt_flashcard_schema():
 @pytest.mark.parametrize("difficulty", ["easy", "medium", "hard"])
 def test_build_quiz_prompt_includes_difficulty_instruction(difficulty):
     messages = _build_quiz_prompt(
-        _CHUNKS, num_questions=3, topic=None, question_type="multiple_choice", difficulty=difficulty
+        _CHUNKS,
+        num_questions=3,
+        topic=None,
+        question_type="multiple_choice",
+        difficulty=difficulty,
     )
     system_msg = messages[0]["content"]
-    assert difficulty.upper() in system_msg or {
-        "easy": "FÁCIL",
-        "medium": "MEDIA",
-        "hard": "DIFÍCIL",
-    }[difficulty] in system_msg
+    assert (
+        difficulty.upper() in system_msg
+        or {
+            "easy": "FÁCIL",
+            "medium": "MEDIA",
+            "hard": "DIFÍCIL",
+        }[difficulty]
+        in system_msg
+    )
 
 
 def test_build_quiz_prompt_defaults_to_medium_difficulty():
-    with_default = _build_quiz_prompt(_CHUNKS, num_questions=3, topic=None, question_type="open")
-    with_explicit = _build_quiz_prompt(_CHUNKS, num_questions=3, topic=None, question_type="open", difficulty="medium")
+    with_default = _build_quiz_prompt(
+        _CHUNKS, num_questions=3, topic=None, question_type="open"
+    )
+    with_explicit = _build_quiz_prompt(
+        _CHUNKS, num_questions=3, topic=None, question_type="open", difficulty="medium"
+    )
     assert with_default[0]["content"] == with_explicit[0]["content"]
 
 
 # ─────────────────────────────────────────────────────────────
 # Fixtures — endpoint end-to-end con dependencias mockeadas
 # ─────────────────────────────────────────────────────────────
+
 
 @pytest.fixture
 def mock_db():
@@ -146,13 +164,16 @@ async def client(mock_db, mock_embeddings, mock_llm):
     app.dependency_overrides[get_embedding_provider] = lambda: mock_embeddings
     app.dependency_overrides[get_llm_provider] = lambda: mock_llm
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as c:
         yield c
 
 
 # ─────────────────────────────────────────────────────────────
 # POST /generate — flashcards + dificultad
 # ─────────────────────────────────────────────────────────────
+
 
 async def test_generate_flashcards_returns_200_with_expected_shape(client):
     payload = {
@@ -186,6 +207,7 @@ async def test_generate_rejects_invalid_difficulty_at_http_level(client):
 # POST /suggest-difficulty (SP-12 / #322)
 # ─────────────────────────────────────────────────────────────
 
+
 def _attempt_row(**kwargs):
     defaults = dict(topic="derivadas", score=0.5, created_at=datetime.now(timezone.utc))
     defaults.update(kwargs)
@@ -198,7 +220,9 @@ _SUGGEST_PAYLOAD = {"course_id": 1, "user_id": 1}
 async def test_suggest_difficulty_no_history_returns_null(client, mock_db):
     mock_db.execute.return_value = _mock_quiz_result([])
 
-    response = await client.post("/api/v1/quiz/suggest-difficulty", json=_SUGGEST_PAYLOAD)
+    response = await client.post(
+        "/api/v1/quiz/suggest-difficulty", json=_SUGGEST_PAYLOAD
+    )
 
     assert response.status_code == 200
     data = response.json()
@@ -207,11 +231,17 @@ async def test_suggest_difficulty_no_history_returns_null(client, mock_db):
 
 
 async def test_suggest_difficulty_high_scores_suggest_hard(client, mock_db):
-    mock_db.execute.return_value = _mock_quiz_result([
-        _attempt_row(score=0.9), _attempt_row(score=1.0), _attempt_row(score=0.85),
-    ])
+    mock_db.execute.return_value = _mock_quiz_result(
+        [
+            _attempt_row(score=0.9),
+            _attempt_row(score=1.0),
+            _attempt_row(score=0.85),
+        ]
+    )
 
-    response = await client.post("/api/v1/quiz/suggest-difficulty", json=_SUGGEST_PAYLOAD)
+    response = await client.post(
+        "/api/v1/quiz/suggest-difficulty", json=_SUGGEST_PAYLOAD
+    )
 
     data = response.json()
     assert data["difficulty"] == "hard"
@@ -220,11 +250,16 @@ async def test_suggest_difficulty_high_scores_suggest_hard(client, mock_db):
 
 
 async def test_suggest_difficulty_low_scores_suggest_easy(client, mock_db):
-    mock_db.execute.return_value = _mock_quiz_result([
-        _attempt_row(score=0.2), _attempt_row(score=0.3),
-    ])
+    mock_db.execute.return_value = _mock_quiz_result(
+        [
+            _attempt_row(score=0.2),
+            _attempt_row(score=0.3),
+        ]
+    )
 
-    response = await client.post("/api/v1/quiz/suggest-difficulty", json=_SUGGEST_PAYLOAD)
+    response = await client.post(
+        "/api/v1/quiz/suggest-difficulty", json=_SUGGEST_PAYLOAD
+    )
 
     data = response.json()
     assert data["difficulty"] == "easy"
@@ -233,7 +268,9 @@ async def test_suggest_difficulty_low_scores_suggest_easy(client, mock_db):
 async def test_suggest_difficulty_mid_scores_suggest_medium(client, mock_db):
     mock_db.execute.return_value = _mock_quiz_result([_attempt_row(score=0.6)])
 
-    response = await client.post("/api/v1/quiz/suggest-difficulty", json=_SUGGEST_PAYLOAD)
+    response = await client.post(
+        "/api/v1/quiz/suggest-difficulty", json=_SUGGEST_PAYLOAD
+    )
 
     assert response.json()["difficulty"] == "medium"
 
@@ -242,11 +279,17 @@ async def test_suggest_difficulty_filters_by_topic_case_insensitive(client, mock
     """El mock no valida la query en sí — esto confirma que el payload con
     topic llega bien al endpoint y no rompe nada (el filtro real se prueba
     end-to-end contra una DB real, fuera del alcance de este entorno)."""
-    mock_db.execute.return_value = _mock_quiz_result([_attempt_row(topic="Derivadas", score=0.9)])
+    mock_db.execute.return_value = _mock_quiz_result(
+        [_attempt_row(topic="Derivadas", score=0.9)]
+    )
 
-    response = await client.post("/api/v1/quiz/suggest-difficulty", json={
-        **_SUGGEST_PAYLOAD, "topic": "derivadas",
-    })
+    response = await client.post(
+        "/api/v1/quiz/suggest-difficulty",
+        json={
+            **_SUGGEST_PAYLOAD,
+            "topic": "derivadas",
+        },
+    )
 
     assert response.status_code == 200
     assert response.json()["difficulty"] == "hard"
@@ -255,6 +298,7 @@ async def test_suggest_difficulty_filters_by_topic_case_insensitive(client, mock
 # ─────────────────────────────────────────────────────────────
 # POST /study-plan — combina QuizError + UnansweredQuestion
 # ─────────────────────────────────────────────────────────────
+
 
 def _quiz_error_row(**kwargs):
     defaults = dict(
@@ -394,6 +438,7 @@ async def test_study_plan_ignores_out_of_range_group_indices(client, mock_db, mo
 # POST /study-plan — quiz_error_ids/gap_question_ids (SP-13 / #323)
 # ─────────────────────────────────────────────────────────────
 
+
 async def test_study_plan_topic_exposes_underlying_row_ids(client, mock_db, mock_llm):
     """El topic es texto del LLM, no una clave estable — el descarte (SP-13)
     opera sobre estos IDs reales, no sobre el texto."""
@@ -429,12 +474,15 @@ _DISMISS_ID_2 = str(uuid4())
 async def test_study_plan_dismiss_updates_quiz_errors_only(client, mock_db):
     mock_db.execute.return_value = MagicMock(rowcount=2)
 
-    response = await client.post("/api/v1/quiz/study-plan/dismiss", json={
-        "course_id": 1,
-        "user_id": 1,
-        "quiz_error_ids": [_DISMISS_ID_1, _DISMISS_ID_2],
-        "gap_question_ids": [],
-    })
+    response = await client.post(
+        "/api/v1/quiz/study-plan/dismiss",
+        json={
+            "course_id": 1,
+            "user_id": 1,
+            "quiz_error_ids": [_DISMISS_ID_1, _DISMISS_ID_2],
+            "gap_question_ids": [],
+        },
+    )
 
     assert response.status_code == 200
     assert response.json()["affected"] == 2
@@ -449,12 +497,15 @@ async def test_study_plan_dismiss_updates_quiz_errors_only(client, mock_db):
 async def test_study_plan_dismiss_updates_both_tables(client, mock_db):
     mock_db.execute.return_value = MagicMock(rowcount=1)
 
-    response = await client.post("/api/v1/quiz/study-plan/dismiss", json={
-        "course_id": 1,
-        "user_id": 1,
-        "quiz_error_ids": [_DISMISS_ID_1],
-        "gap_question_ids": [_DISMISS_ID_2],
-    })
+    response = await client.post(
+        "/api/v1/quiz/study-plan/dismiss",
+        json={
+            "course_id": 1,
+            "user_id": 1,
+            "quiz_error_ids": [_DISMISS_ID_1],
+            "gap_question_ids": [_DISMISS_ID_2],
+        },
+    )
 
     assert response.status_code == 200
     assert response.json()["affected"] == 2  # 1 + 1
@@ -465,12 +516,15 @@ async def test_study_plan_dismiss_updates_both_tables(client, mock_db):
 
 
 async def test_study_plan_dismiss_noop_without_ids(client, mock_db):
-    response = await client.post("/api/v1/quiz/study-plan/dismiss", json={
-        "course_id": 1,
-        "user_id": 1,
-        "quiz_error_ids": [],
-        "gap_question_ids": [],
-    })
+    response = await client.post(
+        "/api/v1/quiz/study-plan/dismiss",
+        json={
+            "course_id": 1,
+            "user_id": 1,
+            "quiz_error_ids": [],
+            "gap_question_ids": [],
+        },
+    )
 
     assert response.status_code == 200
     assert response.json()["affected"] == 0
@@ -506,12 +560,18 @@ def test_exam_request_rejects_non_uuid_document_id():
 def test_exam_request_rejects_flashcard_type():
     # flashcard es válido para el quiz de alumno pero no tiene sentido en un examen.
     with pytest.raises(ValidationError):
-        ExamGenerateRequest(course_id=1, user_id=5, document_ids=[_VALID_DOC_ID], question_type="flashcard")
+        ExamGenerateRequest(
+            course_id=1,
+            user_id=5,
+            document_ids=[_VALID_DOC_ID],
+            question_type="flashcard",
+        )
 
 
 # ─────────────────────────────────────────────────────────────
 # focus_topics — temas con dificultad detectada (DOC-D09 / issue #390)
 # ─────────────────────────────────────────────────────────────
+
 
 def test_exam_request_defaults_to_no_focus_topics():
     req = ExamGenerateRequest(course_id=1, user_id=5, document_ids=[_VALID_DOC_ID])
@@ -520,7 +580,9 @@ def test_exam_request_defaults_to_no_focus_topics():
 
 def test_exam_request_accepts_gap_and_faq_focus_topics():
     req = ExamGenerateRequest(
-        course_id=1, user_id=5, document_ids=[_VALID_DOC_ID],
+        course_id=1,
+        user_id=5,
+        document_ids=[_VALID_DOC_ID],
         focus_topics=[
             {"label": "derivadas de orden superior", "source": "gap"},
             {"label": "teorema de Bayes", "source": "faq"},
@@ -532,7 +594,9 @@ def test_exam_request_accepts_gap_and_faq_focus_topics():
 def test_exam_request_rejects_invalid_focus_topic_source():
     with pytest.raises(ValidationError):
         ExamGenerateRequest(
-            course_id=1, user_id=5, document_ids=[_VALID_DOC_ID],
+            course_id=1,
+            user_id=5,
+            document_ids=[_VALID_DOC_ID],
             focus_topics=[{"label": "x", "source": "made_up"}],
         )
 
@@ -540,12 +604,17 @@ def test_exam_request_rejects_invalid_focus_topic_source():
 def test_exam_request_rejects_too_many_focus_topics():
     topics = [{"label": f"tema {i}", "source": "gap"} for i in range(16)]
     with pytest.raises(ValidationError):
-        ExamGenerateRequest(course_id=1, user_id=5, document_ids=[_VALID_DOC_ID], focus_topics=topics)
+        ExamGenerateRequest(
+            course_id=1, user_id=5, document_ids=[_VALID_DOC_ID], focus_topics=topics
+        )
 
 
 def test_build_quiz_prompt_includes_focus_topics_block():
     messages = _build_quiz_prompt(
-        _CHUNKS, num_questions=3, topic=None, question_type="multiple_choice",
+        _CHUNKS,
+        num_questions=3,
+        topic=None,
+        question_type="multiple_choice",
         focus_topics=["derivadas de orden superior", "teorema de Bayes"],
     )
     user_msg = messages[1]["content"]
@@ -555,7 +624,9 @@ def test_build_quiz_prompt_includes_focus_topics_block():
 
 
 def test_build_quiz_prompt_omits_focus_topics_block_when_empty():
-    messages = _build_quiz_prompt(_CHUNKS, num_questions=3, topic=None, question_type="multiple_choice")
+    messages = _build_quiz_prompt(
+        _CHUNKS, num_questions=3, topic=None, question_type="multiple_choice"
+    )
     user_msg = messages[1]["content"]
     assert "TEMAS CON DIFICULTAD DETECTADA" not in user_msg
 
@@ -563,6 +634,7 @@ def test_build_quiz_prompt_omits_focus_topics_block_when_empty():
 # ─────────────────────────────────────────────────────────────
 # POST /generate-exam — endpoint end-to-end
 # ─────────────────────────────────────────────────────────────
+
 
 async def test_generate_exam_returns_200_with_expected_shape(client):
     payload = {
@@ -600,45 +672,57 @@ async def test_generate_exam_404_when_no_chunks_for_selected_documents(client, m
 
 async def test_generate_exam_keeps_source_topic_matching_focus_topics(client, mock_llm):
     llm_response = {
-        "questions": [{
-            "question_type": "multiple_choice",
-            "question": "¿Cuál es la derivada de x^2?",
-            "options": ["2x", "x", "x^2", "0"],
-            "correct_index": 0,
-            "explanation": "2x",
-            "source_filename": "apunte1.pdf",
-            "source_topic": "derivadas de orden superior",
-        }]
+        "questions": [
+            {
+                "question_type": "multiple_choice",
+                "question": "¿Cuál es la derivada de x^2?",
+                "options": ["2x", "x", "x^2", "0"],
+                "correct_index": 0,
+                "explanation": "2x",
+                "source_filename": "apunte1.pdf",
+                "source_topic": "derivadas de orden superior",
+            }
+        ]
     }
     mock_llm.chat_completion.return_value = MagicMock(text=json.dumps(llm_response))
     payload = {
-        "course_id": 1, "user_id": 9, "document_ids": [_VALID_DOC_ID], "num_questions": 1,
+        "course_id": 1,
+        "user_id": 9,
+        "document_ids": [_VALID_DOC_ID],
+        "num_questions": 1,
         "focus_topics": [{"label": "derivadas de orden superior", "source": "gap"}],
     }
 
     response = await client.post("/api/v1/quiz/generate-exam", json=payload)
 
     assert response.status_code == 200
-    assert response.json()["questions"][0]["source_topic"] == "derivadas de orden superior"
+    assert (
+        response.json()["questions"][0]["source_topic"] == "derivadas de orden superior"
+    )
 
 
 async def test_generate_exam_discards_hallucinated_source_topic(client, mock_llm):
     """DOC-D09: si el LLM inventa un source_topic que no está en la lista
     provista, se descarta en vez de citar un tema falso."""
     llm_response = {
-        "questions": [{
-            "question_type": "multiple_choice",
-            "question": "¿Cuál es la derivada de x^2?",
-            "options": ["2x", "x", "x^2", "0"],
-            "correct_index": 0,
-            "explanation": "2x",
-            "source_filename": "apunte1.pdf",
-            "source_topic": "tema inventado por el LLM",
-        }]
+        "questions": [
+            {
+                "question_type": "multiple_choice",
+                "question": "¿Cuál es la derivada de x^2?",
+                "options": ["2x", "x", "x^2", "0"],
+                "correct_index": 0,
+                "explanation": "2x",
+                "source_filename": "apunte1.pdf",
+                "source_topic": "tema inventado por el LLM",
+            }
+        ]
     }
     mock_llm.chat_completion.return_value = MagicMock(text=json.dumps(llm_response))
     payload = {
-        "course_id": 1, "user_id": 9, "document_ids": [_VALID_DOC_ID], "num_questions": 1,
+        "course_id": 1,
+        "user_id": 9,
+        "document_ids": [_VALID_DOC_ID],
+        "num_questions": 1,
         "focus_topics": [{"label": "derivadas de orden superior", "source": "gap"}],
     }
 
@@ -648,20 +732,29 @@ async def test_generate_exam_discards_hallucinated_source_topic(client, mock_llm
     assert response.json()["questions"][0]["source_topic"] is None
 
 
-async def test_generate_exam_without_focus_topics_never_sets_source_topic(client, mock_llm):
+async def test_generate_exam_without_focus_topics_never_sets_source_topic(
+    client, mock_llm
+):
     llm_response = {
-        "questions": [{
-            "question_type": "multiple_choice",
-            "question": "¿Cuál es la derivada de x^2?",
-            "options": ["2x", "x", "x^2", "0"],
-            "correct_index": 0,
-            "explanation": "2x",
-            "source_filename": "apunte1.pdf",
-            "source_topic": "algo que el LLM puso igual",
-        }]
+        "questions": [
+            {
+                "question_type": "multiple_choice",
+                "question": "¿Cuál es la derivada de x^2?",
+                "options": ["2x", "x", "x^2", "0"],
+                "correct_index": 0,
+                "explanation": "2x",
+                "source_filename": "apunte1.pdf",
+                "source_topic": "algo que el LLM puso igual",
+            }
+        ]
     }
     mock_llm.chat_completion.return_value = MagicMock(text=json.dumps(llm_response))
-    payload = {"course_id": 1, "user_id": 9, "document_ids": [_VALID_DOC_ID], "num_questions": 1}
+    payload = {
+        "course_id": 1,
+        "user_id": 9,
+        "document_ids": [_VALID_DOC_ID],
+        "num_questions": 1,
+    }
 
     response = await client.post("/api/v1/quiz/generate-exam", json=payload)
 
@@ -674,10 +767,16 @@ async def test_generate_exam_without_focus_topics_never_sets_source_topic(client
 # de quiz scores del dashboard docente.
 # ─────────────────────────────────────────────────────────────
 
+
 async def test_record_attempt_recomputes_score_from_answers(client, mock_db):
     # db.add() es sync en SQLAlchemy AsyncSession — MagicMock evita coroutine warning.
     mock_db.add = MagicMock()
-    payload = {"course_id": 1, "user_id": 9, "total_questions": 10, "correct_answers": 7}
+    payload = {
+        "course_id": 1,
+        "user_id": 9,
+        "total_questions": 10,
+        "correct_answers": 7,
+    }
 
     response = await client.post("/api/v1/quiz/attempts", json=payload)
 
@@ -732,14 +831,22 @@ async def test_record_attempt_rejects_zero_total_questions(client):
 
 
 async def test_record_attempt_rejects_negative_course_id(client):
-    payload = {"course_id": -1, "user_id": 9, "total_questions": 5, "correct_answers": 3}
+    payload = {
+        "course_id": -1,
+        "user_id": 9,
+        "total_questions": 5,
+        "correct_answers": 3,
+    }
 
     response = await client.post("/api/v1/quiz/attempts", json=payload)
+
+    assert response.status_code == 422
 
 
 # ─────────────────────────────────────────────────────────────
 # POST /errors/list — paginación (UX-19 / issue #389)
 # ─────────────────────────────────────────────────────────────
+
 
 def _stored_quiz_error_row(**kwargs):
     defaults = dict(
@@ -764,11 +871,15 @@ def _stored_quiz_error_row(**kwargs):
 _ERRORS_LIST_PAYLOAD = {"course_id": 1, "user_id": 1}
 
 
-async def test_list_quiz_errors_total_reflects_real_count_not_page_size(client, mock_db):
+async def test_list_quiz_errors_total_reflects_real_count_not_page_size(
+    client, mock_db
+):
     """Regresión UX-19: `total` debe ser el COUNT(*) real, no `len(items)`
     de la página devuelta — si no, el frontend nunca sabe que hay más."""
     mock_db.scalar.return_value = 37  # el alumno tiene 37 errores en total
-    mock_db.execute.return_value = _mock_quiz_result([_stored_quiz_error_row(), _stored_quiz_error_row()])
+    mock_db.execute.return_value = _mock_quiz_result(
+        [_stored_quiz_error_row(), _stored_quiz_error_row()]
+    )
 
     response = await client.post(
         "/api/v1/quiz/errors/list",
@@ -917,7 +1028,9 @@ async def test_flashcards_due_returns_questions_shaped_like_generate(client, moc
     assert q["correct_index"] == -1
 
 
-async def test_flashcards_review_batch_creates_new_review_and_applies_sm2(client, mock_db):
+async def test_flashcards_review_batch_creates_new_review_and_applies_sm2(
+    client, mock_db
+):
     flashcard_id = uuid4()
 
     valid_ids_result = MagicMock()
@@ -926,7 +1039,11 @@ async def test_flashcards_review_batch_creates_new_review_and_applies_sm2(client
     existing_reviews_result = MagicMock()
     existing_reviews_result.scalars.return_value.all.return_value = []
 
-    mock_db.execute.side_effect = [valid_ids_result, existing_reviews_result, MagicMock()]
+    mock_db.execute.side_effect = [
+        valid_ids_result,
+        existing_reviews_result,
+        MagicMock(),
+    ]
 
     response = await client.post(
         "/api/v1/quiz/flashcards/review-batch",
@@ -1028,11 +1145,13 @@ async def test_streak_endpoint_combines_quiz_and_chat_activity(client, mock_db):
     # qué día real corra la suite — el endpoint usa datetime.now() interno.
     now = datetime.now(timezone.utc)
     mock_db.execute.side_effect = [
-        _days_result([_day_row(now)]),                       # quiz: hoy
-        _days_result([_day_row(now - timedelta(days=1))]),   # chat: ayer
+        _days_result([_day_row(now)]),  # quiz: hoy
+        _days_result([_day_row(now - timedelta(days=1))]),  # chat: ayer
     ]
 
-    response = await client.post("/api/v1/quiz/streak", json={"course_id": 1, "user_id": 1})
+    response = await client.post(
+        "/api/v1/quiz/streak", json={"course_id": 1, "user_id": 1}
+    )
 
     assert response.status_code == 200
     data = response.json()
@@ -1043,7 +1162,9 @@ async def test_streak_endpoint_combines_quiz_and_chat_activity(client, mock_db):
 async def test_streak_endpoint_no_activity_returns_zero(client, mock_db):
     mock_db.execute.side_effect = [_days_result([]), _days_result([])]
 
-    response = await client.post("/api/v1/quiz/streak", json={"course_id": 1, "user_id": 1})
+    response = await client.post(
+        "/api/v1/quiz/streak", json={"course_id": 1, "user_id": 1}
+    )
 
     assert response.status_code == 200
     assert response.json() == {"current_streak": 0, "practiced_today": False}

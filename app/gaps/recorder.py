@@ -98,7 +98,9 @@ async def record_gap_if_needed(
     """
     try:
         no_chunks = chunks_count <= 0
-        weak_match = max_similarity is not None and max_similarity < WEAK_MATCH_THRESHOLD
+        weak_match = (
+            max_similarity is not None and max_similarity < WEAK_MATCH_THRESHOLD
+        )
         llm_said_no = llm_indicated_no_answer(llm_answer)
 
         if not (no_chunks or weak_match or llm_said_no):
@@ -113,7 +115,8 @@ async def record_gap_if_needed(
             except Exception as exc:
                 logger.warning(
                     "No se pudo embeddear el gap (se registra igual, sin embedding): %s: %s",
-                    type(exc).__name__, exc,
+                    type(exc).__name__,
+                    exc,
                 )
 
         gap = UnansweredQuestion(
@@ -127,7 +130,12 @@ async def record_gap_if_needed(
         db.add(gap)
         logger.info(
             "gap_recorded course_id=%d user_id=%d chunks=%d sim=%s llm_said_no=%s embedded=%s",
-            course_id, user_id, chunks_count, max_similarity, llm_said_no, vector is not None,
+            course_id,
+            user_id,
+            chunks_count,
+            max_similarity,
+            llm_said_no,
+            vector is not None,
         )
         return True
     except Exception as exc:

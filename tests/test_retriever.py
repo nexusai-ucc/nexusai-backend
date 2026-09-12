@@ -29,28 +29,39 @@ from app.documents.retriever import (
 # RetrievedChunk.similarity
 # ============================================================
 
+
 def test_similarity_distance_zero_means_perfect_match():
     """Distancia 0 (vectores idénticos) → similitud 1.0."""
-    c = RetrievedChunk(content="x", document_filename="a.pdf", chunk_index=0, distance=0.0)
+    c = RetrievedChunk(
+        content="x", document_filename="a.pdf", chunk_index=0, distance=0.0
+    )
     assert c.similarity == pytest.approx(1.0)
 
 
 def test_similarity_distance_two_means_opposite():
     """Distancia 2 (vectores opuestos) → similitud 0.0."""
-    c = RetrievedChunk(content="x", document_filename="a.pdf", chunk_index=0, distance=2.0)
+    c = RetrievedChunk(
+        content="x", document_filename="a.pdf", chunk_index=0, distance=2.0
+    )
     assert c.similarity == pytest.approx(0.0)
 
 
 def test_similarity_midpoint():
     """Distancia 1 (vectores ortogonales) → similitud 0.5."""
-    c = RetrievedChunk(content="x", document_filename="a.pdf", chunk_index=0, distance=1.0)
+    c = RetrievedChunk(
+        content="x", document_filename="a.pdf", chunk_index=0, distance=1.0
+    )
     assert c.similarity == pytest.approx(0.5)
 
 
 def test_similarity_clamps_to_zero_one_range():
     """Si por error la distancia es > 2 (no debería), no rompemos."""
-    c_neg = RetrievedChunk(content="x", document_filename="a.pdf", chunk_index=0, distance=-0.5)
-    c_huge = RetrievedChunk(content="x", document_filename="a.pdf", chunk_index=0, distance=3.0)
+    c_neg = RetrievedChunk(
+        content="x", document_filename="a.pdf", chunk_index=0, distance=-0.5
+    )
+    c_huge = RetrievedChunk(
+        content="x", document_filename="a.pdf", chunk_index=0, distance=3.0
+    )
     assert 0.0 <= c_neg.similarity <= 1.0
     assert 0.0 <= c_huge.similarity <= 1.0
 
@@ -58,6 +69,7 @@ def test_similarity_clamps_to_zero_one_range():
 # ============================================================
 # format_context_for_prompt
 # ============================================================
+
 
 def test_format_empty_list_returns_empty_string():
     assert format_context_for_prompt([]) == ""
@@ -82,7 +94,12 @@ def test_format_single_chunk_includes_filename_and_index():
 
 def test_format_multiple_chunks_are_numbered_sequentially():
     chunks = [
-        RetrievedChunk(content=f"contenido {i}", document_filename=f"doc{i}.pdf", chunk_index=i, distance=0.1)
+        RetrievedChunk(
+            content=f"contenido {i}",
+            document_filename=f"doc{i}.pdf",
+            chunk_index=i,
+            distance=0.1,
+        )
         for i in range(3)
     ]
     output = format_context_for_prompt(chunks)
@@ -101,7 +118,12 @@ def test_format_truncates_very_long_content():
     """Defensa contra prompt-injection: chunks > 800 chars se truncan."""
     long_content = "A" * 2000
     chunks = [
-        RetrievedChunk(content=long_content, document_filename="big.pdf", chunk_index=0, distance=0.1)
+        RetrievedChunk(
+            content=long_content,
+            document_filename="big.pdf",
+            chunk_index=0,
+            distance=0.1,
+        )
     ]
     output = format_context_for_prompt(chunks)
     # No debe contener los 2000 chars, debe tener "..." al final del fragmento.
@@ -112,6 +134,7 @@ def test_format_truncates_very_long_content():
 # ============================================================
 # retrieve_context — validaciones de input
 # ============================================================
+
 
 @pytest.mark.asyncio
 async def test_retrieve_context_rejects_empty_question():
@@ -126,7 +149,9 @@ async def test_retrieve_context_rejects_whitespace_question():
     db = MagicMock()
     embeddings = MagicMock()
     with pytest.raises(ValueError, match="non-empty"):
-        await retrieve_context(question="   \n\t  ", course_id=1, db=db, embeddings=embeddings)
+        await retrieve_context(
+            question="   \n\t  ", course_id=1, db=db, embeddings=embeddings
+        )
 
 
 @pytest.mark.asyncio
@@ -153,7 +178,10 @@ async def test_retrieve_context_rejects_negative_top_k():
 # retrieve_context — happy path
 # ============================================================
 
-def _fake_row(content: str, chunk_index: int, filename: str, distance: float) -> MagicMock:
+
+def _fake_row(
+    content: str, chunk_index: int, filename: str, distance: float
+) -> MagicMock:
     """Helper para construir filas mockeadas con los atributos que el código espera."""
     row = MagicMock()
     row.content = content

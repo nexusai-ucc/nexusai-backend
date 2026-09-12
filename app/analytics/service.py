@@ -18,7 +18,10 @@ from app.db.models import InteractionLog, Message
 
 class QuestionCount(NamedTuple):
     question: str
-    count: int
+    # El nombre "count" choca con el método heredado tuple.count() a nivel
+    # de tipos (no en runtime — NamedTuple sobreescribe el atributo sin
+    # problema). mypy lo marca igual como redefinición incompatible.
+    count: int  # type: ignore[assignment]
 
 
 async def get_daily_message_counts(
@@ -48,7 +51,12 @@ async def get_daily_message_counts(
     )
     result = await db.execute(stmt)
 
-    return {row.day.strftime("%Y-%m-%d"): int(row.count) for row in result.all()}
+    # row.count: mypy resuelve "count" contra tuple.count (heredado por Row)
+    # en vez de la columna labeleada "count" -- en runtime sí es la columna.
+    return {
+        row.day.strftime("%Y-%m-%d"): int(row.count)  # type: ignore[call-overload]
+        for row in result.all()
+    }
 
 
 async def get_top_questions(
@@ -80,7 +88,10 @@ async def get_top_questions(
         .limit(limit)
     )
     result = await db.execute(stmt)
-    return [QuestionCount(question=row.question, count=int(row.count)) for row in result.all()]
+    return [
+        QuestionCount(question=row.question, count=int(row.count))  # type: ignore[call-overload]
+        for row in result.all()
+    ]
 
 
 async def get_distinct_topic_count(

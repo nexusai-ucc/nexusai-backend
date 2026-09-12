@@ -104,7 +104,9 @@ async def course_stats(
         day = r.created_at.strftime("%Y-%m-%d")
         daily[day] = daily.get(day, 0) + 1
 
-    daily_breakdown = [DailyCount(date=d, interactions=c) for d, c in sorted(daily.items())]
+    daily_breakdown = [
+        DailyCount(date=d, interactions=c) for d, c in sorted(daily.items())
+    ]
 
     return CourseStats(
         course_id=course_id,
@@ -122,6 +124,7 @@ async def course_stats(
 # ============================================================
 # FAQ agrupado por tema — DOC-D02
 # ============================================================
+
 
 class FaqTopicsRequest(BaseModel):
     course_id: int = Field(gt=0)
@@ -154,7 +157,9 @@ async def faq_topics(
     # 1) Agrupar por pregunta normalizada, uniendo interaction_logs con el
     # mensaje de usuario real para recuperar el texto (interaction_logs no
     # guarda el texto de la pregunta, solo métricas — ver InteractionLog).
-    rows = await get_top_questions(db, payload.course_id, since, limit=_FAQ_SAMPLE_LIMIT)
+    rows = await get_top_questions(
+        db, payload.course_id, since, limit=_FAQ_SAMPLE_LIMIT
+    )
 
     if not rows:
         return FaqTopicsResponse(
@@ -203,7 +208,9 @@ async def faq_topics(
             temperature=0.3,
         )
     except Exception as exc:
-        logger.error("FAQ topics LLM call failed: %s: %s", type(exc).__name__, exc, exc_info=True)
+        logger.error(
+            "FAQ topics LLM call failed: %s: %s", type(exc).__name__, exc, exc_info=True
+        )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="No se pudieron agrupar las preguntas frecuentes en este momento. Intentá de nuevo.",
@@ -211,7 +218,9 @@ async def faq_topics(
 
     raw = result_llm.text.strip()
     if raw.startswith("```"):
-        raw = "\n".join(raw.splitlines()[1:-1]) if raw.endswith("```") else raw.strip("`")
+        raw = (
+            "\n".join(raw.splitlines()[1:-1]) if raw.endswith("```") else raw.strip("`")
+        )
 
     try:
         parsed = json.loads(raw)
@@ -231,7 +240,9 @@ async def faq_topics(
         indices = item.get("question_indices")
         if not label or not isinstance(indices, list):
             continue
-        assigned = [rows[i] for i in indices if isinstance(i, int) and 0 <= i < len(rows)]
+        assigned = [
+            rows[i] for i in indices if isinstance(i, int) and 0 <= i < len(rows)
+        ]
         if not assigned:
             continue
         topics.append(

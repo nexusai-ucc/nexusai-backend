@@ -72,7 +72,11 @@ async def check_rate_limit(
         # la ventana en que Redis no responde. Mismo criterio que
         # moderation.py (MODERATION_FAIL_OPEN) y alerting.py para
         # dependencias auxiliares no críticas.
-        logger.error("Rate limit check falló (Redis no disponible), dejando pasar: scope=%s user_id=%s", scope, user_id)
+        logger.error(
+            "Rate limit check falló (Redis no disponible), dejando pasar: scope=%s user_id=%s",
+            scope,
+            user_id,
+        )
         return
     count = int(results[0])
 
