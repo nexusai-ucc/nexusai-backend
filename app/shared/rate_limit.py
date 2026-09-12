@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import time
 
 import redis.asyncio as redis_async
 from fastapi import HTTPException, status
+
+logger = logging.getLogger("nexusai.rate_limit")
 
 _MESSAGES = {
     "minute": "Superaste el límite de {limit} consultas por minuto. Esperá un momento y volvé a intentarlo.",
@@ -58,7 +61,19 @@ async def check_rate_limit(
     pipe = redis.pipeline()
     pipe.incr(key)
     pipe.expire(key, window_sec + 10)
-    results = await pipe.execute()
+    try:
+        results = await pipe.execute()
+    except Exception:
+        # Fail-open a propósito: si Redis está caído/timeout, el rate limit
+        # es un guardrail de abuso, no un control de seguridad crítico —
+        # bloquear con 500 a TODOS los alumnos (no solo a los que superaron
+        # el límite) por la caída de una dependencia auxiliar es peor
+        # experiencia que el riesgo residual de dejar pasar de más durante
+        # la ventana en que Redis no responde. Mismo criterio que
+        # moderation.py (MODERATION_FAIL_OPEN) y alerting.py para
+        # dependencias auxiliares no críticas.
+        logger.error("Rate limit check falló (Redis no disponible), dejando pasar: scope=%s user_id=%s", scope, user_id)
+        return
     count = int(results[0])
 
     if count > limit:

@@ -198,3 +198,39 @@ async def test_mensaje_por_minuto_distingue_de_diario(
     assert detail["scope"] == "minute"
     assert "minuto" in detail["message"]
     assert "mañana" not in detail["message"]
+
+
+class _BrokenRedis:
+    """Simula Redis caído/timeout: pipeline().execute() siempre revienta."""
+
+    class _BrokenPipeline:
+        def incr(self, key: str):
+            return self
+
+        def expire(self, key: str, ttl: int):
+            return self
+
+        async def execute(self):
+            raise ConnectionError("simulated redis outage")
+
+    def pipeline(self):
+        return self._BrokenPipeline()
+
+
+async def test_falla_abierto_cuando_redis_no_responde() -> None:
+    """
+    Si Redis está caído, check_rate_limit no debe tumbar el request con un
+    500 para TODOS los alumnos — el rate limit es un guardrail de abuso, no
+    un control de seguridad crítico. Fail-open a propósito (ver comentario
+    en rate_limit.py), mismo criterio que moderation.py y alerting.py para
+    dependencias auxiliares no críticas.
+    """
+    # No debe lanzar HTTPException ni ninguna otra excepción — simplemente
+    # deja pasar el request como si no hubiera superado el límite.
+    await check_rate_limit(
+        user_id=1,
+        redis=_BrokenRedis(),
+        limit=50,
+        window_sec=DAY,
+        scope="daily",
+    )
