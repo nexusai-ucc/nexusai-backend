@@ -190,7 +190,16 @@ async def _moderate_via_llm(text: str, llm: LLMProvider) -> ModerationResult:
 
     raw = result.text.strip()
     if raw.startswith("```"):
-        raw = "\n".join(raw.splitlines()[1:-1]) if raw.endswith("```") else raw.strip("`")
+        # Sacamos la línea de apertura del fence (``` o ```json) siempre,
+        # tenga o no fence de cierre. `raw.strip("`")` en el caso sin cierre
+        # (respuesta truncada, p. ej. por rate limiting) solo pelaba los
+        # backticks de los extremos y dejaba el literal "json" pegado al
+        # JSON real (`json\n{...}`), lo que rompía el parseo — un error de
+        # parseo así queda indistinguible en el log de una falla real del
+        # proveedor, aunque el modelo sí clasificó el contenido.
+        raw = raw.split("\n", 1)[1] if "\n" in raw else ""
+        if raw.rstrip().endswith("```"):
+            raw = raw.rstrip()[:-3].rstrip()
 
     parsed = json.loads(raw)
     if not parsed.get("flagged", False):

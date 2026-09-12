@@ -107,6 +107,33 @@ async def test_suggest_reply_allows_acceptable_question(client, mock_db, mock_em
     assert mock_llm.chat_completion.await_count == 2
 
 
+async def test_suggest_reply_blocks_flagged_content_in_thread_posts(client, mock_db, mock_embeddings, mock_llm):
+    """La pregunta (`payload.question`) es aceptable, pero un post anterior
+    del hilo (`payload.posts`) es inapropiado. La respuesta sugerida se
+    sintetiza combinando ambos, así que el post del hilo también tiene que
+    pasar por moderación — no alcanza con revisar solo la pregunta."""
+    payload = {
+        "discussion_id": 1,
+        "course_id": 1,
+        "posts": [
+            {"post_id": 1, "author": "Alumno 1", "content": "contenido de odio en un post anterior"},
+        ],
+        "question": "¿Cómo resuelvo esto?",
+    }
+
+    with patch("app.shared.moderation.get_settings", return_value=_fake_settings(None)):
+        mock_llm.chat_completion.return_value = MagicMock(
+            text='{"flagged": true, "categories": ["hate"]}'
+        )
+
+        response = await client.post("/api/v1/forums/suggest-reply", json=payload)
+
+    assert response.status_code == 400
+    assert "no cumple" in response.json()["detail"].lower()
+    mock_embeddings.embed.assert_not_called()
+    assert mock_llm.chat_completion.await_count == 1  # solo la del clasificador
+
+
 async def test_suggest_reply_moderation_failure_is_fail_safe_not_500(client, mock_db, mock_embeddings, mock_llm):
     """Si el servicio de moderación falla por completo (sin API key y el LLM
     de clasificación también revienta), el fail-safe (fail-open por default)

@@ -142,6 +142,25 @@ async def test_llm_fallback_tolerates_markdown_fenced_json():
     assert result.allowed is True
 
 
+async def test_llm_fallback_tolerates_unterminated_markdown_fence():
+    """Fence de apertura sin cierre (respuesta truncada por el proveedor).
+
+    Antes del fix, raw.strip(backtick) sobre un fence sin cierre dejaba el
+    literal "json" pegado al JSON real, y json.loads fallaba — el mensaje
+    quedaba clasificado como error de infraestructura en vez de como el
+    resultado real que el LLM devolvió.
+    """
+    settings = _settings(moderation_api_key=None)
+    llm = _mock_llm('```json\n{"flagged": true, "categories": ["hate"]}')
+
+    with patch("app.shared.moderation.get_settings", return_value=settings):
+        result = await moderation.moderate_text("mensaje de odio", llm=llm)
+
+    assert result.allowed is False
+    assert result.source == "llm_fallback"
+    assert result.categories == ["hate"]
+
+
 async def test_falls_back_to_llm_when_openai_api_raises():
     settings = _settings(moderation_api_key="sk-test")
     llm = _mock_llm(json.dumps({"flagged": False, "categories": []}))
