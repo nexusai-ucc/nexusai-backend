@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import hashlib
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
@@ -175,6 +176,89 @@ async def test_upload_without_section_defaults_to_none(client, mock_db):
     response = await client.post("/api/v1/documents", json=_BASE_PAYLOAD)
 
     assert response.json()["section"] is None
+
+
+# ============================================================
+# POST /api/v1/documents — persistencia en disco (reindex/download)
+# ============================================================
+
+async def test_upload_persists_file_to_disk_after_transient_failure(client, mock_db, tmp_path, monkeypatch):
+    """Un blip transitorio de disco en el primer intento no debe perder el
+    archivo — el reintento (_persist_file_to_disk) lo guarda igual."""
+    monkeypatch.setattr("app.documents.router.UPLOADS_DIR", tmp_path)
+    mock_db.execute.return_value = _exec_result(scalar=None)
+
+    real_write_bytes = Path.write_bytes
+    calls = {"n": 0}
+
+    def flaky_write_bytes(self, data):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("blip transitorio de disco")
+        return real_write_bytes(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", flaky_write_bytes)
+
+    response = await client.post("/api/v1/documents", json=_BASE_PAYLOAD)
+
+    assert response.status_code == 202
+    doc_id = response.json()["id"]
+    saved = list(tmp_path.glob(f"{doc_id}_*"))
+    assert len(saved) == 1
+    assert saved[0].read_bytes() == _PDF_BYTES
+    assert calls["n"] == 2  # falló una vez, se recuperó en el reintento
+
+
+async def test_upload_persistent_disk_failure_still_returns_success(client, mock_db, tmp_path, monkeypatch, caplog):
+    """Si el disco sigue fallando después de reintentar, el upload/indexación
+    NO se rompe (usa los bytes en memoria) — pero ahora queda logueado como
+    error (antes: warning atrapado en silencio, sin exc_info)."""
+    monkeypatch.setattr("app.documents.router.UPLOADS_DIR", tmp_path)
+    mock_db.execute.return_value = _exec_result(scalar=None)
+
+    def always_fails(self, data):
+        raise OSError("disco no escribible")
+
+    monkeypatch.setattr(Path, "write_bytes", always_fails)
+
+    with caplog.at_level("ERROR", logger="nexusai.documents"):
+        response = await client.post("/api/v1/documents", json=_BASE_PAYLOAD)
+
+    assert response.status_code == 202
+    doc_id = response.json()["id"]
+    assert list(tmp_path.glob(f"{doc_id}_*")) == []
+    assert any("no se pudo guardar" in r.message.lower() for r in caplog.records)
+
+
+async def test_upload_persist_db_commit_failure_still_returns_success(
+    client, mock_db, tmp_path, monkeypatch, caplog
+):
+    """Si el archivo SÍ se escribe en disco pero el commit posterior
+    (document.storage_path = ...) falla, el upload no debe romperse — es el
+    mismo best-effort que una falla de disco, solo que en la mitad de atrás
+    de _persist_file_to_disk en vez de en el write."""
+    monkeypatch.setattr("app.documents.router.UPLOADS_DIR", tmp_path)
+    mock_db.execute.return_value = _exec_result(scalar=None)
+
+    calls = {"n": 0}
+    real_commit = mock_db.commit
+
+    async def flaky_commit(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:  # 1ra: creación del documento, 2da: _persist_file_to_disk
+            raise RuntimeError("connection reset")
+        return await real_commit(*args, **kwargs)
+
+    mock_db.commit = AsyncMock(side_effect=flaky_commit)
+
+    with caplog.at_level("ERROR", logger="nexusai.documents"):
+        response = await client.post("/api/v1/documents", json=_BASE_PAYLOAD)
+
+    assert response.status_code == 202
+    doc_id = response.json()["id"]
+    saved = list(tmp_path.glob(f"{doc_id}_*"))
+    assert len(saved) == 1  # el archivo se escribió igual, aunque el commit falló
+    assert any("no se pudo guardar" in r.message.lower() for r in caplog.records)
 
 
 # ============================================================
@@ -417,6 +501,26 @@ async def test_replace_document_keeps_same_id_and_resets_status(client, mock_db)
     assert data["filename"] == "apuntes-v2.pdf"
     assert data["status"] == "pending"
     assert data["error_message"] is None
+
+
+async def test_replace_document_keeps_old_file_when_new_save_fails(client, mock_db, tmp_path, monkeypatch):
+    """Si el guardado del archivo nuevo falla (persistentemente, tras
+    reintentar), NO debe borrarse el archivo viejo — perderíamos el único
+    que sí está bien guardado en disco."""
+    monkeypatch.setattr("app.documents.router.UPLOADS_DIR", tmp_path)
+    doc = _make_doc(status="indexed", storage_path="old-stored.pdf")
+    mock_db.execute.return_value = _exec_result(scalar=doc)
+    (tmp_path / "old-stored.pdf").write_bytes(_PDF_BYTES)
+
+    def always_fails(self, data):
+        raise OSError("disco no escribible")
+
+    monkeypatch.setattr(Path, "write_bytes", always_fails)
+
+    response = await client.post(f"/api/v1/documents/{doc.id}/replace", json=_REPLACE_PAYLOAD)
+
+    assert response.status_code == 202
+    assert (tmp_path / "old-stored.pdf").exists()  # no se borró
 
 
 async def test_replace_document_deletes_old_chunks_before_reindexing(client, mock_db):

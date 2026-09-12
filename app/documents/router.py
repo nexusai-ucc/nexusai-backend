@@ -49,6 +49,7 @@ from app.documents.summarizer import summarize_document, summarize_pre_exam
 from app.infrastructure.redis_client import get_redis
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
+from app.shared.retry import async_retry
 
 logger = logging.getLogger("nexusai.documents")
 
@@ -226,6 +227,53 @@ async def _index_document_task(
             )
 
 
+async def _persist_file_to_disk(
+    document: Document, file_bytes: bytes, filename: str, db: AsyncSession
+) -> Optional[str]:
+    """Guarda el archivo original en disco para que reindex/download puedan
+    leerlo después — best effort, compartido por upload_document y
+    replace_document (mismo storage_name = "{document_id}_{filename saneado}").
+
+    La indexación en sí NUNCA depende de esto (usa `file_bytes` en memoria),
+    así que una falla acá no debe romper el upload/replace — pero antes
+    quedaba atrapada en silencio (logger.warning sin exc_info), dejando
+    `storage_path=None` sin ninguna señal visible hasta que reindex/download
+    fallaban mucho después, sin forma de conectar la causa. Ahora: reintenta
+    una vez ante un blip transitorio de disco, y si igual falla (o falla el
+    commit posterior), loguea como error con el traceback completo.
+
+    Devuelve el storage_name si se guardó, o None si no se pudo persistir.
+    """
+    safe_name = Path(filename).name or "file"
+    storage_name = f"{document.id}_{safe_name}"
+
+    def _write() -> None:
+        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        (UPLOADS_DIR / storage_name).write_bytes(file_bytes)
+
+    try:
+        await async_retry(
+            lambda: asyncio.to_thread(_write),
+            max_attempts=2,
+            base_delay=0.15,
+            retryable=(OSError,),
+        )
+        document.storage_path = storage_name
+        await db.commit()
+    except Exception:
+        # Cualquier falla acá (disco tras reintentar, o el commit) es
+        # best-effort: no debe tirar el upload/replace completo.
+        logger.error(
+            "No se pudo guardar en disco el archivo del documento %s — "
+            "reindex/download van a fallar hasta que se vuelva a subir.",
+            document.id,
+            exc_info=True,
+        )
+        return None
+
+    return storage_name
+
+
 # ============================================================
 # Endpoints
 # ============================================================
@@ -306,20 +354,9 @@ async def upload_document(
     await db.commit()
     await db.refresh(document)
 
-    # Persist original file bytes so the download endpoint can serve them.
-    # Filename is sanitized to avoid path traversal: only the basename is used.
-    safe_name = Path(payload.filename).name or "file"
-    storage_name = f"{document.id}_{safe_name}"
-    try:
-        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-        (UPLOADS_DIR / storage_name).write_bytes(file_bytes)
-        document.storage_path = storage_name
-        await db.commit()
-    except Exception as exc:
-        logger.warning(
-            "Could not save file to disk for document %s: %s",
-            document.id, exc,
-        )
+    # Persist original file bytes so the download/reindex endpoints can read
+    # them later — best effort, ver _persist_file_to_disk.
+    await _persist_file_to_disk(document, file_bytes, payload.filename, db)
 
     await db.refresh(document)
     doc_data = DocumentOut.from_orm(document)
@@ -382,23 +419,13 @@ async def replace_document(
     document.error_message = None
     await db.commit()
 
-    # Guardar el archivo nuevo en disco. Si el nombre cambió, el storage_name
-    # también cambia (incluye el filename) — borrar el archivo viejo para no
-    # dejar basura huérfana.
-    safe_name = Path(payload.filename).name or "file"
-    storage_name = f"{document.id}_{safe_name}"
-    try:
-        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-        (UPLOADS_DIR / storage_name).write_bytes(file_bytes)
-        document.storage_path = storage_name
-        await db.commit()
-        if old_storage_path and old_storage_path != storage_name:
-            (UPLOADS_DIR / old_storage_path).unlink(missing_ok=True)
-    except Exception as exc:
-        logger.warning(
-            "Could not save replacement file to disk for document %s: %s",
-            document.id, exc,
-        )
+    # Guardar el archivo nuevo en disco — best effort, ver _persist_file_to_disk.
+    # Si el nombre cambió, el storage_name también cambia (incluye el
+    # filename) — borrar el archivo viejo para no dejar basura huérfana
+    # (solo si el nuevo sí se pudo guardar).
+    new_storage_name = await _persist_file_to_disk(document, file_bytes, payload.filename, db)
+    if new_storage_name and old_storage_path and old_storage_path != new_storage_name:
+        (UPLOADS_DIR / old_storage_path).unlink(missing_ok=True)
 
     await db.refresh(document)
     doc_data = DocumentOut.from_orm(document)
