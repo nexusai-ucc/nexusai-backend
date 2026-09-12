@@ -239,8 +239,8 @@ async def _persist_file_to_disk(
     quedaba atrapada en silencio (logger.warning sin exc_info), dejando
     `storage_path=None` sin ninguna señal visible hasta que reindex/download
     fallaban mucho después, sin forma de conectar la causa. Ahora: reintenta
-    una vez ante un blip transitorio de disco, y si igual falla, loguea como
-    error con el traceback completo.
+    una vez ante un blip transitorio de disco, y si igual falla (o falla el
+    commit posterior), loguea como error con el traceback completo.
 
     Devuelve el storage_name si se guardó, o None si no se pudo persistir.
     """
@@ -258,17 +258,19 @@ async def _persist_file_to_disk(
             base_delay=0.15,
             retryable=(OSError,),
         )
-    except OSError:
+        document.storage_path = storage_name
+        await db.commit()
+    except Exception:
+        # Cualquier falla acá (disco tras reintentar, o el commit) es
+        # best-effort: no debe tirar el upload/replace completo.
         logger.error(
-            "No se pudo guardar en disco el archivo del documento %s tras reintentar — "
+            "No se pudo guardar en disco el archivo del documento %s — "
             "reindex/download van a fallar hasta que se vuelva a subir.",
             document.id,
             exc_info=True,
         )
         return None
 
-    document.storage_path = storage_name
-    await db.commit()
     return storage_name
 
 

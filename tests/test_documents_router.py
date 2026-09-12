@@ -230,6 +230,37 @@ async def test_upload_persistent_disk_failure_still_returns_success(client, mock
     assert any("no se pudo guardar" in r.message.lower() for r in caplog.records)
 
 
+async def test_upload_persist_db_commit_failure_still_returns_success(
+    client, mock_db, tmp_path, monkeypatch, caplog
+):
+    """Si el archivo SÍ se escribe en disco pero el commit posterior
+    (document.storage_path = ...) falla, el upload no debe romperse — es el
+    mismo best-effort que una falla de disco, solo que en la mitad de atrás
+    de _persist_file_to_disk en vez de en el write."""
+    monkeypatch.setattr("app.documents.router.UPLOADS_DIR", tmp_path)
+    mock_db.execute.return_value = _exec_result(scalar=None)
+
+    calls = {"n": 0}
+    real_commit = mock_db.commit
+
+    async def flaky_commit(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:  # 1ra: creación del documento, 2da: _persist_file_to_disk
+            raise RuntimeError("connection reset")
+        return await real_commit(*args, **kwargs)
+
+    mock_db.commit = AsyncMock(side_effect=flaky_commit)
+
+    with caplog.at_level("ERROR", logger="nexusai.documents"):
+        response = await client.post("/api/v1/documents", json=_BASE_PAYLOAD)
+
+    assert response.status_code == 202
+    doc_id = response.json()["id"]
+    saved = list(tmp_path.glob(f"{doc_id}_*"))
+    assert len(saved) == 1  # el archivo se escribió igual, aunque el commit falló
+    assert any("no se pudo guardar" in r.message.lower() for r in caplog.records)
+
+
 # ============================================================
 # POST /api/v1/documents — dedup CONT-04
 # ============================================================
