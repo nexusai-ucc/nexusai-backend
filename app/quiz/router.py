@@ -45,6 +45,7 @@ from sqlalchemy import delete, desc, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.analytics.logger import log_moderation_block
 from app.auth.hmac import verify_hmac
 from app.db.models import (
     ChatSession,
@@ -63,6 +64,7 @@ from app.gaps.recorder import WEAK_MATCH_THRESHOLD
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
 from app.shared.config import get_settings
+from app.shared.moderation import moderate_text
 
 logger = logging.getLogger("nexusai.quiz")
 
@@ -1114,6 +1116,19 @@ async def evaluate_open_answer(
 
     Devuelve { correct, score 0-1, feedback } con justificación detallada.
     """
+    # ----- Moderación de contenido — antes de gastar tokens evaluando la
+    # respuesta. Ver app/shared/moderation.py. -----
+    moderation = await moderate_text(payload.user_answer, llm=llm)
+    if not moderation.allowed:
+        log_moderation_block(
+            endpoint="quiz.evaluate",
+            course_id=payload.course_id,
+            user_id=payload.user_id,
+            source=moderation.source,
+            categories=moderation.categories,
+        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=moderation.blocked_message)
+
     messages = [
         {
             "role": "system",

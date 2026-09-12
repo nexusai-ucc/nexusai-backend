@@ -48,13 +48,14 @@ from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.analytics.logger import log_moderation_block
 from app.auth.hmac import verify_hmac
 from app.db.models import ForumPostEmbedding, ForumWebhookConfig
 from app.db.session import get_db
 from app.documents.retriever import format_context_for_prompt, retrieve_context
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
-from app.shared.config import get_settings
+from app.shared.moderation import moderate_text
 
 _logger = logging.getLogger(__name__)
 
@@ -466,6 +467,30 @@ async def suggest_reply(
       2. Construye el prompt con el hilo + material recuperado.
       3. El LLM genera la respuesta sugerida.
     """
+    # 0. Formatear el contexto del hilo primero — la moderación de abajo
+    # necesita verlo (ver por qué en el comentario siguiente).
+    thread_text, _, _ = _build_summarize_prompt(payload.posts)
+
+    # ----- Moderación de contenido — antes de gastar tokens en RAG/LLM y
+    # antes de que una respuesta generada a partir de este post llegue a
+    # otro alumno del foro. Ver app/shared/moderation.py.
+    #
+    # Se modera `payload.question` JUNTO CON `thread_text`, no solo la
+    # pregunta: la respuesta sugerida se sintetiza combinando ambos (ver el
+    # prompt más abajo), así que contenido inapropiado en cualquier post
+    # anterior del hilo puede colarse en `suggested_reply` igual que si
+    # viniera de `payload.question`. -----
+    moderation = await moderate_text(f"{payload.question}\n\n{thread_text}", llm=llm)
+    if not moderation.allowed:
+        log_moderation_block(
+            endpoint="forums.suggest_reply",
+            course_id=payload.course_id,
+            user_id=None,  # el post no trae user_id — PHP no lo envía en este endpoint
+            source=moderation.source,
+            categories=moderation.categories,
+        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=moderation.blocked_message)
+
     # 1. RAG: buscar material del curso relevante a la pregunta.
     try:
         chunks = await retrieve_context(
@@ -482,10 +507,8 @@ async def suggest_reply(
     has_material = bool(chunks)
     sources_used = len(chunks)
 
-    # 2. Formatear el contexto del hilo.
-    thread_text, _, _ = _build_summarize_prompt(payload.posts)
-
-    # 3. Formatear el material del curso (si lo hay).
+    # 2. Formatear el material del curso (si lo hay). `thread_text` ya se
+    # construyó arriba, antes de la moderación.
     material_section = ""
     if chunks:
         context_str = format_context_for_prompt(chunks, max_chars_per_chunk=1600)

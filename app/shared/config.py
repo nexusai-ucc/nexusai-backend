@@ -95,6 +95,29 @@ class Settings(BaseSettings):
     # API
     api_port: int = 8001
 
+    # Moderación de contenido — capa de seguridad sobre las entradas del
+    # alumno antes de llegar al LLM principal. Ver app/shared/moderation.py.
+    #
+    # moderation_enabled: apaga toda la capa (default True). Pensado para dev
+    #   local, donde no siempre se quiere pagar la latencia/costo extra de la
+    #   llamada de moderación.
+    # moderation_api_key: si está seteada, se usa la Moderation API de OpenAI
+    #   (gratuita, rápida, especializada en esto) sin importar cuál sea el
+    #   LLM_BASE_URL activo — es un endpoint HTTP aparte, no pasa por
+    #   LLMProvider. Sin esta key (p. ej. en el MVP con Gemini, que no expone
+    #   un endpoint de moderación equivalente vía el shim OpenAI-compat), se
+    #   cae a clasificar el texto con el LLM activo — más caro y algo menos
+    #   preciso, pero mantiene el agnosticismo de proveedor (ADR-003).
+    # moderation_fail_open: qué hacer si la moderación misma falla (timeout,
+    #   ambos caminos caídos). True (default) = dejar pasar el mensaje al LLM
+    #   principal — bloquear alumnos por la falla de un servicio AUXILIAR es
+    #   peor UX que el riesgo residual, y el LLM principal ya tiene su propio
+    #   system prompt con guardrails. False = bloquear hasta que la
+    #   moderación vuelva a estar disponible.
+    moderation_enabled: bool = True
+    moderation_api_key: Optional[str] = None
+    moderation_fail_open: bool = True
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
