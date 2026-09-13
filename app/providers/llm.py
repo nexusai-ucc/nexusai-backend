@@ -291,14 +291,38 @@ class LLMProvider:
         tiene sus propios 3 reintentos vía _create_completion/async_retry —
         recién si esos 3 fallan por _FALLBACK_TRIGGERS pasa al siguiente
         eslabón. Con un solo eslabón (caso default sin fallback configurado),
-        el comportamiento es idéntico al de antes de INFRA-01/INFRA-03."""
+        el comportamiento es idéntico al de antes de INFRA-01/INFRA-03.
+
+        Si CUALQUIER eslabón agota cuota (RateLimitError) antes de llegar al
+        final de la cadena, esa excepción se guarda y se prioriza sobre la
+        del último eslabón (ver ADR-012): sin esto, un primario que agota
+        cuota pero un eslabón intermedio que ya no existe (NotFoundError) o
+        un secundario caído (InternalServerError) hace que la excepción que
+        llega al caller no sea RateLimitError — y record_llm_failure_and_maybe_alert
+        (app/shared/error_monitoring.py) nunca dispara la alerta específica
+        de cuota agotada, la más urgente/accionable de las 4."""
+        quota_exhausted: Optional[openai.RateLimitError] = None
         for i, (client, model) in enumerate(chain):
             try:
                 return await LLMProvider._create_completion(
                     client, model, messages, **kwargs
                 )
+            except openai.RateLimitError as exc:
+                quota_exhausted = quota_exhausted or exc
+                if i == len(chain) - 1:
+                    raise
+                next_model = chain[i + 1][1]
+                logger.warning(
+                    "LLM fallback activado: %s agotado (%s: %s). Pasando a %s.",
+                    model,
+                    type(exc).__name__,
+                    exc,
+                    next_model,
+                )
             except _FALLBACK_TRIGGERS as exc:
                 if i == len(chain) - 1:
+                    if quota_exhausted is not None:
+                        raise quota_exhausted from exc
                     raise
                 next_model = chain[i + 1][1]
                 logger.warning(
@@ -325,6 +349,7 @@ class LLMProvider:
         ya se envió output parcial al caller y no se puede "deshacer".
         """
         chain = self._fallback_chain()
+        quota_exhausted: Optional[openai.RateLimitError] = None
         for i, (client, model) in enumerate(chain):
             try:
                 return await client.chat.completions.create(
@@ -333,8 +358,25 @@ class LLMProvider:
                     stream=True,
                     **kwargs,
                 )
+            except openai.RateLimitError as exc:
+                quota_exhausted = quota_exhausted or exc
+                if i == len(chain) - 1:
+                    raise
+                next_model = chain[i + 1][1]
+                logger.warning(
+                    "LLM fallback activado (stream): %s agotado (%s: %s). Pasando a %s.",
+                    model,
+                    type(exc).__name__,
+                    exc,
+                    next_model,
+                )
             except _FALLBACK_TRIGGERS as exc:
                 if i == len(chain) - 1:
+                    # Ver el comentario equivalente en _run_completion_chain:
+                    # priorizar la cuota agotada de un eslabón anterior sobre
+                    # la falla puntual del último eslabón.
+                    if quota_exhausted is not None:
+                        raise quota_exhausted from exc
                     raise
                 next_model = chain[i + 1][1]
                 logger.warning(

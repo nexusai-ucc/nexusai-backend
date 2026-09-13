@@ -10,7 +10,10 @@ from datetime import datetime, timezone
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
+
+from app.infrastructure.redis_client import get_redis
+from app.shared.error_monitoring import record_5xx_and_maybe_alert
 
 logger = logging.getLogger("nexusai.access")
 
@@ -28,7 +31,28 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         request.state.request_id = request_id
         start = time.perf_counter()
 
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            # Una excepción que no sea HTTPException (un bug no anticipado)
+            # normalmente la resuelve Starlette's ServerErrorMiddleware, que
+            # queda AFUERA de este middleware — el 5xx más grave (un crash
+            # real) nunca pasaría por el chequeo de abajo ni por el log de
+            # acceso (ver ADR-012, hallazgo de audit). Atajarla acá adentro
+            # es lo único que garantiza que sí pase por los dos.
+            logger.error(
+                "Unhandled exception",
+                extra={
+                    "request_id": request_id,
+                    "path": request.url.path,
+                    "error": str(exc),
+                    "type": type(exc).__name__,
+                },
+                exc_info=True,
+            )
+            response = JSONResponse(
+                status_code=500, content={"detail": "Internal server error"}
+            )
 
         latency_ms = round((time.perf_counter() - start) * 1000, 1)
         response.headers["X-Request-ID"] = request_id
@@ -46,5 +70,16 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
                 ensure_ascii=False,
             )
         )
+
+        if response.status_code >= 500:
+            try:
+                redis = await get_redis()
+                await record_5xx_and_maybe_alert(
+                    redis, status_code=response.status_code, path=request.url.path
+                )
+            except Exception as exc:
+                # No dejar que un fallo de alertas (p. ej. Redis caído) tumbe
+                # la response real que ya se generó.
+                logger.warning("record_5xx_and_maybe_alert falló: %s", exc)
 
         return response
