@@ -298,13 +298,30 @@ def get_judge_provider() -> LLMProvider:
     ver evaluacion-rag.md, sección "Hallazgos de infraestructura". Para no
     quemar la cuota diaria del sistema bajo evaluación con las llamadas del
     judge (que son tooling de la evaluación, no el sistema medido), el judge
-    usa un modelo de Groq confirmado disponible con la misma API key de
-    fallback, en vez de reusar get_llm_provider().
+    usa un modelo de Groq, en vez de reusar get_llm_provider().
+
+    Usa LLM_JUDGE_API_KEY/LLM_JUDGE_BASE_URL si están seteadas. Si no, cae a
+    LLM_FALLBACK_API_KEY/LLM_FALLBACK_BASE_URL — las MISMAS credenciales que
+    usa LLMProvider._fallback_chain() en producción — y avisa por stderr,
+    porque en ese caso el judge compite por la cuota del fallback real con
+    tráfico de alumnos (más una vez arreglado el hallazgo de arriba).
     """
     settings = get_settings()
+    api_key = settings.llm_judge_api_key or settings.llm_fallback_api_key
+    base_url = settings.llm_judge_base_url or settings.llm_fallback_base_url
+    if not (settings.llm_judge_api_key and settings.llm_judge_base_url):
+        print(
+            "[eval_rag] AVISO: LLM_JUDGE_API_KEY/LLM_JUDGE_BASE_URL no están "
+            "seteadas — el judge usa las credenciales de LLM_FALLBACK_*, las "
+            "mismas que el fallback real de producción. Esta corrida va a "
+            "competir por esa cuota con tráfico de alumnos que caiga a "
+            "fallback. Setear LLM_JUDGE_API_KEY/LLM_JUDGE_BASE_URL para "
+            "evitarlo.",
+            file=sys.stderr,
+        )
     return LLMProvider(
-        api_key=settings.llm_fallback_api_key,
-        base_url=settings.llm_fallback_base_url,
+        api_key=api_key,
+        base_url=base_url,
         model="openai/gpt-oss-120b",
         # Este modelo de Groq no acepta reasoning_effort="none" (el default
         # de LLM_REASONING_EFFORT) — exige low/medium/high.
@@ -444,47 +461,53 @@ async def main() -> None:
 
     dataset = json.loads(args.dataset.read_text())["items"]
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        print(f"[1/4] Indexando {args.material.name} en curso {args.course_id}...")
-        await index_course_material(client, args.course_id, args.user_id, args.material)
-        print("      Indexado OK.")
+    # try/finally: si cualquier paso de acá abajo lanza (timeout de indexación,
+    # error del judge, respuesta inesperada del chat), igual queremos limpiar
+    # el curso de evaluación — no hay staging separado, y dev/prod comparten
+    # las mismas tablas, así que un crash sin este finally deja el material y
+    # los chunks del curso de eval en la base para siempre.
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            print(f"[1/4] Indexando {args.material.name} en curso {args.course_id}...")
+            await index_course_material(client, args.course_id, args.user_id, args.material)
+            print("      Indexado OK.")
 
-        print("[2/4] Nivel 1 — retrieval (Recall@5, Precision@5, MRR)...")
-        retrieval_results = await eval_retrieval(dataset, args.course_id)
+            print("[2/4] Nivel 1 — retrieval (Recall@5, Precision@5, MRR)...")
+            retrieval_results = await eval_retrieval(dataset, args.course_id)
 
-        print("[3/4] Nivel 2 — generación / faithfulness (LLM-as-judge)...")
-        generation_results = await eval_generation(client, dataset, args.course_id, args.user_id)
+            print("[3/4] Nivel 2 — generación / faithfulness (LLM-as-judge)...")
+            generation_results = await eval_generation(client, dataset, args.course_id, args.user_id)
 
-        print("[4/4] Nivel 3 — fallback honesto (preguntas fuera del material)...")
-        fallback_results = await eval_fallback(client, dataset, args.course_id, args.user_id)
+            print("[4/4] Nivel 3 — fallback honesto (preguntas fuera del material)...")
+            fallback_results = await eval_fallback(client, dataset, args.course_id, args.user_id)
 
-    summary = summarize(retrieval_results, generation_results, fallback_results)
+        summary = summarize(retrieval_results, generation_results, fallback_results)
 
-    report = {
-        "meta": {
-            "course_id": args.course_id,
-            "dataset": str(args.dataset),
-            "material": str(args.material),
-            "chat_top_k": CHAT_TOP_K,
-            "chat_min_similarity": CHAT_MIN_SIMILARITY,
-        },
-        "summary": summary,
-        "detalle": {
-            "retrieval": [r.__dict__ for r in retrieval_results],
-            "generacion": [g.__dict__ for g in generation_results],
-            "fallback": [f.__dict__ for f in fallback_results],
-        },
-    }
+        report = {
+            "meta": {
+                "course_id": args.course_id,
+                "dataset": str(args.dataset),
+                "material": str(args.material),
+                "chat_top_k": CHAT_TOP_K,
+                "chat_min_similarity": CHAT_MIN_SIMILARITY,
+            },
+            "summary": summary,
+            "detalle": {
+                "retrieval": [r.__dict__ for r in retrieval_results],
+                "generacion": [g.__dict__ for g in generation_results],
+                "fallback": [f.__dict__ for f in fallback_results],
+            },
+        }
 
-    args.out.write_text(json.dumps(report, indent=2, ensure_ascii=False))
-    print(f"\nReporte escrito en {args.out}")
-    print(json.dumps(summary, indent=2, ensure_ascii=False))
+        args.out.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+        print(f"\nReporte escrito en {args.out}")
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+    finally:
+        if not args.keep_data:
+            await cleanup_course(args.course_id)
+            print(f"Datos de evaluación del curso {args.course_id} eliminados.")
 
-    if not args.keep_data:
-        await cleanup_course(args.course_id)
-        print(f"Datos de evaluación del curso {args.course_id} eliminados.")
-
-    await dispose_engine()
+        await dispose_engine()
 
 
 if __name__ == "__main__":

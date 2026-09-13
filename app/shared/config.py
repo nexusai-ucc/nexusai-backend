@@ -47,6 +47,15 @@ class Settings(BaseSettings):
     # a antes de INFRA-03 (salta directo del primario al secundario).
     llm_intermediate_models: Optional[str] = None
 
+    # LLM — credenciales dedicadas para el LLM-as-judge de scripts/eval_rag.py.
+    # Opcionales: si no están seteadas, el judge cae a llm_fallback_api_key/
+    # llm_fallback_base_url (ver eval_rag.py::get_judge_provider). Ese fallback
+    # comparte cuota con el proveedor secundario real de producción — setear
+    # estas para que correr la evaluación no compita por la cuota del fallback
+    # que usan alumnos reales.
+    llm_judge_api_key: Optional[str] = None
+    llm_judge_base_url: Optional[str] = None
+
     # Resúmenes de documentos (PERF-02) — ver documents/summarizer.py.
     #
     # summary_cache_ttl_sec: cuánto vive en Redis el resumen ya generado de un
