@@ -16,7 +16,10 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from app.auth.hmac import verify_hmac
-from app.providers.transcription import TranscriptionProvider, get_transcription_provider
+from app.providers.transcription import (
+    TranscriptionProvider,
+    get_transcription_provider,
+)
 
 _AUDIO_BYTES = b"fake-audio-bytes-not-a-real-webm-file"
 _AUDIO_B64 = base64.b64encode(_AUDIO_BYTES).decode()
@@ -38,7 +41,9 @@ async def client(mock_provider):
     app.dependency_overrides[verify_hmac] = lambda: b"test-body"
     app.dependency_overrides[get_transcription_provider] = lambda: mock_provider
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as c:
         yield c
 
 
@@ -52,7 +57,9 @@ async def client_unconfigured():
     app.dependency_overrides[verify_hmac] = lambda: b"test-body"
     app.dependency_overrides[get_transcription_provider] = lambda: None
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as c:
         yield c
 
 

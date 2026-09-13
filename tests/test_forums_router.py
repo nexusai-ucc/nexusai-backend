@@ -63,6 +63,7 @@ def _make_post_embedding(**kwargs):
 # Fixtures
 # ─────────────────────────────────────────────────────────────
 
+
 @pytest.fixture
 def mock_db():
     db = AsyncMock()
@@ -98,13 +99,16 @@ async def client(mock_db, mock_embeddings, mock_llm):
     app.dependency_overrides[get_embedding_provider] = lambda: mock_embeddings
     app.dependency_overrides[get_llm_provider] = lambda: mock_llm
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as c:
         yield c
 
 
 # ─────────────────────────────────────────────────────────────
 # POST /index-post — nuevo post
 # ─────────────────────────────────────────────────────────────
+
 
 async def test_index_new_post_returns_indexed(client, mock_db):
     """Post que no existe en DB → se indexa y devuelve status='indexed'."""
@@ -171,6 +175,7 @@ async def test_index_post_propagates_embedding_error(client, mock_db, mock_embed
 # DELETE /index-post/{post_id}
 # ─────────────────────────────────────────────────────────────
 
+
 async def test_delete_post_embedding_returns_204(client, mock_db):
     response = await client.delete("/api/v1/forums/index-post/10")
 
@@ -188,6 +193,7 @@ async def test_delete_nonexistent_post_still_returns_204(client, mock_db):
 # ─────────────────────────────────────────────────────────────
 # POST /similar-posts
 # ─────────────────────────────────────────────────────────────
+
 
 async def test_similar_posts_returns_matches(client, mock_db, mock_embeddings):
     """Hay posts similares → los devuelve con preview y similarity."""
@@ -330,14 +336,20 @@ _DIGEST_PAYLOAD = {
             "discussion_name": "No entiendo nada del parcial",
             "forum_name": "Consultas generales",
             "posts": [
-                {"post_id": 3, "author": "Juan", "content": "URGENTE no entiendo nada del parcial, ayuda por favor!!!"},
+                {
+                    "post_id": 3,
+                    "author": "Juan",
+                    "content": "URGENTE no entiendo nada del parcial, ayuda por favor!!!",
+                },
             ],
         },
     ],
 }
 
 
-async def test_weekly_digest_returns_summary_and_per_discussion_urgency(client, mock_llm):
+async def test_weekly_digest_returns_summary_and_per_discussion_urgency(
+    client, mock_llm
+):
     response = await client.post("/api/v1/forums/weekly-digest", json=_DIGEST_PAYLOAD)
 
     assert response.status_code == 200
@@ -402,14 +414,21 @@ async def test_weekly_digest_rejects_too_many_discussions(client):
 # FOR-07 (#378) — webhook externo del digest semanal
 # ─────────────────────────────────────────────────────────────
 
-async def test_weekly_digest_posts_to_webhook_when_configured(client, mock_db, mock_llm):
-    mock_db.execute.return_value.scalar_one_or_none.return_value = "https://hooks.slack.com/services/xxx"
+
+async def test_weekly_digest_posts_to_webhook_when_configured(
+    client, mock_db, mock_llm
+):
+    mock_db.execute.return_value.scalar_one_or_none.return_value = (
+        "https://hooks.slack.com/services/xxx"
+    )
 
     with patch("app.forums.router.httpx.AsyncClient") as mock_client_cls:
         mock_client = AsyncMock()
         mock_client_cls.return_value.__aenter__.return_value = mock_client
 
-        response = await client.post("/api/v1/forums/weekly-digest", json=_DIGEST_PAYLOAD)
+        response = await client.post(
+            "/api/v1/forums/weekly-digest", json=_DIGEST_PAYLOAD
+        )
 
     assert response.status_code == 200
     mock_client.post.assert_awaited_once_with(
@@ -417,34 +436,48 @@ async def test_weekly_digest_posts_to_webhook_when_configured(client, mock_db, m
     )
 
 
-async def test_weekly_digest_does_not_call_webhook_when_not_configured(client, mock_db, mock_llm):
+async def test_weekly_digest_does_not_call_webhook_when_not_configured(
+    client, mock_db, mock_llm
+):
     mock_db.execute.return_value.scalar_one_or_none.return_value = None
 
     with patch("app.forums.router.httpx.AsyncClient") as mock_client_cls:
-        response = await client.post("/api/v1/forums/weekly-digest", json=_DIGEST_PAYLOAD)
+        response = await client.post(
+            "/api/v1/forums/weekly-digest", json=_DIGEST_PAYLOAD
+        )
 
     assert response.status_code == 200
     mock_client_cls.assert_not_called()
 
 
-async def test_weekly_digest_webhook_failure_does_not_break_response(client, mock_db, mock_llm):
+async def test_weekly_digest_webhook_failure_does_not_break_response(
+    client, mock_db, mock_llm
+):
     """Criterio de aceptación explícito: un fallo del webhook no debe romper
     la generación del digest en la UI."""
-    mock_db.execute.return_value.scalar_one_or_none.return_value = "https://hooks.slack.com/services/xxx"
+    mock_db.execute.return_value.scalar_one_or_none.return_value = (
+        "https://hooks.slack.com/services/xxx"
+    )
 
     with patch("app.forums.router.httpx.AsyncClient") as mock_client_cls:
         mock_client = AsyncMock()
         mock_client.post.side_effect = Exception("webhook host unreachable")
         mock_client_cls.return_value.__aenter__.return_value = mock_client
 
-        response = await client.post("/api/v1/forums/weekly-digest", json=_DIGEST_PAYLOAD)
+        response = await client.post(
+            "/api/v1/forums/weekly-digest", json=_DIGEST_PAYLOAD
+        )
 
     assert response.status_code == 200
     assert response.json()["summary"] == "Resumen de la semana."
 
 
-async def test_weekly_digest_does_not_call_webhook_when_no_activity(client, mock_db, mock_llm):
-    mock_db.execute.return_value.scalar_one_or_none.return_value = "https://hooks.slack.com/services/xxx"
+async def test_weekly_digest_does_not_call_webhook_when_no_activity(
+    client, mock_db, mock_llm
+):
+    mock_db.execute.return_value.scalar_one_or_none.return_value = (
+        "https://hooks.slack.com/services/xxx"
+    )
     payload = {**_DIGEST_PAYLOAD, "discussions": []}
 
     with patch("app.forums.router.httpx.AsyncClient") as mock_client_cls:
@@ -490,9 +523,13 @@ async def test_save_webhook_config_rejects_non_http_url(client):
 
 
 async def test_get_webhook_config_returns_saved_url(client, mock_db):
-    mock_db.execute.return_value.scalar_one_or_none.return_value = "https://hooks.slack.com/services/xxx"
+    mock_db.execute.return_value.scalar_one_or_none.return_value = (
+        "https://hooks.slack.com/services/xxx"
+    )
 
-    response = await client.post("/api/v1/forums/webhook-config/get", json={"course_id": 1})
+    response = await client.post(
+        "/api/v1/forums/webhook-config/get", json={"course_id": 1}
+    )
 
     assert response.status_code == 200
     assert response.json() == {"webhook_url": "https://hooks.slack.com/services/xxx"}
@@ -501,7 +538,9 @@ async def test_get_webhook_config_returns_saved_url(client, mock_db):
 async def test_get_webhook_config_returns_none_when_not_configured(client, mock_db):
     mock_db.execute.return_value.scalar_one_or_none.return_value = None
 
-    response = await client.post("/api/v1/forums/webhook-config/get", json={"course_id": 1})
+    response = await client.post(
+        "/api/v1/forums/webhook-config/get", json={"course_id": 1}
+    )
 
     assert response.status_code == 200
     assert response.json() == {"webhook_url": None}

@@ -48,13 +48,14 @@ from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.analytics.logger import log_moderation_block
 from app.auth.hmac import verify_hmac
 from app.db.models import ForumPostEmbedding, ForumWebhookConfig
 from app.db.session import get_db
 from app.documents.retriever import format_context_for_prompt, retrieve_context
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
-from app.shared.config import get_settings
+from app.shared.moderation import moderate_text
 
 _logger = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ _DEFAULT_TOP_K = 5
 # ─────────────────────────────────────────────────────────────
 # Schemas
 # ─────────────────────────────────────────────────────────────
+
 
 class IndexPostRequest(BaseModel):
     post_id: int = Field(gt=0, description="ID de mdl_forum_posts")
@@ -82,7 +84,9 @@ class IndexPostResponse(BaseModel):
 
 class SimilarPostsRequest(BaseModel):
     course_id: int = Field(gt=0)
-    text: str = Field(min_length=10, max_length=5_000, description="Texto del post en redacción")
+    text: str = Field(
+        min_length=10, max_length=5_000, description="Texto del post en redacción"
+    )
     exclude_post_id: Optional[int] = Field(
         default=None,
         description="Post a excluir de los resultados (útil al editar un post existente)",
@@ -112,6 +116,7 @@ class SimilarPostsResponse(BaseModel):
 # Helpers
 # ─────────────────────────────────────────────────────────────
 
+
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -120,7 +125,10 @@ def _sha256(text: str) -> str:
 # Endpoints
 # ─────────────────────────────────────────────────────────────
 
-@router.post("/index-post", response_model=IndexPostResponse, status_code=status.HTTP_200_OK)
+
+@router.post(
+    "/index-post", response_model=IndexPostResponse, status_code=status.HTTP_200_OK
+)
 async def index_post(
     payload: IndexPostRequest,
     _body: Annotated[bytes, Depends(verify_hmac)],
@@ -174,7 +182,9 @@ async def index_post(
     return IndexPostResponse(post_id=payload.post_id, status="indexed")
 
 
-@router.delete("/index-post/{post_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
+@router.delete(
+    "/index-post/{post_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None
+)
 async def delete_post_embedding(
     _body: Annotated[bytes, Depends(verify_hmac)],
     post_id: int = Path(gt=0),
@@ -182,9 +192,7 @@ async def delete_post_embedding(
 ) -> None:
     """Elimina el embedding de un post cuando se borra en Moodle."""
     await db.execute(
-        delete(ForumPostEmbedding).where(
-            ForumPostEmbedding.forum_post_id == post_id
-        )
+        delete(ForumPostEmbedding).where(ForumPostEmbedding.forum_post_id == post_id)
     )
     await db.commit()
 
@@ -290,6 +298,7 @@ class SummarizeThreadResponse(BaseModel):
 # F-04 — Helpers
 # ─────────────────────────────────────────────────────────────
 
+
 def _build_summarize_prompt(posts: List[ThreadPost]) -> tuple[str, int, bool]:
     """Construye el bloque de texto del hilo para el prompt del LLM.
 
@@ -335,6 +344,7 @@ Respondé con un JSON válido con exactamente estas claves (sin texto antes ni d
 # F-04 — Endpoint
 # ─────────────────────────────────────────────────────────────
 
+
 @router.post("/summarize-thread", response_model=SummarizeThreadResponse)
 async def summarize_thread(
     payload: SummarizeThreadRequest,
@@ -351,7 +361,10 @@ async def summarize_thread(
 
     messages = [
         {"role": "system", "content": _SUMMARIZE_SYSTEM},
-        {"role": "user",   "content": _SUMMARIZE_USER_TMPL.format(thread_text=thread_text)},
+        {
+            "role": "user",
+            "content": _SUMMARIZE_USER_TMPL.format(thread_text=thread_text),
+        },
     ]
 
     try:
@@ -366,7 +379,7 @@ async def summarize_thread(
     # si falla el parse, devolvemos el texto crudo como summary.
     raw = result.text.strip()
     # Extraer bloque JSON aunque el LLM añada markdown (```json ... ```)
-    json_match = _re.search(r'\{.*\}', raw, _re.DOTALL)
+    json_match = _re.search(r"\{.*\}", raw, _re.DOTALL)
     parsed: dict = {}
     if json_match:
         try:
@@ -374,9 +387,9 @@ async def summarize_thread(
         except _json.JSONDecodeError:
             pass
 
-    summary    = str(parsed.get("summary",    raw))
+    summary = str(parsed.get("summary", raw))
     key_points = parsed.get("key_points", [])
-    resolved   = bool(parsed.get("resolved",  False))
+    resolved = bool(parsed.get("resolved", False))
 
     if not isinstance(key_points, list):
         key_points = []
@@ -451,6 +464,7 @@ MATERIAL DEL CURSO (fragmentos relevantes recuperados por búsqueda semántica):
 # F-05 — Endpoint
 # ─────────────────────────────────────────────────────────────
 
+
 @router.post("/suggest-reply", response_model=SuggestReplyResponse)
 async def suggest_reply(
     payload: SuggestReplyRequest,
@@ -466,6 +480,32 @@ async def suggest_reply(
       2. Construye el prompt con el hilo + material recuperado.
       3. El LLM genera la respuesta sugerida.
     """
+    # 0. Formatear el contexto del hilo primero — la moderación de abajo
+    # necesita verlo (ver por qué en el comentario siguiente).
+    thread_text, _, _ = _build_summarize_prompt(payload.posts)
+
+    # ----- Moderación de contenido — antes de gastar tokens en RAG/LLM y
+    # antes de que una respuesta generada a partir de este post llegue a
+    # otro alumno del foro. Ver app/shared/moderation.py.
+    #
+    # Se modera `payload.question` JUNTO CON `thread_text`, no solo la
+    # pregunta: la respuesta sugerida se sintetiza combinando ambos (ver el
+    # prompt más abajo), así que contenido inapropiado en cualquier post
+    # anterior del hilo puede colarse en `suggested_reply` igual que si
+    # viniera de `payload.question`. -----
+    moderation = await moderate_text(f"{payload.question}\n\n{thread_text}", llm=llm)
+    if not moderation.allowed:
+        log_moderation_block(
+            endpoint="forums.suggest_reply",
+            course_id=payload.course_id,
+            user_id=None,  # el post no trae user_id — PHP no lo envía en este endpoint
+            source=moderation.source,
+            categories=moderation.categories,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=moderation.blocked_message
+        )
+
     # 1. RAG: buscar material del curso relevante a la pregunta.
     try:
         chunks = await retrieve_context(
@@ -482,10 +522,8 @@ async def suggest_reply(
     has_material = bool(chunks)
     sources_used = len(chunks)
 
-    # 2. Formatear el contexto del hilo.
-    thread_text, _, _ = _build_summarize_prompt(payload.posts)
-
-    # 3. Formatear el material del curso (si lo hay).
+    # 2. Formatear el material del curso (si lo hay). `thread_text` ya se
+    # construyó arriba, antes de la moderación.
     material_section = ""
     if chunks:
         context_str = format_context_for_prompt(chunks, max_chars_per_chunk=1600)
@@ -523,15 +561,28 @@ async def suggest_reply(
 # ─────────────────────────────────────────────────────────────
 
 _URGENCY_KEYWORDS = [
-    "urgente", "urgencia", "urgent",
-    "ayuda", "help",
-    "no entiendo", "i don't understand", "i dont understand",
-    "no puedo", "i can't", "i cant",
-    "desesperad", "desperate",
-    "frustrad", "frustrat",
-    "perdido", "perdida", "lost",
-    "confundid", "confused",
-    "por favor", "please help",
+    "urgente",
+    "urgencia",
+    "urgent",
+    "ayuda",
+    "help",
+    "no entiendo",
+    "i don't understand",
+    "i dont understand",
+    "no puedo",
+    "i can't",
+    "i cant",
+    "desesperad",
+    "desperate",
+    "frustrad",
+    "frustrat",
+    "perdido",
+    "perdida",
+    "lost",
+    "confundid",
+    "confused",
+    "por favor",
+    "please help",
 ]
 
 
@@ -589,13 +640,17 @@ class DigestDiscussion(BaseModel):
     discussion_id: int = Field(gt=0)
     discussion_name: str = Field(max_length=300)
     forum_name: str = Field(max_length=300)
-    posts: List[ThreadPost] = Field(min_length=1, max_length=_MAX_POSTS_PER_DISCUSSION_IN_DIGEST)
+    posts: List[ThreadPost] = Field(
+        min_length=1, max_length=_MAX_POSTS_PER_DISCUSSION_IN_DIGEST
+    )
 
 
 class WeeklyDigestRequest(BaseModel):
     course_id: int = Field(gt=0)
     days: int = Field(default=7, ge=1, le=30)
-    discussions: List[DigestDiscussion] = Field(default_factory=list, max_length=_MAX_DISCUSSIONS_IN_DIGEST)
+    discussions: List[DigestDiscussion] = Field(
+        default_factory=list, max_length=_MAX_DISCUSSIONS_IN_DIGEST
+    )
 
 
 class DigestDiscussionResult(BaseModel):
@@ -618,7 +673,9 @@ def _build_digest_prompt(discussions: List[DigestDiscussion]) -> str:
     blocks = []
     for d in discussions:
         thread_text, _, _ = _build_summarize_prompt(d.posts)
-        blocks.append(f'=== Hilo: "{d.discussion_name}" (foro: {d.forum_name}) ===\n{thread_text}')
+        blocks.append(
+            f'=== Hilo: "{d.discussion_name}" (foro: {d.forum_name}) ===\n{thread_text}'
+        )
     return "\n\n".join(blocks)
 
 
@@ -676,7 +733,12 @@ async def weekly_digest(
     threads_text = _build_digest_prompt(payload.discussions)
     messages = [
         {"role": "system", "content": _DIGEST_SYSTEM},
-        {"role": "user", "content": _DIGEST_USER_TMPL.format(days=payload.days, threads_text=threads_text)},
+        {
+            "role": "user",
+            "content": _DIGEST_USER_TMPL.format(
+                days=payload.days, threads_text=threads_text
+            ),
+        },
     ]
 
     try:
@@ -732,12 +794,16 @@ class WebhookConfigGetResponse(BaseModel):
     webhook_url: Optional[str]
 
 
-async def _notify_webhook_if_configured(db: AsyncSession, course_id: int, summary: Optional[str]) -> None:
+async def _notify_webhook_if_configured(
+    db: AsyncSession, course_id: int, summary: Optional[str]
+) -> None:
     if not summary:
         return  # nada que notificar (mismo criterio que "sin discusiones, sin LLM")
 
     row = await db.execute(
-        select(ForumWebhookConfig.webhook_url).where(ForumWebhookConfig.course_id == course_id)
+        select(ForumWebhookConfig.webhook_url).where(
+            ForumWebhookConfig.course_id == course_id
+        )
     )
     webhook_url = row.scalar_one_or_none()
     if not webhook_url:
@@ -747,7 +813,11 @@ async def _notify_webhook_if_configured(db: AsyncSession, course_id: int, summar
         async with httpx.AsyncClient(timeout=_WEBHOOK_POST_TIMEOUT) as client:
             await client.post(webhook_url, json={"text": summary})
     except Exception:
-        _logger.warning("FOR-07: fallo al notificar el webhook del curso %s", course_id, exc_info=True)
+        _logger.warning(
+            "FOR-07: fallo al notificar el webhook del curso %s",
+            course_id,
+            exc_info=True,
+        )
 
 
 @router.post("/webhook-config/save", response_model=WebhookConfigSaveResponse)
@@ -758,16 +828,27 @@ async def save_webhook_config(
 ) -> WebhookConfigSaveResponse:
     """Guarda (o borra, con webhook_url="") la URL de webhook del curso."""
     if not payload.webhook_url:
-        await db.execute(delete(ForumWebhookConfig).where(ForumWebhookConfig.course_id == payload.course_id))
+        await db.execute(
+            delete(ForumWebhookConfig).where(
+                ForumWebhookConfig.course_id == payload.course_id
+            )
+        )
         await db.commit()
         return WebhookConfigSaveResponse(webhook_url=None)
 
     if not _re.match(r"^https?://", payload.webhook_url):
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="webhook_url debe ser http(s)")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="webhook_url debe ser http(s)",
+        )
 
     stmt = (
         pg_insert(ForumWebhookConfig)
-        .values(id=uuid.uuid4(), course_id=payload.course_id, webhook_url=payload.webhook_url)
+        .values(
+            id=uuid.uuid4(),
+            course_id=payload.course_id,
+            webhook_url=payload.webhook_url,
+        )
         .on_conflict_do_update(
             constraint="uq_forum_webhook_configs_course",
             set_={"webhook_url": payload.webhook_url},
@@ -777,6 +858,7 @@ async def save_webhook_config(
     result = await db.execute(stmt)
     await db.commit()
     row = result.fetchone()
+    assert row is not None  # RETURNING de un upsert siempre devuelve una fila.
     return WebhookConfigSaveResponse(webhook_url=row.webhook_url)
 
 
@@ -787,6 +869,8 @@ async def get_webhook_config(
     db: AsyncSession = Depends(get_db),
 ) -> WebhookConfigGetResponse:
     row = await db.execute(
-        select(ForumWebhookConfig.webhook_url).where(ForumWebhookConfig.course_id == payload.course_id)
+        select(ForumWebhookConfig.webhook_url).where(
+            ForumWebhookConfig.course_id == payload.course_id
+        )
     )
     return WebhookConfigGetResponse(webhook_url=row.scalar_one_or_none())

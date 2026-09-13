@@ -8,8 +8,9 @@ Sprint 3 additions:
              Devuelve los tokens en ChatResponse para monitoreo en tiempo real.
   - BACK-13: validación explícita de material indexado en el sistema prompt.
              El retrieval filtra por course_id (aislamiento multi-curso verificado).
-  - BACK-14: rate limiting por user_id (20 req/min), logging estructurado JSON
-             con request_id + course_id + user_id + tokens + latencia.
+  - BACK-14: rate limiting por user_id (20 req/min + límite diario), logging
+             estructurado JSON con request_id + course_id + user_id + tokens
+             + latencia.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.analytics.logger import hash_user_id, log_interaction
+from app.analytics.logger import hash_user_id, log_interaction, log_moderation_block
 from app.auth.hmac import verify_hmac
 from app.chat.schemas import ChatRequest, ChatResponse, MessageOut
 from app.db.models import ChatSession, Message, MessageFeedback
@@ -42,6 +43,7 @@ from app.shared.error_monitoring import (
     record_llm_failure_and_maybe_alert,
     record_llm_slow_and_maybe_alert,
 )
+from app.shared.moderation import moderate_text
 from app.shared.rate_limit import check_rate_limit
 
 import redis.asyncio as redis_async
@@ -54,6 +56,7 @@ logger = logging.getLogger("nexusai.chat")
 # Helpers internos
 # ============================================================
 
+
 class EchoRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
     course_id: int = Field(..., gt=0)
@@ -64,7 +67,9 @@ class EchoResponse(BaseModel):
     echo: str
     course_id: int
     user_id: int
-    note: str = "HMAC verificado correctamente. Esto es un mock — Sprint 2 conecta el LLM real."
+    note: str = (
+        "HMAC verificado correctamente. Esto es un mock — Sprint 2 conecta el LLM real."
+    )
 
 
 async def _get_or_create_session(
@@ -77,15 +82,15 @@ async def _get_or_create_session(
         )
         session = result.scalar_one_or_none()
         if session is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Session not found"
+            )
         return session
 
     # Feature B: si el chat está en modo multi-curso (course_ids con >1 item),
     # la sesión se crea con course_id=0 (sesión global, no atada a una materia).
     session_course_id = (
-        0
-        if (payload.course_ids and len(payload.course_ids) > 1)
-        else payload.course_id
+        0 if (payload.course_ids and len(payload.course_ids) > 1) else payload.course_id
     )
     session = ChatSession(user_id=payload.user_id, course_id=session_course_id)
     db.add(session)
@@ -137,7 +142,7 @@ def _build_system_prompt(retrieved_context: str, is_multicourse: bool = False) -
             + f"Tenés acceso a fragmentos del material {source_label}. "
             "Usá esos fragmentos como tu fuente principal de información. "
             "Cuando uses información de un fragmento, podés citar el nombre del archivo "
-            "que aparece entre comillas en su encabezado [Fuente: \"...\"]. "
+            'que aparece entre comillas en su encabezado [Fuente: "..."]. '
             "NUNCA inventes ni copies nombres de archivo de ejemplos previos. "
             + multicourse_hint
             + "Si la pregunta NO se puede responder con los fragmentos disponibles, "
@@ -167,6 +172,7 @@ def _build_system_prompt(retrieved_context: str, is_multicourse: bool = False) -
 # Endpoint principal: POST /messages
 # ============================================================
 
+
 @router.post("/messages", response_model=ChatResponse)
 async def messages(
     request: Request,
@@ -181,13 +187,36 @@ async def messages(
     start_time = time.perf_counter()
     request_id = getattr(request.state, "request_id", "-")
 
-    # ----- BACK-14: Rate limiting por user_id -----
+    # ----- BACK-14: Rate limiting por user_id (por minuto + diario) -----
     await check_rate_limit(
         user_id=payload.user_id,
         redis=redis,
         limit=settings.rate_limit_per_user_minute,
         window_sec=60,
+        scope="minute",
     )
+    await check_rate_limit(
+        user_id=payload.user_id,
+        redis=redis,
+        limit=settings.rate_limit_per_user_daily,
+        window_sec=86400,
+        scope="daily",
+    )
+
+    # ----- Moderación de contenido — antes de cualquier escritura o gasto de
+    # tokens (retrieval/LLM). Ver app/shared/moderation.py. -----
+    moderation = await moderate_text(payload.question, llm=llm)
+    if not moderation.allowed:
+        log_moderation_block(
+            endpoint="chat.messages",
+            course_id=payload.course_id,
+            user_id=payload.user_id,
+            source=moderation.source,
+            categories=moderation.categories,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=moderation.blocked_message
+        )
 
     session = await _get_or_create_session(db, payload)
 
@@ -246,7 +275,12 @@ async def messages(
     recent_messages = list(reversed(history_result.scalars().all()))
 
     llm_messages = [
-        {"role": "system", "content": _build_system_prompt(context_text, is_multicourse=is_multicourse)},
+        {
+            "role": "system",
+            "content": _build_system_prompt(
+                context_text, is_multicourse=is_multicourse
+            ),
+        },
     ]
     for message in recent_messages:
         if message.id == user_message.id:
@@ -326,7 +360,11 @@ async def messages(
     )
 
     # ----- DOC-D01: Logging anonimizado para analytics -----
-    has_ctx = bool(retrieved_chunks and max_sim_for_gap is not None and max_sim_for_gap >= WEAK_MATCH_THRESHOLD)
+    has_ctx = bool(
+        retrieved_chunks
+        and max_sim_for_gap is not None
+        and max_sim_for_gap >= WEAK_MATCH_THRESHOLD
+    )
     await log_interaction(
         db,
         course_id=payload.course_id,
@@ -356,6 +394,7 @@ async def messages(
 # ============================================================
 # Endpoint streaming: POST /stream — Server-Sent Events
 # ============================================================
+
 
 @router.post("/stream")
 async def messages_stream(
@@ -388,7 +427,30 @@ async def messages_stream(
         redis=redis,
         limit=settings.rate_limit_per_user_minute,
         window_sec=60,
+        scope="minute",
     )
+    await check_rate_limit(
+        user_id=payload.user_id,
+        redis=redis,
+        limit=settings.rate_limit_per_user_daily,
+        window_sec=86400,
+        scope="daily",
+    )
+
+    # ----- Moderación de contenido — antes de abrir el stream (que ya
+    # implica costo de RAG/LLM). Ver app/shared/moderation.py. -----
+    moderation = await moderate_text(payload.question, llm=llm)
+    if not moderation.allowed:
+        log_moderation_block(
+            endpoint="chat.stream",
+            course_id=payload.course_id,
+            user_id=payload.user_id,
+            source=moderation.source,
+            categories=moderation.categories,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=moderation.blocked_message
+        )
 
     is_multicourse = bool(payload.course_ids and len(payload.course_ids) > 1)
     course_names_int: dict[int, str] = {}
@@ -406,7 +468,9 @@ async def messages_stream(
         async with SessionFactory() as db:
             try:
                 session = await _get_or_create_session(db, payload)
-                user_message = Message(session_id=session.id, role="user", content=payload.question)
+                user_message = Message(
+                    session_id=session.id, role="user", content=payload.question
+                )
                 db.add(user_message)
                 await db.flush()
                 await db.commit()
@@ -435,7 +499,9 @@ async def messages_stream(
                     context_text = ""
 
                 # Memoizamos max similarity para la evaluación de gap post-LLM.
-                max_sim_stream = max((c.similarity for c in retrieved_chunks), default=None)
+                max_sim_stream = max(
+                    (c.similarity for c in retrieved_chunks), default=None
+                )
 
                 # has_relevant_context: True sólo si el retrieval encontró chunks
                 # con similarity suficientemente alta (≥ umbral de gaps). Cuando es
@@ -454,30 +520,28 @@ async def messages_stream(
                 sources_payload = [
                     {
                         "document_filename": c.document_filename,
-                        "document_id":       str(c.document_id) if c.document_id else None,
-                        "chunk_index":       c.chunk_index,
-                        "content":           c.content[:400].strip(),
-                        "similarity":        round(c.similarity, 3),
-                        "course_id":         c.course_id,
+                        "document_id": str(c.document_id) if c.document_id else None,
+                        "chunk_index": c.chunk_index,
+                        "content": c.content[:400].strip(),
+                        "similarity": round(c.similarity, 3),
+                        "course_id": c.course_id,
                     }
                     for c in retrieved_chunks
                 ]
                 # En multi-curso, propagamos el mapa course_id → nombre al frontend
                 # para que las pills puedan mostrar de qué materia viene cada fuente.
                 meta_payload = {
-                    "type":                 "meta",
-                    "session_id":           str(session.id),
-                    "chunks":               len(retrieved_chunks),
-                    "sources":              sources_payload,
+                    "type": "meta",
+                    "session_id": str(session.id),
+                    "chunks": len(retrieved_chunks),
+                    "sources": sources_payload,
                     "has_relevant_context": has_relevant_context,
                 }
                 if is_multicourse and course_names_int:
                     meta_payload["course_names"] = {
                         str(k): v for k, v in course_names_int.items()
                     }
-                yield (
-                    "data: " + json.dumps(meta_payload, ensure_ascii=False) + "\n\n"
-                )
+                yield ("data: " + json.dumps(meta_payload, ensure_ascii=False) + "\n\n")
 
                 # Historial.
                 history_result = await db.execute(
@@ -489,12 +553,19 @@ async def messages_stream(
                 recent_messages = list(reversed(history_result.scalars().all()))
 
                 llm_messages = [
-                    {"role": "system", "content": _build_system_prompt(context_text, is_multicourse=is_multicourse)},
+                    {
+                        "role": "system",
+                        "content": _build_system_prompt(
+                            context_text, is_multicourse=is_multicourse
+                        ),
+                    },
                 ]
                 for message in recent_messages:
                     if message.id == user_message.id:
                         continue
-                    llm_messages.append({"role": message.role, "content": message.content})
+                    llm_messages.append(
+                        {"role": message.role, "content": message.content}
+                    )
                 llm_messages.append({"role": "user", "content": payload.question})
 
                 # Stream del LLM.
@@ -506,10 +577,15 @@ async def messages_stream(
                     if isinstance(chunk, StreamToken):
                         full_text_parts.append(chunk.text)
                         yield (
-                            "data: " + json.dumps({
-                                "type": "token",
-                                "content": chunk.text,
-                            }, ensure_ascii=False) + "\n\n"
+                            "data: "
+                            + json.dumps(
+                                {
+                                    "type": "token",
+                                    "content": chunk.text,
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n\n"
                         )
                     elif isinstance(chunk, StreamUsage):
                         usage_seen = chunk
@@ -526,7 +602,9 @@ async def messages_stream(
                     role="assistant",
                     content=full_text,
                     token_count_prompt=usage_seen.prompt_tokens if usage_seen else 0,
-                    token_count_completion=usage_seen.completion_tokens if usage_seen else 0,
+                    token_count_completion=usage_seen.completion_tokens
+                    if usage_seen
+                    else 0,
                 )
                 db.add(assistant_message)
 
@@ -555,38 +633,59 @@ async def messages_stream(
 
                 latency_ms = round((time.perf_counter() - start_time) * 1000, 1)
                 logger.info(
-                    json.dumps({
-                        "event": "chat_stream",
-                        "request_id": request_id,
-                        "course_id": payload.course_id,
-                        "user_id": payload.user_id,
-                        "session_id": str(session.id),
-                        "chunks_retrieved": len(retrieved_chunks),
-                        "prompt_tokens": usage_seen.prompt_tokens if usage_seen else 0,
-                        "completion_tokens": usage_seen.completion_tokens if usage_seen else 0,
-                        "latency_ms": latency_ms,
-                    }, ensure_ascii=False)
+                    json.dumps(
+                        {
+                            "event": "chat_stream",
+                            "request_id": request_id,
+                            "course_id": payload.course_id,
+                            "user_id": payload.user_id,
+                            "session_id": str(session.id),
+                            "chunks_retrieved": len(retrieved_chunks),
+                            "prompt_tokens": usage_seen.prompt_tokens
+                            if usage_seen
+                            else 0,
+                            "completion_tokens": usage_seen.completion_tokens
+                            if usage_seen
+                            else 0,
+                            "latency_ms": latency_ms,
+                        },
+                        ensure_ascii=False,
+                    )
                 )
 
                 yield (
-                    "data: " + json.dumps({
-                        "type": "answer_meta",
-                        "grounded": grounded,
-                    }) + "\n\n"
+                    "data: "
+                    + json.dumps(
+                        {
+                            "type": "answer_meta",
+                            "grounded": grounded,
+                        }
+                    )
+                    + "\n\n"
                 )
 
                 yield (
-                    "data: " + json.dumps({
-                        "type": "done",
-                        "prompt_tokens": usage_seen.prompt_tokens if usage_seen else 0,
-                        "completion_tokens": usage_seen.completion_tokens if usage_seen else 0,
-                        "total_tokens": usage_seen.total_tokens if usage_seen else 0,
-                        # ASIST-01 (#321): id real ya asignado por el commit de más
-                        # arriba — permite que el frontend habilite el feedback
-                        # 👍/👎 sobre el mensaje recién streameado, sin esperar a
-                        # recargar el historial (que sí trae MessageOut.id).
-                        "assistant_message_id": str(assistant_message.id),
-                    }) + "\n\n"
+                    "data: "
+                    + json.dumps(
+                        {
+                            "type": "done",
+                            "prompt_tokens": usage_seen.prompt_tokens
+                            if usage_seen
+                            else 0,
+                            "completion_tokens": usage_seen.completion_tokens
+                            if usage_seen
+                            else 0,
+                            "total_tokens": usage_seen.total_tokens
+                            if usage_seen
+                            else 0,
+                            # ASIST-01 (#321): id real ya asignado por el commit de más
+                            # arriba — permite que el frontend habilite el feedback
+                            # 👍/👎 sobre el mensaje recién streameado, sin esperar a
+                            # recargar el historial (que sí trae MessageOut.id).
+                            "assistant_message_id": str(assistant_message.id),
+                        }
+                    )
+                    + "\n\n"
                 )
 
                 # ----- DOC-D01: Logging anonimizado para analytics -----
@@ -601,7 +700,9 @@ async def messages_stream(
                     has_relevant_context=grounded,
                     is_multicourse=is_multicourse,
                     prompt_tokens=usage_seen.prompt_tokens if usage_seen else None,
-                    completion_tokens=usage_seen.completion_tokens if usage_seen else None,
+                    completion_tokens=usage_seen.completion_tokens
+                    if usage_seen
+                    else None,
                     latency_ms=latency_ms,
                     endpoint="stream",
                 )
@@ -619,10 +720,14 @@ async def messages_stream(
                 # aceptable para un piloto.
                 await record_llm_failure_and_maybe_alert(redis, endpoint="stream", error=exc)
                 yield (
-                    "data: " + json.dumps({
-                        "type": "error",
-                        "detail": "El asistente no está disponible temporalmente",
-                    }) + "\n\n"
+                    "data: "
+                    + json.dumps(
+                        {
+                            "type": "error",
+                            "detail": "El asistente no está disponible temporalmente",
+                        }
+                    )
+                    + "\n\n"
                 )
 
     return StreamingResponse(
@@ -639,6 +744,7 @@ async def messages_stream(
 # ============================================================
 # Endpoints de historial — listar sesiones + leer mensajes
 # ============================================================
+
 
 class SessionSummary(BaseModel):
     id: str
@@ -703,20 +809,28 @@ async def sessions_list(
         )
         first_msg_res = await db.execute(msg_stmt)
         first_msg = first_msg_res.scalar_one_or_none()
-        preview = (first_msg.content[:80].strip() + "…") if first_msg and len(first_msg.content) > 80 else (first_msg.content if first_msg else None)
+        preview = (
+            (first_msg.content[:80].strip() + "…")
+            if first_msg and len(first_msg.content) > 80
+            else (first_msg.content if first_msg else None)
+        )
 
-        count_stmt = select(func.count()).select_from(Message).where(Message.session_id == s.id)
+        count_stmt = (
+            select(func.count()).select_from(Message).where(Message.session_id == s.id)
+        )
         count_res = await db.execute(count_stmt)
         count = int(count_res.scalar_one() or 0)
 
-        out.append(SessionSummary(
-            id=str(s.id),
-            course_id=s.course_id,
-            created_at=s.created_at,
-            updated_at=s.updated_at,
-            last_message_preview=preview,
-            message_count=count,
-        ))
+        out.append(
+            SessionSummary(
+                id=str(s.id),
+                course_id=s.course_id,
+                created_at=s.created_at,
+                updated_at=s.updated_at,
+                last_message_preview=preview,
+                message_count=count,
+            )
+        )
 
     return SessionsList(sessions=out)
 
@@ -736,9 +850,14 @@ async def session_messages(
     res = await db.execute(session_stmt)
     session = res.scalar_one_or_none()
     if session is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found"
+        )
     if session.user_id != payload.user_id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Session does not belong to user")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Session does not belong to user",
+        )
 
     msg_stmt = (
         select(Message)
@@ -780,9 +899,14 @@ async def session_delete(
     res = await db.execute(session_stmt)
     session = res.scalar_one_or_none()
     if session is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found"
+        )
     if session.user_id != payload.user_id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Session does not belong to user")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Session does not belong to user",
+        )
 
     await db.delete(session)
     await db.commit()
@@ -793,6 +917,7 @@ async def session_delete(
 # ============================================================
 # Feedback del alumno sobre una respuesta — ASIST-01 (#321)
 # ============================================================
+
 
 class MessageFeedbackRequest(BaseModel):
     message_id: UUID
@@ -847,6 +972,7 @@ async def submit_message_feedback(
 # ============================================================
 # Endpoint de smoke test: POST /echo
 # ============================================================
+
 
 @router.post("/echo", response_model=EchoResponse)
 async def echo(

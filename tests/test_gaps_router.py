@@ -25,7 +25,14 @@ from app.gaps.router import SEMANTIC_GAP_SIMILARITY_THRESHOLD, _cluster_gaps, ro
 _NOW = datetime(2026, 8, 8, 12, 0, 0, tzinfo=timezone.utc)
 
 
-def _row(question: str, minutes_ago: int, embedding=None, max_similarity=None, row_id=None, archived_at=None):
+def _row(
+    question: str,
+    minutes_ago: int,
+    embedding=None,
+    max_similarity=None,
+    row_id=None,
+    archived_at=None,
+):
     return (
         row_id or uuid.uuid4(),
         question,
@@ -49,6 +56,7 @@ def _onehot(i: int, dims: int = 5) -> list[float]:
 # _cluster_gaps — algoritmo puro
 # ============================================================
 
+
 def test_cluster_gaps_merges_semantically_similar_questions_with_different_wording():
     """Caso central de la issue: sinónimos/reformulación se agrupan como
     un solo gap aunque el texto sea completamente distinto."""
@@ -58,7 +66,11 @@ def test_cluster_gaps_merges_semantically_similar_questions_with_different_wordi
 
     rows = [
         _row("¿qué es overfitting?", minutes_ago=10, embedding=emb_a),
-        _row("¿cuándo un modelo memoriza en vez de generalizar?", minutes_ago=5, embedding=emb_b),
+        _row(
+            "¿cuándo un modelo memoriza en vez de generalizar?",
+            minutes_ago=5,
+            embedding=emb_b,
+        ),
     ]
 
     items = _cluster_gaps(rows)
@@ -149,7 +161,12 @@ def test_cluster_gaps_averages_similarity_across_merged_rows():
     emb = [1.0, 0.0]
     rows = [
         _row("pregunta A", minutes_ago=10, embedding=emb, max_similarity=0.2),
-        _row("pregunta A reformulada", minutes_ago=5, embedding=[0.99, 0.14], max_similarity=0.4),
+        _row(
+            "pregunta A reformulada",
+            minutes_ago=5,
+            embedding=[0.99, 0.14],
+            max_similarity=0.4,
+        ),
     ]
 
     items = _cluster_gaps(rows)
@@ -167,7 +184,12 @@ def test_cluster_gaps_exposes_underlying_row_ids():
     emb_b = [0.99, 0.1, 0.0]
     rows = [
         _row("¿qué es overfitting?", minutes_ago=10, embedding=emb_a, row_id=id_a),
-        _row("¿cuándo un modelo memoriza en vez de generalizar?", minutes_ago=5, embedding=emb_b, row_id=id_b),
+        _row(
+            "¿cuándo un modelo memoriza en vez de generalizar?",
+            minutes_ago=5,
+            embedding=emb_b,
+            row_id=id_b,
+        ),
     ]
 
     items = _cluster_gaps(rows)
@@ -183,21 +205,35 @@ def test_cluster_gaps_is_archived_true_only_when_all_rows_archived():
     emb_a = [1.0, 0.0]
     emb_b = [0.99, 0.14]
 
-    fully_archived = _cluster_gaps([
-        _row("pregunta archivada", minutes_ago=10, embedding=emb_a, archived_at=_NOW),
-    ])
+    fully_archived = _cluster_gaps(
+        [
+            _row(
+                "pregunta archivada", minutes_ago=10, embedding=emb_a, archived_at=_NOW
+            ),
+        ]
+    )
     assert fully_archived[0].is_archived is True
 
-    mixed = _cluster_gaps([
-        _row("pregunta archivada", minutes_ago=10, embedding=emb_a, archived_at=_NOW),
-        _row("pregunta archivada reformulada", minutes_ago=1, embedding=emb_b, archived_at=None),
-    ])
+    mixed = _cluster_gaps(
+        [
+            _row(
+                "pregunta archivada", minutes_ago=10, embedding=emb_a, archived_at=_NOW
+            ),
+            _row(
+                "pregunta archivada reformulada",
+                minutes_ago=1,
+                embedding=emb_b,
+                archived_at=None,
+            ),
+        ]
+    )
     assert mixed[0].is_archived is False
 
 
 # ============================================================
 # Endpoint /list — end-to-end con DB mockeada
 # ============================================================
+
 
 @pytest.fixture
 def mock_db():
@@ -211,7 +247,9 @@ async def client(mock_db):
     app.dependency_overrides[verify_hmac] = lambda: b"test-body"
     app.dependency_overrides[get_db] = lambda: mock_db
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as c:
         yield c
 
 
@@ -219,13 +257,19 @@ async def client(mock_db):
 async def test_gaps_list_merges_synonyms_end_to_end(client, mock_db):
     rows = [
         _row("¿qué es overfitting?", minutes_ago=10, embedding=[1.0, 0.05, 0.0]),
-        _row("¿cuándo un modelo memoriza en vez de generalizar?", minutes_ago=5, embedding=[0.99, 0.1, 0.0]),
+        _row(
+            "¿cuándo un modelo memoriza en vez de generalizar?",
+            minutes_ago=5,
+            embedding=[0.99, 0.1, 0.0],
+        ),
     ]
     db_result = MagicMock()
     db_result.all.return_value = rows
     mock_db.execute = AsyncMock(return_value=db_result)
 
-    resp = await client.post("/api/v1/gaps/list", json={"course_id": 1, "days": 30, "limit": 20})
+    resp = await client.post(
+        "/api/v1/gaps/list", json={"course_id": 1, "days": 30, "limit": 20}
+    )
 
     assert resp.status_code == 200
     body = resp.json()
@@ -243,7 +287,9 @@ async def test_gaps_list_applies_limit_after_clustering(client, mock_db):
     db_result.all.return_value = rows
     mock_db.execute = AsyncMock(return_value=db_result)
 
-    resp = await client.post("/api/v1/gaps/list", json={"course_id": 1, "days": 30, "limit": 2})
+    resp = await client.post(
+        "/api/v1/gaps/list", json={"course_id": 1, "days": 30, "limit": 2}
+    )
 
     assert resp.status_code == 200
     body = resp.json()
@@ -266,11 +312,19 @@ async def test_gaps_list_offset_paginates_without_overlap(client, mock_db):
     db_result.all.return_value = rows
     mock_db.execute = AsyncMock(return_value=db_result)
 
-    page1 = await client.post("/api/v1/gaps/list", json={"course_id": 1, "days": 30, "limit": 2, "offset": 0})
-    page2 = await client.post("/api/v1/gaps/list", json={"course_id": 1, "days": 30, "limit": 2, "offset": 2})
-    page3 = await client.post("/api/v1/gaps/list", json={"course_id": 1, "days": 30, "limit": 2, "offset": 4})
+    page1 = await client.post(
+        "/api/v1/gaps/list", json={"course_id": 1, "days": 30, "limit": 2, "offset": 0}
+    )
+    page2 = await client.post(
+        "/api/v1/gaps/list", json={"course_id": 1, "days": 30, "limit": 2, "offset": 2}
+    )
+    page3 = await client.post(
+        "/api/v1/gaps/list", json={"course_id": 1, "days": 30, "limit": 2, "offset": 4}
+    )
 
     body1, body2, body3 = page1.json(), page2.json(), page3.json()
-    assert [i["question"] for i in body1["items"]] != [i["question"] for i in body2["items"]]
+    assert [i["question"] for i in body1["items"]] != [
+        i["question"] for i in body2["items"]
+    ]
     assert len(body3["items"]) == 1
     assert body1["total"] == body2["total"] == body3["total"] == 5

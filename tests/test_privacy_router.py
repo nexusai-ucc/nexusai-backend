@@ -35,7 +35,9 @@ async def client(mock_db):
     app.dependency_overrides[verify_hmac] = lambda: b"test-body"
     app.dependency_overrides[get_db] = lambda: mock_db
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as c:
         yield c
 
 
@@ -47,9 +49,12 @@ def _now():
 # GET /export
 # ============================================================
 
+
 @pytest.mark.asyncio
 async def test_export_rejects_non_positive_ids(client):
-    resp = await client.get("/api/v1/privacy/export", params={"user_id": 0, "course_id": 5})
+    resp = await client.get(
+        "/api/v1/privacy/export", params={"user_id": 0, "course_id": 5}
+    )
     assert resp.status_code == 400
 
 
@@ -59,12 +64,16 @@ async def test_export_returns_messages_from_all_sessions(client, mock_db):
         id=uuid4(),
         messages=[
             SimpleNamespace(role="user", content="hola", created_at=_now()),
-            SimpleNamespace(role="assistant", content="hola, ¿en qué te ayudo?", created_at=_now()),
+            SimpleNamespace(
+                role="assistant", content="hola, ¿en qué te ayudo?", created_at=_now()
+            ),
         ],
     )
     session2 = SimpleNamespace(
         id=uuid4(),
-        messages=[SimpleNamespace(role="user", content="otra pregunta", created_at=_now())],
+        messages=[
+            SimpleNamespace(role="user", content="otra pregunta", created_at=_now())
+        ],
     )
 
     sessions_result = MagicMock()
@@ -76,9 +85,13 @@ async def test_export_returns_messages_from_all_sessions(client, mock_db):
     errors_result = MagicMock()
     errors_result.scalars.return_value.all.return_value = []
 
-    mock_db.execute = AsyncMock(side_effect=[sessions_result, attempts_result, errors_result])
+    mock_db.execute = AsyncMock(
+        side_effect=[sessions_result, attempts_result, errors_result]
+    )
 
-    resp = await client.get("/api/v1/privacy/export", params={"user_id": 7, "course_id": 3})
+    resp = await client.get(
+        "/api/v1/privacy/export", params={"user_id": 7, "course_id": 3}
+    )
 
     assert resp.status_code == 200
     body = resp.json()
@@ -111,9 +124,13 @@ async def test_export_excludes_anonymized_quiz_attempts_at_query_level(client, m
     errors_result = MagicMock()
     errors_result.scalars.return_value.all.return_value = []
 
-    mock_db.execute = AsyncMock(side_effect=[sessions_result, attempts_result, errors_result])
+    mock_db.execute = AsyncMock(
+        side_effect=[sessions_result, attempts_result, errors_result]
+    )
 
-    resp = await client.get("/api/v1/privacy/export", params={"user_id": 7, "course_id": 3})
+    resp = await client.get(
+        "/api/v1/privacy/export", params={"user_id": 7, "course_id": 3}
+    )
 
     assert resp.status_code == 200
     body = resp.json()
@@ -124,6 +141,7 @@ async def test_export_excludes_anonymized_quiz_attempts_at_query_level(client, m
 # ============================================================
 # DELETE /data
 # ============================================================
+
 
 @pytest.mark.asyncio
 async def test_delete_rejects_non_positive_ids(client):
@@ -179,7 +197,9 @@ async def test_delete_anonymizes_quiz_attempts_instead_of_deleting(client, mock_
     mock_db.execute = fake_execute
     mock_db.commit = AsyncMock()
 
-    await client.request("DELETE", "/api/v1/privacy/data", params={"user_id": 7, "course_id": 3})
+    await client.request(
+        "DELETE", "/api/v1/privacy/data", params={"user_id": 7, "course_id": 3}
+    )
 
     assert len(calls) == 5
     # El 4to statement es un Update sobre QuizAttempt, no un Delete.

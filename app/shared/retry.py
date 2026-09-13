@@ -58,13 +58,19 @@ async def async_retry(
             if attempt == max_attempts:
                 logger.warning(
                     "Todos los %d intentos fallaron: %s: %s",
-                    max_attempts, type(exc).__name__, exc,
+                    max_attempts,
+                    type(exc).__name__,
+                    exc,
                 )
                 break
             delay = base_delay * (2 ** (attempt - 1))
             logger.warning(
                 "Intento %d/%d falló (%s: %s). Reintentando en %.1fs...",
-                attempt, max_attempts, type(exc).__name__, exc, delay,
+                attempt,
+                max_attempts,
+                type(exc).__name__,
+                exc,
+                delay,
             )
             await asyncio.sleep(delay)
         # Excepciones no-retryable propagán inmediatamente (sin except aquí).

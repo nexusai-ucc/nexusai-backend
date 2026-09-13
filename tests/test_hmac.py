@@ -44,11 +44,12 @@ def app(fake_redis):
     Mini FastAPI con un endpoint protegido por verify_hmac y Redis mockeado.
     No depende del main.py real para mantener los tests aislados.
     """
-    settings = get_settings()
     test_app = FastAPI()
 
     @test_app.post("/protected")
-    async def protected(_body: bytes = pytest.importorskip("fastapi").Depends(verify_hmac)):
+    async def protected(
+        _body: bytes = pytest.importorskip("fastapi").Depends(verify_hmac),
+    ):
         return {"ok": True}
 
     # Override de la dependency get_redis para usar el mock.
@@ -66,9 +67,7 @@ def _good_headers(body: bytes) -> dict[str, str]:
     settings = get_settings()
     timestamp = str(int(time.time()))
     nonce = "test-nonce-12345"
-    signature = _build_signature(
-        settings.nexusai_shared_secret, timestamp, nonce, body
-    )
+    signature = _build_signature(settings.nexusai_shared_secret, timestamp, nonce, body)
     return {
         "Authorization": f"Bearer {settings.nexusai_api_key}",
         "X-Timestamp": timestamp,
@@ -82,6 +81,7 @@ def _good_headers(body: bytes) -> dict[str, str]:
 # Happy path
 # ============================================================
 
+
 def test_happy_path(client):
     body = b'{"hello": "world"}'
     response = client.post("/protected", headers=_good_headers(body), content=body)
@@ -92,6 +92,7 @@ def test_happy_path(client):
 # ============================================================
 # Capa 1 — Bearer API key
 # ============================================================
+
 
 def test_missing_authorization(client):
     body = b'{"hello": "world"}'
@@ -123,6 +124,7 @@ def test_invalid_api_key(client):
 # ============================================================
 # Capa 2 — Timestamp / firma
 # ============================================================
+
 
 def test_invalid_timestamp_format(client):
     body = b'{"hello": "world"}'
@@ -186,6 +188,7 @@ def test_signature_with_wrong_secret(client):
 # ============================================================
 # Capa 3 — Anti-replay (nonce ya usado)
 # ============================================================
+
 
 def test_replay_detected(client, fake_redis):
     """Si Redis dice que el nonce ya existe (set NX = False), rechazar."""

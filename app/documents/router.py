@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import hashlib
 import logging
 from datetime import datetime
@@ -49,6 +50,7 @@ from app.documents.summarizer import summarize_document, summarize_pre_exam
 from app.infrastructure.redis_client import get_redis
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
+from app.shared.retry import async_retry
 
 logger = logging.getLogger("nexusai.documents")
 
@@ -81,11 +83,14 @@ _MAGIC_BYTES: dict[str, bytes | None] = {
 # Schemas
 # ============================================================
 
+
 class DocumentUploadRequest(BaseModel):
     """Payload de upload firmado con HMAC."""
 
     course_id: int = Field(gt=0, description="ID del curso de Moodle")
-    uploader_id: int = Field(gt=0, description="$USER->id real del docente (no del cliente)")
+    uploader_id: int = Field(
+        gt=0, description="$USER->id real del docente (no del cliente)"
+    )
     filename: str = Field(min_length=1, max_length=255)
     mime_type: str = Field(default="application/pdf")
     content_b64: str = Field(
@@ -147,6 +152,7 @@ class DocumentListResponse(BaseModel):
 # Validación de archivo — compartida entre upload_document y replace_document
 # ============================================================
 
+
 def _decode_and_validate_file(mime_type: str, content_b64: str) -> bytes:
     """Decodea y valida un archivo en base64: mime-type soportado, base64
     válido, no vacío, dentro del tamaño máximo y con magic bytes coherentes
@@ -163,14 +169,16 @@ def _decode_and_validate_file(mime_type: str, content_b64: str) -> bytes:
 
     try:
         file_bytes = base64.b64decode(content_b64, validate=True)
-    except (ValueError, base64.binascii.Error) as exc:
+    except (ValueError, binascii.Error) as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid base64 content: {exc}",
         )
 
     if not file_bytes:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File is empty")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="File is empty"
+        )
 
     if len(file_bytes) > MAX_UPLOAD_BYTES:
         raise HTTPException(
@@ -194,6 +202,7 @@ def _decode_and_validate_file(mime_type: str, content_b64: str) -> bytes:
 # ============================================================
 # Background task wrapper
 # ============================================================
+
 
 async def _index_document_task(
     document_id: UUID,
@@ -226,9 +235,57 @@ async def _index_document_task(
             )
 
 
+async def _persist_file_to_disk(
+    document: Document, file_bytes: bytes, filename: str, db: AsyncSession
+) -> Optional[str]:
+    """Guarda el archivo original en disco para que reindex/download puedan
+    leerlo después — best effort, compartido por upload_document y
+    replace_document (mismo storage_name = "{document_id}_{filename saneado}").
+
+    La indexación en sí NUNCA depende de esto (usa `file_bytes` en memoria),
+    así que una falla acá no debe romper el upload/replace — pero antes
+    quedaba atrapada en silencio (logger.warning sin exc_info), dejando
+    `storage_path=None` sin ninguna señal visible hasta que reindex/download
+    fallaban mucho después, sin forma de conectar la causa. Ahora: reintenta
+    una vez ante un blip transitorio de disco, y si igual falla (o falla el
+    commit posterior), loguea como error con el traceback completo.
+
+    Devuelve el storage_name si se guardó, o None si no se pudo persistir.
+    """
+    safe_name = Path(filename).name or "file"
+    storage_name = f"{document.id}_{safe_name}"
+
+    def _write() -> None:
+        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        (UPLOADS_DIR / storage_name).write_bytes(file_bytes)
+
+    try:
+        await async_retry(
+            lambda: asyncio.to_thread(_write),
+            max_attempts=2,
+            base_delay=0.15,
+            retryable=(OSError,),
+        )
+        document.storage_path = storage_name
+        await db.commit()
+    except Exception:
+        # Cualquier falla acá (disco tras reintentar, o el commit) es
+        # best-effort: no debe tirar el upload/replace completo.
+        logger.error(
+            "No se pudo guardar en disco el archivo del documento %s — "
+            "reindex/download van a fallar hasta que se vuelva a subir.",
+            document.id,
+            exc_info=True,
+        )
+        return None
+
+    return storage_name
+
+
 # ============================================================
 # Endpoints
 # ============================================================
+
 
 @router.post("", response_model=DocumentOut, status_code=status.HTTP_202_ACCEPTED)
 async def upload_document(
@@ -306,20 +363,9 @@ async def upload_document(
     await db.commit()
     await db.refresh(document)
 
-    # Persist original file bytes so the download endpoint can serve them.
-    # Filename is sanitized to avoid path traversal: only the basename is used.
-    safe_name = Path(payload.filename).name or "file"
-    storage_name = f"{document.id}_{safe_name}"
-    try:
-        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-        (UPLOADS_DIR / storage_name).write_bytes(file_bytes)
-        document.storage_path = storage_name
-        await db.commit()
-    except Exception as exc:
-        logger.warning(
-            "Could not save file to disk for document %s: %s",
-            document.id, exc,
-        )
+    # Persist original file bytes so the download/reindex endpoints can read
+    # them later — best effort, ver _persist_file_to_disk.
+    await _persist_file_to_disk(document, file_bytes, payload.filename, db)
 
     await db.refresh(document)
     doc_data = DocumentOut.from_orm(document)
@@ -344,7 +390,11 @@ class DocumentReplaceRequest(BaseModel):
     content_b64: str = Field(min_length=1)
 
 
-@router.post("/{document_id}/replace", response_model=DocumentOut, status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/{document_id}/replace",
+    response_model=DocumentOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 async def replace_document(
     document_id: UUID,
     payload: DocumentReplaceRequest,
@@ -363,7 +413,9 @@ async def replace_document(
     result = await db.execute(select(Document).where(Document.id == document_id))
     document = result.scalar_one_or_none()
     if document is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Document not found"
+        )
 
     file_bytes = _decode_and_validate_file(payload.mime_type, payload.content_b64)
 
@@ -382,23 +434,15 @@ async def replace_document(
     document.error_message = None
     await db.commit()
 
-    # Guardar el archivo nuevo en disco. Si el nombre cambió, el storage_name
-    # también cambia (incluye el filename) — borrar el archivo viejo para no
-    # dejar basura huérfana.
-    safe_name = Path(payload.filename).name or "file"
-    storage_name = f"{document.id}_{safe_name}"
-    try:
-        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-        (UPLOADS_DIR / storage_name).write_bytes(file_bytes)
-        document.storage_path = storage_name
-        await db.commit()
-        if old_storage_path and old_storage_path != storage_name:
-            (UPLOADS_DIR / old_storage_path).unlink(missing_ok=True)
-    except Exception as exc:
-        logger.warning(
-            "Could not save replacement file to disk for document %s: %s",
-            document.id, exc,
-        )
+    # Guardar el archivo nuevo en disco — best effort, ver _persist_file_to_disk.
+    # Si el nombre cambió, el storage_name también cambia (incluye el
+    # filename) — borrar el archivo viejo para no dejar basura huérfana
+    # (solo si el nuevo sí se pudo guardar).
+    new_storage_name = await _persist_file_to_disk(
+        document, file_bytes, payload.filename, db
+    )
+    if new_storage_name and old_storage_path and old_storage_path != new_storage_name:
+        (UPLOADS_DIR / old_storage_path).unlink(missing_ok=True)
 
     await db.refresh(document)
     doc_data = DocumentOut.from_orm(document)
@@ -413,13 +457,19 @@ async def replace_document(
 
     logger.info(
         "Document %s replaced: %r -> %r",
-        document.id, old_filename, payload.filename,
+        document.id,
+        old_filename,
+        payload.filename,
     )
 
     return doc_data
 
 
-@router.post("/{document_id}/reindex", response_model=DocumentOut, status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/{document_id}/reindex",
+    response_model=DocumentOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 async def reindex_document(
     document_id: UUID,
     _body: Annotated[bytes, Depends(verify_hmac)],
@@ -437,7 +487,9 @@ async def reindex_document(
     result = await db.execute(select(Document).where(Document.id == document_id))
     document = result.scalar_one_or_none()
     if document is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Document not found"
+        )
 
     if not document.storage_path:
         raise HTTPException(
@@ -492,7 +544,9 @@ async def get_document_status(
     result = await db.execute(select(Document).where(Document.id == document_id))
     document = result.scalar_one_or_none()
     if document is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Document not found"
+        )
     return DocumentOut.from_orm(document)
 
 
@@ -512,12 +566,16 @@ async def list_documents_by_course(
     tabla de materiales sí manda `limit`/`offset` explícitos para paginar.
     """
     if course_id <= 0:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="course_id must be positive")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="course_id must be positive"
+        )
 
     effective_limit = limit if limit is not None else _DEFAULT_LIST_LIMIT
 
     total = await db.scalar(
-        select(func.count()).select_from(Document).where(Document.course_id == course_id)
+        select(func.count())
+        .select_from(Document)
+        .where(Document.course_id == course_id)
     )
 
     result = await db.execute(
@@ -567,11 +625,14 @@ async def get_document_preview(
     result = await db.execute(select(Document).where(Document.id == document_id))
     document = result.scalar_one_or_none()
     if document is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Document not found"
+        )
 
     first_chunk = await db.scalar(
-        select(Chunk.content)
-        .where(Chunk.document_id == document_id, Chunk.chunk_index == 0)
+        select(Chunk.content).where(
+            Chunk.document_id == document_id, Chunk.chunk_index == 0
+        )
     )
 
     if not first_chunk:
@@ -609,7 +670,9 @@ async def download_document(
     result = await db.execute(select(Document).where(Document.id == document_id))
     document = result.scalar_one_or_none()
     if document is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Document not found"
+        )
     if not document.storage_path:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -617,7 +680,9 @@ async def download_document(
         )
     file_path = UPLOADS_DIR / document.storage_path
     if not file_path.exists():
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found on disk")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="File not found on disk"
+        )
 
     return FileResponse(
         path=str(file_path),
@@ -744,7 +809,9 @@ async def delete_document(
     result = await db.execute(select(Document).where(Document.id == document_id))
     document = result.scalar_one_or_none()
     if document is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Document not found"
+        )
 
     # Eliminar el archivo del disco antes de borrar el registro.
     # Nunca propagar: un fallo de disco no debe bloquear el borrado en DB.
@@ -753,7 +820,9 @@ async def delete_document(
             try:
                 (UPLOADS_DIR / document.storage_path).unlink(missing_ok=True)
             except OSError as exc:
-                logger.warning("Could not delete file %s: %s", document.storage_path, exc)
+                logger.warning(
+                    "Could not delete file %s: %s", document.storage_path, exc
+                )
     except Exception:
         pass
 

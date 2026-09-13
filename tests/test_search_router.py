@@ -65,7 +65,9 @@ async def client(mock_db, mock_embeddings):
     app.dependency_overrides[get_db] = lambda: mock_db
     app.dependency_overrides[get_embedding_provider] = lambda: mock_embeddings
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as c:
         yield c
 
 

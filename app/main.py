@@ -58,10 +58,13 @@ async def _recover_interrupted_documents() -> None:
                 """)
             )
             await db.commit()
-            if result.rowcount:
+            # execute() de un UPDATE vía text() devuelve un CursorResult real
+            # (con rowcount) en runtime; el tipo genérico Result[Any] no lo
+            # expone estáticamente.
+            if result.rowcount:  # type: ignore[attr-defined]
                 logger.info(
                     "Startup recovery: %d documento(s) con indexación interrumpida → error",
-                    result.rowcount,
+                    result.rowcount,  # type: ignore[attr-defined]
                 )
     except Exception as exc:
         logger.warning("Startup recovery failed (non-fatal): %s", exc)
@@ -110,36 +113,37 @@ if settings.env == "development":
 # Routers de feature
 # ============================================================
 
-from app.admin.router import router as admin_router          # noqa: E402
+from app.admin.router import router as admin_router  # noqa: E402
 from app.analytics.router import router as analytics_router  # noqa: E402
-from app.calendar.router import router as calendar_router    # noqa: E402
-from app.chat.router import router as chat_router            # noqa: E402
-from app.courses.router import router as courses_router      # noqa: E402
+from app.calendar.router import router as calendar_router  # noqa: E402
+from app.chat.router import router as chat_router  # noqa: E402
+from app.courses.router import router as courses_router  # noqa: E402
 from app.documents.router import router as documents_router  # noqa: E402
-from app.forums.router import router as forums_router        # noqa: E402
-from app.gaps.router import router as gaps_router            # noqa: E402
-from app.privacy.router import router as privacy_router      # noqa: E402
-from app.quiz.router import router as quiz_router            # noqa: E402
-from app.search.router import router as search_router        # noqa: E402
-from app.voice.router import router as voice_router          # noqa: E402
+from app.forums.router import router as forums_router  # noqa: E402
+from app.gaps.router import router as gaps_router  # noqa: E402
+from app.privacy.router import router as privacy_router  # noqa: E402
+from app.quiz.router import router as quiz_router  # noqa: E402
+from app.search.router import router as search_router  # noqa: E402
+from app.voice.router import router as voice_router  # noqa: E402
 
-app.include_router(analytics_router, prefix="/api/v1/analytics",       tags=["analytics"])
-app.include_router(calendar_router,  prefix="/api/v1/calendar/alerts", tags=["calendar"])
-app.include_router(chat_router,      prefix="/api/v1/chat",            tags=["chat"])
-app.include_router(documents_router, prefix="/api/v1/documents",       tags=["documents"])
-app.include_router(admin_router,     prefix="/api/v1/admin",           tags=["admin"])
-app.include_router(courses_router,   prefix="/api/v1/courses",         tags=["courses"])
-app.include_router(search_router,    prefix="/api/v1/search",          tags=["search"])
-app.include_router(quiz_router,      prefix="/api/v1/quiz",            tags=["quiz"])
-app.include_router(gaps_router,      prefix="/api/v1/gaps",            tags=["gaps"])
-app.include_router(forums_router,    prefix="/api/v1/forums",          tags=["forums"])
-app.include_router(privacy_router,   prefix="/api/v1/privacy",         tags=["privacy"])
-app.include_router(voice_router,     prefix="/api/v1/voice",           tags=["voice"])
+app.include_router(analytics_router, prefix="/api/v1/analytics", tags=["analytics"])
+app.include_router(calendar_router, prefix="/api/v1/calendar/alerts", tags=["calendar"])
+app.include_router(chat_router, prefix="/api/v1/chat", tags=["chat"])
+app.include_router(documents_router, prefix="/api/v1/documents", tags=["documents"])
+app.include_router(admin_router, prefix="/api/v1/admin", tags=["admin"])
+app.include_router(courses_router, prefix="/api/v1/courses", tags=["courses"])
+app.include_router(search_router, prefix="/api/v1/search", tags=["search"])
+app.include_router(quiz_router, prefix="/api/v1/quiz", tags=["quiz"])
+app.include_router(gaps_router, prefix="/api/v1/gaps", tags=["gaps"])
+app.include_router(forums_router, prefix="/api/v1/forums", tags=["forums"])
+app.include_router(privacy_router, prefix="/api/v1/privacy", tags=["privacy"])
+app.include_router(voice_router, prefix="/api/v1/voice", tags=["voice"])
 
 
 # ============================================================
 # Endpoints de servicio
 # ============================================================
+
 
 @app.get("/health")
 async def health():

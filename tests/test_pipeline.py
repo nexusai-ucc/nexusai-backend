@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
@@ -29,6 +29,7 @@ from app.providers.embeddings import EmbeddingProvider
 # ============================================================
 # Helpers
 # ============================================================
+
 
 def _make_doc(**kwargs) -> SimpleNamespace:
     """Simula un ORM Document con atributos seteables."""
@@ -62,6 +63,7 @@ def _db_exec(scalar_one_or_none=None, scalar_one=0) -> MagicMock:
 # Test 1: happy path — indexación completa
 # ============================================================
 
+
 async def test_index_document_indexes_successfully():
     """
     Flujo normal: extrae texto → 2 chunks → 2 embeddings → persiste como 'indexed'.
@@ -81,7 +83,10 @@ async def test_index_document_indexes_successfully():
     embeddings = AsyncMock(spec=EmbeddingProvider)
     embeddings.embed.return_value = [0.1] * 768
 
-    with patch("app.documents.pipeline.extract_text", return_value="Hola mundo. Texto de prueba."):
+    with patch(
+        "app.documents.pipeline.extract_text",
+        return_value="Hola mundo. Texto de prueba.",
+    ):
         result = await index_document(doc.id, b"%PDF-fake", db, embeddings)
 
     assert result.status == "indexed"
@@ -95,6 +100,7 @@ async def test_index_document_indexes_successfully():
 # ============================================================
 # Test 2: CONT-04 — skip si ya hay chunks
 # ============================================================
+
 
 async def test_index_document_skips_if_chunks_already_exist():
     """
@@ -126,6 +132,7 @@ async def test_index_document_skips_if_chunks_already_exist():
 # Test 3: documento no encontrado
 # ============================================================
 
+
 async def test_index_document_raises_if_document_not_found():
     """
     Si el document_id no existe en DB, el pipeline levanta ValueError.
@@ -144,6 +151,7 @@ async def test_index_document_raises_if_document_not_found():
 # Test 4: fallo total de embeddings → status='error'
 # ============================================================
 
+
 async def test_index_document_marks_error_when_all_embeddings_fail():
     """
     Si todos los chunks fallan al embeddear, el pipeline marca status='error'
@@ -154,9 +162,9 @@ async def test_index_document_marks_error_when_all_embeddings_fail():
 
     # El error handler re-fetches el documento con un tercer execute()
     db.execute.side_effect = [
-        _db_exec(scalar_one_or_none=doc),   # fetch inicial
-        _db_exec(scalar_one=0),              # count chunks → 0
-        _db_exec(scalar_one_or_none=doc),   # re-fetch en bloque except
+        _db_exec(scalar_one_or_none=doc),  # fetch inicial
+        _db_exec(scalar_one=0),  # count chunks → 0
+        _db_exec(scalar_one_or_none=doc),  # re-fetch en bloque except
     ]
 
     embeddings = AsyncMock(spec=EmbeddingProvider)
@@ -176,6 +184,7 @@ async def test_index_document_marks_error_when_all_embeddings_fail():
 # Test 5: error en extracción (PDF vacío / corrupto)
 # ============================================================
 
+
 async def test_index_document_marks_error_on_extraction_failure():
     """
     Si extract_text() falla (PDF ilegible, archivo corrupto, etc.),
@@ -187,9 +196,9 @@ async def test_index_document_marks_error_on_extraction_failure():
     # Flujo: fetch doc → count chunks → commit 'indexing' → extract falla
     # → rollback → re-fetch doc → commit 'error' → raise
     db.execute.side_effect = [
-        _db_exec(scalar_one_or_none=doc),   # fetch inicial
-        _db_exec(scalar_one=0),              # count chunks → 0
-        _db_exec(scalar_one_or_none=doc),   # re-fetch en bloque except
+        _db_exec(scalar_one_or_none=doc),  # fetch inicial
+        _db_exec(scalar_one=0),  # count chunks → 0
+        _db_exec(scalar_one_or_none=doc),  # re-fetch en bloque except
     ]
 
     embeddings = AsyncMock(spec=EmbeddingProvider)

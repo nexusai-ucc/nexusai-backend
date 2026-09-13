@@ -75,7 +75,7 @@ async def verify_hmac(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing or malformed Authorization header",
         )
-    api_key = authorization[len("Bearer "):]
+    api_key = authorization[len("Bearer ") :]
     if not hmac_lib.compare_digest(api_key, settings.nexusai_api_key):
         # `compare_digest` evita timing attacks (no leakea info por el largo
         # del prefix coincidente).
@@ -135,8 +135,8 @@ async def verify_hmac(
     nonce_key = f"{_NONCE_KEY_PREFIX}{x_nonce}"
     was_set = await redis.set(
         nonce_key,
-        str(ts),                # value: timestamp original (útil para debug)
-        nx=True,                # NX: solo si no existe
+        str(ts),  # value: timestamp original (útil para debug)
+        nx=True,  # NX: solo si no existe
         ex=settings.hmac_replay_window_sec,  # EX: TTL en segundos
     )
     if not was_set:

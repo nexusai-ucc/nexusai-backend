@@ -168,8 +168,6 @@ def format_context_for_prompt(
         if course_names and chunk.course_id in course_names:
             course_label = f", materia: {course_names[chunk.course_id]}"
 
-        parts.append(
-            f'[Fuente: "{chunk.document_filename}"{course_label}]\n{content}'
-        )
+        parts.append(f'[Fuente: "{chunk.document_filename}"{course_label}]\n{content}')
 
     return "\n\n".join(parts)

@@ -56,7 +56,9 @@ async def client(mock_db, mock_llm):
     app.dependency_overrides[get_db] = lambda: mock_db
     app.dependency_overrides[get_llm_provider] = lambda: mock_llm
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as c:
         yield c
 
 
@@ -67,7 +69,9 @@ def _llm_response(payload: dict) -> MagicMock:
     return MagicMock(text=json.dumps(payload))
 
 
-async def test_no_interactions_returns_empty_without_llm_call(client, mock_db, mock_llm):
+async def test_no_interactions_returns_empty_without_llm_call(
+    client, mock_db, mock_llm
+):
     mock_db.execute.return_value.all.return_value = []
 
     response = await client.post("/api/v1/analytics/faq-topics", json=_BASE_PAYLOAD)
@@ -79,18 +83,22 @@ async def test_no_interactions_returns_empty_without_llm_call(client, mock_db, m
 
 
 async def test_topics_recompute_count_from_assigned_indices(client, mock_llm):
-    mock_llm.chat_completion.return_value = _llm_response({
-        "topics": [
-            {"label": "Fechas del parcial", "question_indices": [0]},
-            {"label": "Álgebra lineal", "question_indices": [1, 2]},
-        ]
-    })
+    mock_llm.chat_completion.return_value = _llm_response(
+        {
+            "topics": [
+                {"label": "Fechas del parcial", "question_indices": [0]},
+                {"label": "Álgebra lineal", "question_indices": [1, 2]},
+            ]
+        }
+    )
 
     response = await client.post("/api/v1/analytics/faq-topics", json=_BASE_PAYLOAD)
 
     assert response.status_code == 200
     data = response.json()
-    assert data["total_questions"] == 14  # 6 + 5 + 3, calculado en Python, no por el LLM
+    assert (
+        data["total_questions"] == 14
+    )  # 6 + 5 + 3, calculado en Python, no por el LLM
     topics = {t["topic"]: t for t in data["topics"]}
     assert topics["Fechas del parcial"]["count"] == 6
     assert topics["Álgebra lineal"]["count"] == 8  # 5 + 3, no lo que diga el LLM
@@ -98,12 +106,14 @@ async def test_topics_recompute_count_from_assigned_indices(client, mock_llm):
 
 async def test_topics_sorted_by_recomputed_count_desc(client, mock_llm):
     # El LLM devuelve el grupo chico primero — la respuesta debe reordenar igual.
-    mock_llm.chat_completion.return_value = _llm_response({
-        "topics": [
-            {"label": "Chico", "question_indices": [2]},
-            {"label": "Grande", "question_indices": [0, 1]},
-        ]
-    })
+    mock_llm.chat_completion.return_value = _llm_response(
+        {
+            "topics": [
+                {"label": "Chico", "question_indices": [2]},
+                {"label": "Grande", "question_indices": [0, 1]},
+            ]
+        }
+    )
 
     response = await client.post("/api/v1/analytics/faq-topics", json=_BASE_PAYLOAD)
 
@@ -112,12 +122,14 @@ async def test_topics_sorted_by_recomputed_count_desc(client, mock_llm):
 
 
 async def test_invalid_indices_are_dropped_and_topic_skipped_if_empty(client, mock_llm):
-    mock_llm.chat_completion.return_value = _llm_response({
-        "topics": [
-            {"label": "Fuera de rango", "question_indices": [99]},
-            {"label": "Válido", "question_indices": [0, 99]},
-        ]
-    })
+    mock_llm.chat_completion.return_value = _llm_response(
+        {
+            "topics": [
+                {"label": "Fuera de rango", "question_indices": [99]},
+                {"label": "Válido", "question_indices": [0, 99]},
+            ]
+        }
+    )
 
     response = await client.post("/api/v1/analytics/faq-topics", json=_BASE_PAYLOAD)
 
