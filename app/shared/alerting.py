@@ -162,7 +162,9 @@ async def record_event_and_maybe_alert(
             return False
     except Exception as exc:
         # Redis caído no puede tumbar el request/la llamada que lo disparó.
-        logger.warning("record_event_and_maybe_alert falló (Redis no disponible?): %s", exc)
+        logger.warning(
+            "record_event_and_maybe_alert falló (Redis no disponible?): %s", exc
+        )
         return False
 
     _fire_and_forget(send_alert(title, message))

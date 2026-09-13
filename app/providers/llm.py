@@ -304,7 +304,9 @@ class LLMProvider:
         quota_exhausted: Optional[openai.RateLimitError] = None
         for i, (client, model) in enumerate(chain):
             try:
-                return await LLMProvider._create_completion(client, model, messages, **kwargs)
+                return await LLMProvider._create_completion(
+                    client, model, messages, **kwargs
+                )
             except openai.RateLimitError as exc:
                 quota_exhausted = quota_exhausted or exc
                 if i == len(chain) - 1:
@@ -312,7 +314,10 @@ class LLMProvider:
                 next_model = chain[i + 1][1]
                 logger.warning(
                     "LLM fallback activado: %s agotado (%s: %s). Pasando a %s.",
-                    model, type(exc).__name__, exc, next_model,
+                    model,
+                    type(exc).__name__,
+                    exc,
+                    next_model,
                 )
             except _FALLBACK_TRIGGERS as exc:
                 if i == len(chain) - 1:
@@ -360,7 +365,10 @@ class LLMProvider:
                 next_model = chain[i + 1][1]
                 logger.warning(
                     "LLM fallback activado (stream): %s agotado (%s: %s). Pasando a %s.",
-                    model, type(exc).__name__, exc, next_model,
+                    model,
+                    type(exc).__name__,
+                    exc,
+                    next_model,
                 )
             except _FALLBACK_TRIGGERS as exc:
                 if i == len(chain) - 1:

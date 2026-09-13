@@ -672,7 +672,9 @@ async def test_chat_completion_propagates_quota_error_over_later_link_failure():
 
     with patch("app.shared.retry.asyncio.sleep", new=AsyncMock()):
         with pytest.raises(openai.RateLimitError):
-            await provider.chat_completion(messages=[{"role": "user", "content": "hola"}])
+            await provider.chat_completion(
+                messages=[{"role": "user", "content": "hola"}]
+            )
 
 
 @pytest.mark.asyncio
@@ -686,5 +688,7 @@ async def test_chat_stream_propagates_quota_error_over_later_link_failure():
     )
 
     with pytest.raises(openai.RateLimitError):
-        async for _ in provider.chat_stream(messages=[{"role": "user", "content": "hola"}]):
+        async for _ in provider.chat_stream(
+            messages=[{"role": "user", "content": "hola"}]
+        ):
             pass

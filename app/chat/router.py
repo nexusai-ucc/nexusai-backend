@@ -304,7 +304,9 @@ async def messages(
         ) from exc
 
     llm_latency_ms = (time.perf_counter() - llm_start) * 1000
-    await record_llm_slow_and_maybe_alert(redis, endpoint="messages", latency_ms=llm_latency_ms)
+    await record_llm_slow_and_maybe_alert(
+        redis, endpoint="messages", latency_ms=llm_latency_ms
+    )
 
     # ----- BACK-12: Persistir mensaje del asistente con token counts -----
     assistant_message = Message(
@@ -718,7 +720,9 @@ async def messages_stream(
                 # probable acá (retrieval ya tiene su propio try/except arriba),
                 # y contar de más algo que no era LLM es un falso positivo
                 # aceptable para un piloto.
-                await record_llm_failure_and_maybe_alert(redis, endpoint="stream", error=exc)
+                await record_llm_failure_and_maybe_alert(
+                    redis, endpoint="stream", error=exc
+                )
                 yield (
                     "data: "
                     + json.dumps(

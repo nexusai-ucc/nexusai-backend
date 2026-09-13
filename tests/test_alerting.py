@@ -42,9 +42,11 @@ def _configured_settings() -> MagicMock:
 # send_alert
 # ============================================================
 
+
 async def test_send_alert_sends_email_when_smtp_configured():
-    with patch("app.shared.alerting.get_settings", return_value=_configured_settings()), \
-         patch("app.shared.alerting._send_email_sync") as mock_send_sync:
+    with patch(
+        "app.shared.alerting.get_settings", return_value=_configured_settings()
+    ), patch("app.shared.alerting._send_email_sync") as mock_send_sync:
         await alerting.send_alert("Título", "Mensaje")
 
     mock_send_sync.assert_called_once_with(
@@ -64,16 +66,21 @@ async def test_send_alert_without_smtp_config_only_logs():
     settings.alert_smtp_password = None
     settings.alert_email_to = None
 
-    with patch("app.shared.alerting.get_settings", return_value=settings), \
-         patch("app.shared.alerting._send_email_sync") as mock_send_sync:
+    with patch("app.shared.alerting.get_settings", return_value=settings), patch(
+        "app.shared.alerting._send_email_sync"
+    ) as mock_send_sync:
         await alerting.send_alert("Título", "Mensaje")
 
     mock_send_sync.assert_not_called()
 
 
 async def test_send_alert_smtp_failure_does_not_propagate():
-    with patch("app.shared.alerting.get_settings", return_value=_configured_settings()), \
-         patch("app.shared.alerting._send_email_sync", side_effect=Exception("smtp unreachable")):
+    with patch(
+        "app.shared.alerting.get_settings", return_value=_configured_settings()
+    ), patch(
+        "app.shared.alerting._send_email_sync",
+        side_effect=Exception("smtp unreachable"),
+    ):
         # No debe lanzar.
         await alerting.send_alert("Título", "Mensaje")
 
@@ -81,6 +88,7 @@ async def test_send_alert_smtp_failure_does_not_propagate():
 # ============================================================
 # record_event_and_maybe_alert — lógica de umbral
 # ============================================================
+
 
 async def test_alert_not_triggered_below_threshold():
     redis = _fake_redis(incr_result=2)
@@ -211,8 +219,12 @@ async def test_second_window_within_cooldown_does_not_realert():
 
     with patch("app.shared.alerting.send_alert", new=AsyncMock()) as mock_send:
         first = await alerting.record_event_and_maybe_alert(
-            redis, key_prefix="test:key", window_sec=60, threshold=5,
-            title="t", message="m",
+            redis,
+            key_prefix="test:key",
+            window_sec=60,
+            threshold=5,
+            title="t",
+            message="m",
         )
         await asyncio.sleep(0)
 
@@ -222,8 +234,12 @@ async def test_second_window_within_cooldown_does_not_realert():
         # que es mucho mayor a window_sec en la config real).
         redis.set = AsyncMock(return_value=False)
         second = await alerting.record_event_and_maybe_alert(
-            redis, key_prefix="test:key", window_sec=60, threshold=5,
-            title="t", message="m",
+            redis,
+            key_prefix="test:key",
+            window_sec=60,
+            threshold=5,
+            title="t",
+            message="m",
         )
         await asyncio.sleep(0)
 
