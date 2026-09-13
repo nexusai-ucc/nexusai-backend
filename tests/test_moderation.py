@@ -37,7 +37,9 @@ def _mock_llm(response_text: str) -> AsyncMock:
     return llm
 
 
-def _openai_response(*, flagged: bool, categories: dict[str, bool] | None = None) -> MagicMock:
+def _openai_response(
+    *, flagged: bool, categories: dict[str, bool] | None = None
+) -> MagicMock:
     response = MagicMock()
     response.raise_for_status = MagicMock()
     response.json.return_value = {
@@ -50,8 +52,12 @@ def _openai_response(*, flagged: bool, categories: dict[str, bool] | None = None
 # Deshabilitado / texto vacío
 # ─────────────────────────────────────────────────────────────
 
+
 async def test_disabled_allows_everything():
-    with patch("app.shared.moderation.get_settings", return_value=_settings(moderation_enabled=False)):
+    with patch(
+        "app.shared.moderation.get_settings",
+        return_value=_settings(moderation_enabled=False),
+    ):
         result = await moderation.moderate_text("cualquier cosa horrible", llm=None)
 
     assert result.allowed is True
@@ -59,7 +65,10 @@ async def test_disabled_allows_everything():
 
 
 async def test_empty_text_is_allowed_without_calling_anything():
-    with patch("app.shared.moderation.get_settings", return_value=_settings(moderation_api_key="sk-test")):
+    with patch(
+        "app.shared.moderation.get_settings",
+        return_value=_settings(moderation_api_key="sk-test"),
+    ):
         result = await moderation.moderate_text("   ", llm=None)
 
     assert result.allowed is True
@@ -70,6 +79,7 @@ async def test_empty_text_is_allowed_without_calling_anything():
 # Camino primario: Moderation API de OpenAI
 # ─────────────────────────────────────────────────────────────
 
+
 async def test_openai_api_allows_acceptable_content():
     settings = _settings(moderation_api_key="sk-test")
     with patch("app.shared.moderation.get_settings", return_value=settings):
@@ -78,7 +88,9 @@ async def test_openai_api_allows_acceptable_content():
             mock_client.post.return_value = _openai_response(flagged=False)
             mock_client_cls.return_value.__aenter__.return_value = mock_client
 
-            result = await moderation.moderate_text("¿Cómo resuelvo esta integral?", llm=None)
+            result = await moderation.moderate_text(
+                "¿Cómo resuelvo esta integral?", llm=None
+            )
 
     assert result.allowed is True
     assert result.source == "openai_api"
@@ -106,6 +118,7 @@ async def test_openai_api_blocks_flagged_content_with_clear_message():
 # ─────────────────────────────────────────────────────────────
 # Fallback agnóstico: clasificación vía el LLM activo (sin MODERATION_API_KEY)
 # ─────────────────────────────────────────────────────────────
+
 
 async def test_llm_fallback_allows_acceptable_content_when_no_api_key():
     settings = _settings(moderation_api_key=None)
@@ -167,7 +180,9 @@ async def test_falls_back_to_llm_when_openai_api_raises():
 
     with patch("app.shared.moderation.get_settings", return_value=settings):
         with patch("app.shared.moderation.httpx.AsyncClient") as mock_client_cls:
-            mock_client_cls.return_value.__aenter__.side_effect = Exception("openai down")
+            mock_client_cls.return_value.__aenter__.side_effect = Exception(
+                "openai down"
+            )
 
             result = await moderation.moderate_text("pregunta normal", llm=llm)
 
@@ -180,6 +195,7 @@ async def test_falls_back_to_llm_when_openai_api_raises():
 # Fail-safe: la moderación NO debe romper el endpoint que la usa.
 # ─────────────────────────────────────────────────────────────
 
+
 async def test_fail_open_by_default_when_every_path_fails():
     """Con MODERATION_FAIL_OPEN=true (default), un fallo total de la
     moderación deja pasar el mensaje en vez de bloquear al alumno."""
@@ -189,7 +205,9 @@ async def test_fail_open_by_default_when_every_path_fails():
 
     with patch("app.shared.moderation.get_settings", return_value=settings):
         with patch("app.shared.moderation.httpx.AsyncClient") as mock_client_cls:
-            mock_client_cls.return_value.__aenter__.side_effect = Exception("openai down")
+            mock_client_cls.return_value.__aenter__.side_effect = Exception(
+                "openai down"
+            )
 
             result = await moderation.moderate_text("texto cualquiera", llm=llm)
 
@@ -206,7 +224,9 @@ async def test_fail_closed_when_configured_and_everything_fails():
 
     with patch("app.shared.moderation.get_settings", return_value=settings):
         with patch("app.shared.moderation.httpx.AsyncClient") as mock_client_cls:
-            mock_client_cls.return_value.__aenter__.side_effect = Exception("openai down")
+            mock_client_cls.return_value.__aenter__.side_effect = Exception(
+                "openai down"
+            )
 
             result = await moderation.moderate_text("texto cualquiera", llm=llm)
 

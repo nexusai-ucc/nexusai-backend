@@ -34,7 +34,9 @@ async def client(mock_db):
     app.dependency_overrides[verify_hmac] = lambda: b"test-body"
     app.dependency_overrides[get_db] = lambda: mock_db
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as c:
         yield c
 
 
@@ -78,7 +80,9 @@ async def test_feedback_upserts_when_student_changes_vote(client, mock_db):
 
     response = await client.post(
         "/api/v1/chat/messages/feedback",
-        json=_payload(is_helpful=False, comment="La respuesta citaba la fuente equivocada."),
+        json=_payload(
+            is_helpful=False, comment="La respuesta citaba la fuente equivocada."
+        ),
     )
 
     assert response.status_code == 200

@@ -21,6 +21,7 @@ from app.documents.chunker import Chunk, chunk_text
 # Happy path
 # ============================================================
 
+
 def test_short_text_returns_single_chunk():
     """Texto que cabe en max_tokens → un solo chunk."""
     text = "Una derivada mide la tasa instantánea de cambio."
@@ -74,6 +75,7 @@ def test_chunk_content_is_stripped():
 # Validaciones de input
 # ============================================================
 
+
 def test_empty_text_raises():
     with pytest.raises(ValueError, match="empty"):
         chunk_text("", max_tokens=512, overlap_tokens=64)
@@ -108,6 +110,7 @@ def test_negative_overlap_raises():
 # ============================================================
 # Edge cases
 # ============================================================
+
 
 def test_zero_overlap_no_repetition():
     """Con overlap=0, los chunks no deberían repetir contenido."""

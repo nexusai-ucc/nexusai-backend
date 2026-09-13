@@ -3,6 +3,7 @@ from typing import Optional
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 
+
 class Settings(BaseSettings):
     env: str = "development"
     app_version: str = "0.1.0"
@@ -122,6 +123,10 @@ class Settings(BaseSettings):
         env_file = ".env"
         env_file_encoding = "utf-8"
 
+
 @lru_cache()
 def get_settings() -> Settings:
-    return Settings()
+    # mypy no sabe que BaseSettings completa los args "faltantes" leyendo
+    # variables de entorno en tiempo de ejecución (no hay plugin de mypy
+    # para pydantic-settings instalado acá).
+    return Settings()  # type: ignore[call-arg]

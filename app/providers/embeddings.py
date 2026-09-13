@@ -137,6 +137,7 @@ class EmbeddingProvider:
 # FastAPI Dependency
 # ============================================================
 
+
 @lru_cache(maxsize=1)
 def _cached_provider() -> EmbeddingProvider:
     return EmbeddingProvider()

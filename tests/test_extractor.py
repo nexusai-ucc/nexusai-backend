@@ -29,12 +29,13 @@ HTML_MIME = "text/html"
 # Helpers — generar PDFs in-memory
 # ============================================================
 
+
 def _make_pdf_bytes(text_per_page: list[str]) -> bytes:
     """
     Crea un PDF con N páginas, una página por entrada de `text_per_page`.
     Devuelve los bytes serializados.
     """
-    reportlab = pytest.importorskip(
+    pytest.importorskip(
         "reportlab",
         reason="reportlab no instalado — pip install reportlab para correr estos tests",
     )
@@ -59,6 +60,7 @@ def _make_pdf_bytes(text_per_page: list[str]) -> bytes:
 # Happy path
 # ============================================================
 
+
 def test_extract_single_page_pdf():
     pdf_bytes = _make_pdf_bytes(["Una derivada mide la tasa instantánea."])
     text = extract_text(pdf_bytes)
@@ -67,11 +69,13 @@ def test_extract_single_page_pdf():
 
 
 def test_extract_multi_page_pdf_joins_pages():
-    pdf_bytes = _make_pdf_bytes([
-        "Pagina uno con contenido inicial.",
-        "Pagina dos con mas contenido.",
-        "Pagina tres ultima.",
-    ])
+    pdf_bytes = _make_pdf_bytes(
+        [
+            "Pagina uno con contenido inicial.",
+            "Pagina dos con mas contenido.",
+            "Pagina tres ultima.",
+        ]
+    )
     text = extract_text(pdf_bytes)
     assert "uno" in text.lower()
     assert "dos" in text.lower()
@@ -90,6 +94,7 @@ def test_extract_returns_stripped_text():
 # ============================================================
 # Validaciones de input
 # ============================================================
+
 
 def test_empty_bytes_raises():
     with pytest.raises(ValueError, match="vacío"):
@@ -146,6 +151,7 @@ def test_pdf_with_no_text_falls_back_to_ocr():
 # PPTX
 # ============================================================
 
+
 def _make_pptx_bytes(slide_texts: list[str]) -> bytes:
     pytest.importorskip("pptx", reason="python-pptx no instalado")
     from pptx import Presentation  # type: ignore[import-not-found]
@@ -162,7 +168,9 @@ def _make_pptx_bytes(slide_texts: list[str]) -> bytes:
 
 
 def test_extract_pptx_reads_slide_text():
-    pptx_bytes = _make_pptx_bytes(["Introducción a las derivadas", "Regla de la cadena"])
+    pptx_bytes = _make_pptx_bytes(
+        ["Introducción a las derivadas", "Regla de la cadena"]
+    )
     text = extract_text(pptx_bytes, mime_type=PPTX_MIME)
     assert "derivadas" in text.lower()
     assert "cadena" in text.lower()
@@ -184,6 +192,7 @@ def test_pptx_without_text_or_images_raises():
 # ============================================================
 # XLSX
 # ============================================================
+
 
 def _make_xlsx_bytes(rows: list[list]) -> bytes:
     openpyxl = pytest.importorskip("openpyxl", reason="openpyxl no instalado")
@@ -213,6 +222,7 @@ def test_empty_xlsx_raises():
 # CSV
 # ============================================================
 
+
 def test_extract_csv_joins_rows():
     csv_bytes = "tema,nota\nlímites,9\nderivadas,8\n".encode("utf-8")
     text = extract_text(csv_bytes, mime_type=CSV_MIME)
@@ -229,6 +239,7 @@ def test_empty_csv_raises():
 # Markdown
 # ============================================================
 
+
 def test_extract_markdown_returns_plain_text():
     md_bytes = "# Título\n\nContenido sobre **derivadas**.".encode("utf-8")
     text = extract_text(md_bytes, mime_type=MD_MIME)
@@ -238,6 +249,7 @@ def test_extract_markdown_returns_plain_text():
 # ============================================================
 # HTML
 # ============================================================
+
 
 def test_extract_html_strips_tags():
     html_bytes = (
@@ -261,6 +273,7 @@ def test_html_without_visible_text_raises():
 # ============================================================
 # Tipo no soportado
 # ============================================================
+
 
 def test_unsupported_mime_type_raises():
     with pytest.raises(ValueError, match="no soportado"):

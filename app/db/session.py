@@ -35,6 +35,7 @@ class Base(DeclarativeBase):
     via importación en app/db/models.py (TODO: crear cuando agreguemos
     Alembic).
     """
+
     pass
 
 

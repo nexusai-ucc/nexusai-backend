@@ -47,7 +47,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime
 
 from app.auth.hmac import verify_hmac
-from app.db.models import ChatSession, Flashcard, FlashcardReview, Message, QuizAttempt, QuizError
+from app.db.models import (
+    ChatSession,
+    Flashcard,
+    FlashcardReview,
+    Message,
+    QuizAttempt,
+    QuizError,
+)
 from app.db.session import get_db
 
 router = APIRouter()
@@ -56,6 +63,7 @@ router = APIRouter()
 # ============================================================
 # Schemas
 # ============================================================
+
 
 class ExportedMessage(BaseModel):
     session_id: UUID
@@ -112,6 +120,7 @@ def _validate_ids(user_id: int, course_id: int) -> None:
 # ============================================================
 # GET /export
 # ============================================================
+
 
 @router.get("/export", response_model=PrivacyExportResponse)
 async def export_personal_data(
@@ -195,6 +204,7 @@ async def export_personal_data(
 # ============================================================
 # DELETE /data
 # ============================================================
+
 
 @router.delete("/data", response_model=PrivacyDeleteResponse)
 async def delete_personal_data(

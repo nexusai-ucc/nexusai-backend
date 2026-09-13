@@ -16,6 +16,7 @@ configurada, devuelve 503 explícito en vez de fallar al intentar transcribir.
 from __future__ import annotations
 
 import base64
+import binascii
 import logging
 from typing import Annotated
 
@@ -23,7 +24,10 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from app.auth.hmac import verify_hmac
-from app.providers.transcription import TranscriptionProvider, get_transcription_provider
+from app.providers.transcription import (
+    TranscriptionProvider,
+    get_transcription_provider,
+)
 
 router = APIRouter()
 
@@ -77,14 +81,16 @@ async def transcribe(
 
     try:
         audio_bytes = base64.b64decode(payload.content_b64, validate=True)
-    except (ValueError, base64.binascii.Error) as exc:
+    except (ValueError, binascii.Error) as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid base64 content: {exc}",
         )
 
     if not audio_bytes:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Audio is empty")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Audio is empty"
+        )
 
     if len(audio_bytes) > MAX_AUDIO_BYTES:
         raise HTTPException(
@@ -95,7 +101,10 @@ async def transcribe(
     ext = payload.mime_type.split("/")[-1]
     try:
         text = await provider.transcribe(
-            audio_bytes, filename=f"question.{ext}", mime_type=payload.mime_type, language=payload.language
+            audio_bytes,
+            filename=f"question.{ext}",
+            mime_type=payload.mime_type,
+            language=payload.language,
         )
     except Exception as exc:
         _logger.warning("VOICE-01: fallo al transcribir audio", exc_info=True)

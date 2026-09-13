@@ -29,12 +29,15 @@ def _server_error() -> openai.InternalServerError:
     response = MagicMock()
     response.status_code = 503
     response.headers = {}
-    return openai.InternalServerError("service unavailable", response=response, body=None)
+    return openai.InternalServerError(
+        "service unavailable", response=response, body=None
+    )
 
 
 # ============================================================
 # LLMProvider — chat_completion
 # ============================================================
+
 
 @pytest.mark.asyncio
 async def test_chat_completion_returns_message_content(fake_openai_chat_response):
@@ -78,6 +81,7 @@ async def test_chat_completion_empty_content_returns_empty_string():
 # ============================================================
 # LLMProvider — chat_stream
 # ============================================================
+
 
 @pytest.mark.asyncio
 async def test_chat_stream_yields_deltas():
@@ -139,6 +143,7 @@ async def test_chat_stream_skips_empty_chunks():
 # LLMProvider — fallback automático entre proveedores (INFRA-01 / #307)
 # ============================================================
 
+
 @pytest.mark.asyncio
 async def test_chat_completion_falls_back_to_secondary_on_quota_error(
     fake_openai_chat_response, caplog
@@ -164,7 +169,10 @@ async def test_chat_completion_falls_back_to_secondary_on_quota_error(
     assert provider.client.chat.completions.create.call_count == 3
     # El secundario se llamó una sola vez, con su propio modelo configurado.
     provider.fallback_client.chat.completions.create.assert_called_once()
-    assert provider.fallback_client.chat.completions.create.call_args.kwargs["model"] == "gpt-4o-mini"
+    assert (
+        provider.fallback_client.chat.completions.create.call_args.kwargs["model"]
+        == "gpt-4o-mini"
+    )
     assert "fallback" in caplog.text.lower()
 
 
@@ -178,10 +186,14 @@ async def test_chat_completion_falls_back_on_server_error_503():
     fake_response.usage = None
 
     provider.client.chat.completions.create = AsyncMock(side_effect=_server_error())
-    provider.fallback_client.chat.completions.create = AsyncMock(return_value=fake_response)
+    provider.fallback_client.chat.completions.create = AsyncMock(
+        return_value=fake_response
+    )
 
     with patch("app.shared.retry.asyncio.sleep", new=AsyncMock()):
-        result = await provider.chat_completion(messages=[{"role": "user", "content": "hola"}])
+        result = await provider.chat_completion(
+            messages=[{"role": "user", "content": "hola"}]
+        )
 
     assert result.text == "desde el secundario"
 
@@ -197,7 +209,9 @@ async def test_chat_completion_propagates_when_no_fallback_configured():
 
     with patch("app.shared.retry.asyncio.sleep", new=AsyncMock()):
         with pytest.raises(openai.RateLimitError):
-            await provider.chat_completion(messages=[{"role": "user", "content": "hola"}])
+            await provider.chat_completion(
+                messages=[{"role": "user", "content": "hola"}]
+            )
 
 
 @pytest.mark.asyncio
@@ -221,7 +235,9 @@ async def test_chat_stream_falls_back_to_secondary_on_quota_error(caplog):
 
     with caplog.at_level("WARNING", logger="app.providers.llm"):
         deltas = []
-        async for d in provider.chat_stream(messages=[{"role": "user", "content": "x"}]):
+        async for d in provider.chat_stream(
+            messages=[{"role": "user", "content": "x"}]
+        ):
             deltas.append(d)
 
     assert deltas == ["Hola", " ", "secundario"]
@@ -231,6 +247,7 @@ async def test_chat_stream_falls_back_to_secondary_on_quota_error(caplog):
 # ============================================================
 # LLMProvider — cadena de modelos intermedios (INFRA-03 / #343)
 # ============================================================
+
 
 @pytest.mark.asyncio
 async def test_chat_completion_uses_intermediate_model_before_secondary(
@@ -243,7 +260,9 @@ async def test_chat_completion_uses_intermediate_model_before_secondary(
 
     provider.client.chat.completions.create = AsyncMock(
         side_effect=[
-            _rate_limit_error(), _rate_limit_error(), _rate_limit_error(),  # primario: 3 intentos
+            _rate_limit_error(),
+            _rate_limit_error(),
+            _rate_limit_error(),  # primario: 3 intentos
             fake_openai_chat_response,  # intermedio: responde OK al primer intento
         ]
     )
@@ -251,16 +270,22 @@ async def test_chat_completion_uses_intermediate_model_before_secondary(
 
     with patch("app.shared.retry.asyncio.sleep", new=AsyncMock()):
         with caplog.at_level("WARNING", logger="app.providers.llm"):
-            result = await provider.chat_completion(messages=[{"role": "user", "content": "hola"}])
+            result = await provider.chat_completion(
+                messages=[{"role": "user", "content": "hola"}]
+            )
 
     assert result.text == "respuesta mockeada"
-    assert provider.client.chat.completions.create.call_count == 4  # 3 primario + 1 intermedio
+    assert (
+        provider.client.chat.completions.create.call_count == 4
+    )  # 3 primario + 1 intermedio
     provider.fallback_client.chat.completions.create.assert_not_called()
     assert "gemini-2.5-flash-lite" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_chat_completion_falls_through_full_chain_to_secondary(fake_openai_chat_response):
+async def test_chat_completion_falls_through_full_chain_to_secondary(
+    fake_openai_chat_response,
+):
     """Si el primario Y todos los intermedios fallan, recién ahí se usa el
     proveedor secundario — la cadena completa se recorre en orden."""
     provider = LLMProvider()
@@ -273,12 +298,17 @@ async def test_chat_completion_falls_through_full_chain_to_secondary(fake_openai
     )
 
     with patch("app.shared.retry.asyncio.sleep", new=AsyncMock()):
-        result = await provider.chat_completion(messages=[{"role": "user", "content": "hola"}])
+        result = await provider.chat_completion(
+            messages=[{"role": "user", "content": "hola"}]
+        )
 
     assert result.text == "respuesta mockeada"
     assert provider.client.chat.completions.create.call_count == 9
     provider.fallback_client.chat.completions.create.assert_called_once()
-    assert provider.fallback_client.chat.completions.create.call_args.kwargs["model"] == "gpt-4o-mini"
+    assert (
+        provider.fallback_client.chat.completions.create.call_args.kwargs["model"]
+        == "gpt-4o-mini"
+    )
 
 
 @pytest.mark.asyncio
@@ -295,11 +325,18 @@ async def test_chat_completion_cascades_between_gemini_models_without_secondary_
     response.usage = None
 
     provider.client.chat.completions.create = AsyncMock(
-        side_effect=[_rate_limit_error(), _rate_limit_error(), _rate_limit_error(), response]
+        side_effect=[
+            _rate_limit_error(),
+            _rate_limit_error(),
+            _rate_limit_error(),
+            response,
+        ]
     )
 
     with patch("app.shared.retry.asyncio.sleep", new=AsyncMock()):
-        result = await provider.chat_completion(messages=[{"role": "user", "content": "hola"}])
+        result = await provider.chat_completion(
+            messages=[{"role": "user", "content": "hola"}]
+        )
 
     assert result.text == "desde el modelo intermedio"
 
@@ -346,6 +383,7 @@ async def test_chat_stream_cascades_through_intermediate_model():
 # EmbeddingProvider
 # ============================================================
 
+
 @pytest.mark.asyncio
 async def test_embed_returns_vector_with_correct_dimensions(
     fake_openai_embedding_response,
@@ -391,9 +429,15 @@ async def test_embed_many_preserves_order():
     provider = EmbeddingProvider()
     response = MagicMock()
     # Devolvemos en orden 2, 0, 1 — el provider tiene que re-ordenarlos.
-    d2 = MagicMock(); d2.index = 2; d2.embedding = [0.3] * 768
-    d0 = MagicMock(); d0.index = 0; d0.embedding = [0.1] * 768
-    d1 = MagicMock(); d1.index = 1; d1.embedding = [0.2] * 768
+    d2 = MagicMock()
+    d2.index = 2
+    d2.embedding = [0.3] * 768
+    d0 = MagicMock()
+    d0.index = 0
+    d0.embedding = [0.1] * 768
+    d1 = MagicMock()
+    d1.index = 1
+    d1.embedding = [0.2] * 768
     response.data = [d2, d0, d1]
     provider.client.embeddings.create = AsyncMock(return_value=response)
 
@@ -421,6 +465,7 @@ async def test_embed_many_rejects_empty_strings():
 # LLMProvider — control del thinking (PERF-01)
 # ============================================================
 
+
 def _not_found_error() -> openai.NotFoundError:
     """404: el modelo fue retirado por el proveedor (pasa seguido en Gemini)."""
     response = MagicMock()
@@ -438,14 +483,18 @@ def _bad_request_error() -> openai.BadRequestError:
 
 
 @pytest.mark.asyncio
-async def test_chat_completion_sends_default_reasoning_effort(fake_openai_chat_response):
+async def test_chat_completion_sends_default_reasoning_effort(
+    fake_openai_chat_response,
+):
     """El default de LLM_REASONING_EFFORT viaja en extra_body en cada llamada.
 
     Es el cambio que baja el tiempo hasta el primer token: sin este parámetro,
     los flash 2.5+ de Gemini razonan en silencio antes de empezar a responder.
     """
     provider = LLMProvider(reasoning_effort="none")
-    provider.client.chat.completions.create = AsyncMock(return_value=fake_openai_chat_response)
+    provider.client.chat.completions.create = AsyncMock(
+        return_value=fake_openai_chat_response
+    )
 
     await provider.chat_completion(messages=[{"role": "user", "content": "hola"}])
 
@@ -454,11 +503,15 @@ async def test_chat_completion_sends_default_reasoning_effort(fake_openai_chat_r
 
 
 @pytest.mark.asyncio
-async def test_chat_completion_call_site_overrides_reasoning_effort(fake_openai_chat_response):
+async def test_chat_completion_call_site_overrides_reasoning_effort(
+    fake_openai_chat_response,
+):
     """Un call-site puede pedir más razonamiento que el default global — es lo
     que hace la generación de quiz/examen con 'low'."""
     provider = LLMProvider(reasoning_effort="none")
-    provider.client.chat.completions.create = AsyncMock(return_value=fake_openai_chat_response)
+    provider.client.chat.completions.create = AsyncMock(
+        return_value=fake_openai_chat_response
+    )
 
     await provider.chat_completion(
         messages=[{"role": "user", "content": "hola"}],
@@ -471,12 +524,16 @@ async def test_chat_completion_call_site_overrides_reasoning_effort(fake_openai_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("effort", ["", "default", "auto", "AUTO"])
-async def test_chat_completion_omits_parameter_when_effort_unset(effort, fake_openai_chat_response):
+async def test_chat_completion_omits_parameter_when_effort_unset(
+    effort, fake_openai_chat_response
+):
     """Con "default"/"auto"/vacío no se manda el parámetro y decide el modelo,
     o sea el comportamiento previo a PERF-01. Es la vía de rollback por env var,
     sin tocar código."""
     provider = LLMProvider(reasoning_effort=effort)
-    provider.client.chat.completions.create = AsyncMock(return_value=fake_openai_chat_response)
+    provider.client.chat.completions.create = AsyncMock(
+        return_value=fake_openai_chat_response
+    )
 
     await provider.chat_completion(messages=[{"role": "user", "content": "hola"}])
 
@@ -484,10 +541,14 @@ async def test_chat_completion_omits_parameter_when_effort_unset(effort, fake_op
 
 
 @pytest.mark.asyncio
-async def test_chat_completion_does_not_clobber_caller_extra_body(fake_openai_chat_response):
+async def test_chat_completion_does_not_clobber_caller_extra_body(
+    fake_openai_chat_response,
+):
     """Si el call-site ya arma su propio extra_body, se respeta lo que puso."""
     provider = LLMProvider(reasoning_effort="none")
-    provider.client.chat.completions.create = AsyncMock(return_value=fake_openai_chat_response)
+    provider.client.chat.completions.create = AsyncMock(
+        return_value=fake_openai_chat_response
+    )
 
     await provider.chat_completion(
         messages=[{"role": "user", "content": "hola"}],
@@ -514,7 +575,9 @@ async def test_chat_completion_stream_sends_reasoning_effort():
 
     provider.client.chat.completions.create = AsyncMock(return_value=fake_stream())
 
-    async for _ in provider.chat_completion_stream(messages=[{"role": "user", "content": "x"}]):
+    async for _ in provider.chat_completion_stream(
+        messages=[{"role": "user", "content": "x"}]
+    ):
         pass
 
     kwargs = provider.client.chat.completions.create.call_args.kwargs
@@ -525,8 +588,11 @@ async def test_chat_completion_stream_sends_reasoning_effort():
 # LLMProvider — fallback ante modelo retirado / parámetro rechazado (PERF-01)
 # ============================================================
 
+
 @pytest.mark.asyncio
-async def test_chat_completion_falls_back_when_model_was_retired(fake_openai_chat_response):
+async def test_chat_completion_falls_back_when_model_was_retired(
+    fake_openai_chat_response,
+):
     """Un 404 por modelo retirado cede el paso al siguiente eslabón.
 
     Antes de PERF-01, NotFoundError no estaba en _FALLBACK_TRIGGERS: un modelo
@@ -539,7 +605,9 @@ async def test_chat_completion_falls_back_when_model_was_retired(fake_openai_cha
         return_value=fake_openai_chat_response
     )
 
-    result = await provider.chat_completion(messages=[{"role": "user", "content": "hola"}])
+    result = await provider.chat_completion(
+        messages=[{"role": "user", "content": "hola"}]
+    )
 
     assert result.text == "respuesta mockeada"
     # Un 404 es definitivo: no se reintenta el mismo modelo 3 veces, se pasa al
@@ -549,16 +617,22 @@ async def test_chat_completion_falls_back_when_model_was_retired(fake_openai_cha
 
 
 @pytest.mark.asyncio
-async def test_chat_completion_falls_back_when_model_rejects_parameter(fake_openai_chat_response):
+async def test_chat_completion_falls_back_when_model_rejects_parameter(
+    fake_openai_chat_response,
+):
     """Un 400 (p. ej. un modelo que no acepta reasoning_effort) también cede el
     paso al siguiente eslabón en vez de fallar la request entera."""
     provider = LLMProvider()
-    provider.client.chat.completions.create = AsyncMock(side_effect=_bad_request_error())
+    provider.client.chat.completions.create = AsyncMock(
+        side_effect=_bad_request_error()
+    )
     provider.fallback_client.chat.completions.create = AsyncMock(
         return_value=fake_openai_chat_response
     )
 
-    result = await provider.chat_completion(messages=[{"role": "user", "content": "hola"}])
+    result = await provider.chat_completion(
+        messages=[{"role": "user", "content": "hola"}]
+    )
 
     assert result.text == "respuesta mockeada"
     assert provider.client.chat.completions.create.call_count == 1

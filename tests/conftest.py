@@ -47,6 +47,7 @@ os.environ.setdefault("MODERATION_ENABLED", "false")
 # Fixtures
 # ============================================================
 
+
 @pytest.fixture
 def fake_redis() -> MagicMock:
     """

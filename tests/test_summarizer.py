@@ -21,7 +21,9 @@ from app.documents import summarizer
 from app.documents.summarizer import summarize_document, summarize_pre_exam
 
 
-def _fake_document(filename: str = "apunte.pdf", file_hash: str = "hash-abc") -> MagicMock:
+def _fake_document(
+    filename: str = "apunte.pdf", file_hash: str = "hash-abc"
+) -> MagicMock:
     doc = MagicMock()
     doc.id = uuid.uuid4()
     doc.course_id = 7
@@ -51,7 +53,9 @@ def _fake_db(document: MagicMock, chunks: list) -> MagicMock:
     return db
 
 
-def _fake_llm(text: str = "resumen generado", model: str = "gemini-3.5-flash") -> MagicMock:
+def _fake_llm(
+    text: str = "resumen generado", model: str = "gemini-3.5-flash"
+) -> MagicMock:
     llm = MagicMock()
     llm.model = model
     result = MagicMock()
@@ -71,6 +75,7 @@ def _fake_cache() -> MagicMock:
 # Cache de resúmenes por documento (PERF-02)
 # ============================================================
 
+
 @pytest.mark.asyncio
 async def test_summarize_document_caches_result_after_generating():
     """Un miss de cache genera el resumen y lo guarda con TTL."""
@@ -89,7 +94,7 @@ async def test_summarize_document_caches_result_after_generating():
 
     key, ttl, raw = cache.setex.await_args.args
     assert str(document.id) in key
-    assert "hash-abc" in key      # huella del archivo
+    assert "hash-abc" in key  # huella del archivo
     assert "gemini-3.5-flash" in key  # modelo, para no servir resúmenes de otro
     assert ttl > 0
     assert json.loads(raw)["summary"] == "resumen generado"
@@ -190,6 +195,7 @@ async def test_cache_key_changes_when_document_is_replaced():
 # Resumen pre-parcial en paralelo (PERF-02)
 # ============================================================
 
+
 def _pre_exam_db(documents: list[MagicMock], chunks_by_doc: dict) -> MagicMock:
     """Sesión mockeada para summarize_pre_exam: primero la lista de documentos
     del curso, después (documento, chunks) por cada uno."""
@@ -218,7 +224,9 @@ async def test_pre_exam_summary_runs_document_summaries_concurrently():
     PHP. Se verifica midiendo cuántas llamadas están en vuelo a la vez.
     """
     documents = [_fake_document(f"doc{i}.pdf", f"hash-{i}") for i in range(4)]
-    chunks_by_doc = {d.id: [_fake_chunk(f"contenido {i}", 0)] for i, d in enumerate(documents)}
+    chunks_by_doc = {
+        d.id: [_fake_chunk(f"contenido {i}", 0)] for i, d in enumerate(documents)
+    }
     db = _pre_exam_db(documents, chunks_by_doc)
 
     in_flight = 0
@@ -256,7 +264,9 @@ async def test_pre_exam_summary_respects_concurrency_limit(monkeypatch):
     monkeypatch.setattr(settings, "summary_max_concurrency", 2, raising=False)
 
     documents = [_fake_document(f"doc{i}.pdf", f"hash-{i}") for i in range(6)]
-    chunks_by_doc = {d.id: [_fake_chunk(f"contenido {i}", 0)] for i, d in enumerate(documents)}
+    chunks_by_doc = {
+        d.id: [_fake_chunk(f"contenido {i}", 0)] for i, d in enumerate(documents)
+    }
     db = _pre_exam_db(documents, chunks_by_doc)
 
     in_flight = 0
@@ -285,7 +295,9 @@ async def test_pre_exam_summary_skips_document_whose_llm_call_fails():
     """Un documento que falla se saltea, el repaso se arma con el resto —
     mismo criterio que antes de PERF-02."""
     documents = [_fake_document(f"doc{i}.pdf", f"hash-{i}") for i in range(3)]
-    chunks_by_doc = {d.id: [_fake_chunk(f"contenido {i}", 0)] for i, d in enumerate(documents)}
+    chunks_by_doc = {
+        d.id: [_fake_chunk(f"contenido {i}", 0)] for i, d in enumerate(documents)
+    }
     db = _pre_exam_db(documents, chunks_by_doc)
 
     calls = {"n": 0}

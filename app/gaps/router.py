@@ -29,7 +29,7 @@ from __future__ import annotations
 import math
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, List, Optional
+from typing import Annotated, Any, List, Optional, Sequence
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
@@ -120,8 +120,13 @@ class _TextGroup:
     después el clustering semántico puede fusionar varios de estos entre sí."""
 
     __slots__ = (
-        "representative_question", "count", "last_asked_at", "_sim_values",
-        "embedding", "row_ids", "_all_archived",
+        "representative_question",
+        "count",
+        "last_asked_at",
+        "_sim_values",
+        "embedding",
+        "row_ids",
+        "_all_archived",
     )
 
     def __init__(
@@ -136,7 +141,9 @@ class _TextGroup:
         self.representative_question = question
         self.count = 1
         self.last_asked_at = created_at
-        self._sim_values: List[float] = [max_similarity] if max_similarity is not None else []
+        self._sim_values: List[float] = (
+            [max_similarity] if max_similarity is not None else []
+        )
         self.embedding = embedding
         self.row_ids: List[uuid.UUID] = [row_id]
         self._all_archived = archived_at is not None
@@ -184,7 +191,7 @@ class _TextGroup:
 
 
 def _cluster_gaps(
-    rows: List[tuple],
+    rows: Sequence[Sequence[Any]],
     *,
     similarity_threshold: float = SEMANTIC_GAP_SIMILARITY_THRESHOLD,
 ) -> List[GapItem]:
@@ -193,7 +200,9 @@ def _cluster_gaps(
     `rows`: iterable de tuplas
     (id, question, created_at, max_similarity, embedding, archived_at).
     Función pura (sin DB) a propósito, para poder testear el clustering en
-    aislamiento sin mockear una sesión de SQLAlchemy.
+    aislamiento sin mockear una sesión de SQLAlchemy — acepta tanto
+    `list[tuple]` (tests) como `Sequence[Row]` de SQLAlchemy (caller real),
+    ambos indexables/desempaquetables por posición.
     """
     # Pasada 1 — dedup exacto por texto normalizado.
     text_groups: "dict[str, _TextGroup]" = {}
@@ -201,9 +210,13 @@ def _cluster_gaps(
     for row_id, question, created_at, max_similarity, embedding, archived_at in rows:
         norm = question.strip().lower()
         if norm in text_groups:
-            text_groups[norm].add_row(row_id, question, created_at, max_similarity, embedding, archived_at)
+            text_groups[norm].add_row(
+                row_id, question, created_at, max_similarity, embedding, archived_at
+            )
         else:
-            text_groups[norm] = _TextGroup(row_id, question, created_at, max_similarity, embedding, archived_at)
+            text_groups[norm] = _TextGroup(
+                row_id, question, created_at, max_similarity, embedding, archived_at
+            )
             order.append(norm)
 
     # Pasada 2 — clustering semántico de esos grupos entre sí. Filas sin

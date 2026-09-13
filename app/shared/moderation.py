@@ -96,7 +96,9 @@ class ModerationResult:
     """
 
     allowed: bool
-    source: str  # "disabled" | "openai_api" | "llm_fallback" | "fail_open" | "fail_closed"
+    source: (
+        str  # "disabled" | "openai_api" | "llm_fallback" | "fail_open" | "fail_closed"
+    )
     categories: list[str] = field(default_factory=list)
     blocked_message: Optional[str] = None
 
@@ -114,7 +116,9 @@ def _blocked(source: str, categories: list[str]) -> ModerationResult:
     )
 
 
-async def moderate_text(text: str, *, llm: Optional[LLMProvider] = None) -> ModerationResult:
+async def moderate_text(
+    text: str, *, llm: Optional[LLMProvider] = None
+) -> ModerationResult:
     """Clasifica `text` como aceptable o no. Nunca levanta excepción.
 
     `llm` es el `LLMProvider` ya inyectado por el endpoint llamante (mismo
@@ -135,7 +139,8 @@ async def moderate_text(text: str, *, llm: Optional[LLMProvider] = None) -> Mode
         except Exception as exc:
             logger.warning(
                 "Moderation API de OpenAI falló, cayendo a fallback vía LLM: %s: %s",
-                type(exc).__name__, exc,
+                type(exc).__name__,
+                exc,
             )
 
     if llm is not None:
@@ -143,7 +148,9 @@ async def moderate_text(text: str, *, llm: Optional[LLMProvider] = None) -> Mode
             return await _moderate_via_llm(text, llm)
         except Exception as exc:
             logger.error(
-                "Moderación vía LLM también falló: %s: %s", type(exc).__name__, exc,
+                "Moderación vía LLM también falló: %s: %s",
+                type(exc).__name__,
+                exc,
             )
 
     # Ambos caminos fallaron (o no había LLM disponible) — ver fail-safe
