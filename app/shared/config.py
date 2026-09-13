@@ -124,6 +124,18 @@ class Settings(BaseSettings):
     alert_smtp_password: Optional[str] = None
     alert_email_to: str = "santiagotricherri@gmail.com"
 
+    # Cooldown global entre alertas del MISMO tipo (mismo key_prefix), ver
+    # app.shared.alerting.record_event_and_maybe_alert. Hallazgo de audit
+    # (PR #482): el dedupe original solo suprimía repeticiones DENTRO de una
+    # ventana (`error_rate_window_sec=60` por default) — en una caída
+    # sostenida donde cada request devuelve 5xx, cada ventana nueva volvía a
+    # cruzar el umbral y a alertar, hasta ~60 emails/hora solo por esa señal.
+    # Este cooldown es independiente de `window_sec`/`threshold` de cada
+    # caller: una vez que se manda una alerta de un tipo, ese mismo tipo no
+    # vuelve a alertar hasta que pase este tiempo, sin importar cuántas
+    # ventanas sigan cruzando el umbral mientras tanto.
+    alert_cooldown_sec: int = 900
+
     error_rate_window_sec: int = 60
     error_rate_threshold: int = 10
 

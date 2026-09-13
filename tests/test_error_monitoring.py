@@ -9,7 +9,6 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import openai
-import pytest
 
 from app.shared import error_monitoring
 

@@ -391,9 +391,15 @@ async def test_embed_many_preserves_order():
     provider = EmbeddingProvider()
     response = MagicMock()
     # Devolvemos en orden 2, 0, 1 — el provider tiene que re-ordenarlos.
-    d2 = MagicMock(); d2.index = 2; d2.embedding = [0.3] * 768
-    d0 = MagicMock(); d0.index = 0; d0.embedding = [0.1] * 768
-    d1 = MagicMock(); d1.index = 1; d1.embedding = [0.2] * 768
+    d2 = MagicMock()
+    d2.index = 2
+    d2.embedding = [0.3] * 768
+    d0 = MagicMock()
+    d0.index = 0
+    d0.embedding = [0.1] * 768
+    d1 = MagicMock()
+    d1.index = 1
+    d1.embedding = [0.2] * 768
     response.data = [d2, d0, d1]
     provider.client.embeddings.create = AsyncMock(return_value=response)
 
@@ -573,3 +579,44 @@ async def test_chat_completion_propagates_404_when_chain_is_exhausted():
 
     with pytest.raises(openai.NotFoundError):
         await provider.chat_completion(messages=[{"role": "user", "content": "hola"}])
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_propagates_quota_error_over_later_link_failure():
+    """Si un eslabón anterior agotó cuota (RateLimitError) pero el ÚLTIMO
+    eslabón de la cadena falla con otro tipo de error (ej. modelo retirado),
+    tiene que propagar el RateLimitError — no el error del último eslabón.
+
+    Sin esto, record_llm_failure_and_maybe_alert (error_monitoring.py) nunca
+    ve el RateLimitError y la alerta específica de cuota agotada (ADR-012,
+    umbral 1, la más urgente) no dispara — se dispara en su lugar la
+    genérica de "el LLM está fallando", que apunta a la acción equivocada.
+    """
+    provider = LLMProvider()
+    provider.intermediate_models = []
+    # Primario agota cuota en sus 3 reintentos.
+    provider.client.chat.completions.create = AsyncMock(side_effect=_rate_limit_error())
+    # Secundario (último eslabón) falla con un error distinto — sin más
+    # eslabones después, la cadena se agota acá.
+    provider.fallback_client.chat.completions.create = AsyncMock(
+        side_effect=_not_found_error()
+    )
+
+    with patch("app.shared.retry.asyncio.sleep", new=AsyncMock()):
+        with pytest.raises(openai.RateLimitError):
+            await provider.chat_completion(messages=[{"role": "user", "content": "hola"}])
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_propagates_quota_error_over_later_link_failure():
+    """Misma prioridad que en chat_completion, para la apertura del stream."""
+    provider = LLMProvider()
+    provider.intermediate_models = []
+    provider.client.chat.completions.create = AsyncMock(side_effect=_rate_limit_error())
+    provider.fallback_client.chat.completions.create = AsyncMock(
+        side_effect=_not_found_error()
+    )
+
+    with pytest.raises(openai.RateLimitError):
+        async for _ in provider.chat_stream(messages=[{"role": "user", "content": "hola"}]):
+            pass

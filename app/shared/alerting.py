@@ -11,10 +11,13 @@ Ver ADR-012 (docs/adr/012-alertas-monitoreo-minimo.md). Dos piezas:
 
   - `record_event_and_maybe_alert`: cuenta eventos en una ventana fija de
     Redis (mismo patrón que app.shared.rate_limit) y dispara `send_alert`
-    como máximo UNA vez por ventana al cruzar el umbral, para no floodear
-    la casilla mientras el problema persiste. La reusan
-    app.shared.error_monitoring (5xx) y app.chat.router (fallas/latencia
-    del LLM).
+    al cruzar el umbral — con un cooldown (`ALERT_COOLDOWN_SEC`, default
+    900s) que persiste INDEPENDIENTE de la ventana, no solo dentro de ella
+    (hallazgo de audit sobre la versión anterior: con dedupe solo
+    por-ventana, una caída sostenida donde cada ventana nueva vuelve a
+    cruzar el umbral generaba una alerta nueva cada `window_sec`, hasta
+    ~60/hora con el umbral de 5xx). La reusan app.shared.error_monitoring
+    (5xx) y app.chat.router (fallas/latencia del LLM).
 """
 
 from __future__ import annotations
@@ -24,13 +27,27 @@ import logging
 import smtplib
 import time
 from email.message import EmailMessage
-from typing import Optional
 
 import redis.asyncio as redis_async
 
 from app.shared.config import get_settings
 
 logger = logging.getLogger("nexusai.alerts")
+
+# El event loop solo mantiene una referencia DÉBIL a una task creada con
+# asyncio.create_task() — si nada más la referencia, puede recolectarse a
+# mitad de ejecución (documentado en la stdlib). Como record_event_and_maybe_alert
+# retorna inmediatamente después de crear la task de send_alert (todo el
+# punto de hacerlo fire-and-forget), hace falta este set para mantener una
+# referencia fuerte hasta que termine.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _fire_and_forget(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 def _send_email_sync(
@@ -106,30 +123,41 @@ async def record_event_and_maybe_alert(
     "¿hay un problema ahora mismo?" el trade-off de picos 2x en el cruce de
     ventana es aceptable.
 
-    Dedupe: además del contador, se setea una bandera `SET NX` con el mismo
-    TTL que la ventana. Solo la llamada que logra setearla (la primera en
-    cruzar el umbral dentro de esa ventana) dispara `send_alert` — las
-    siguientes llamadas de la misma ventana ya la ven seteada y no vuelven a
-    avisar, aunque el contador siga subiendo.
+    Cooldown: a diferencia del contador (que sí es por-ventana), la
+    supresión de alertas repetidas usa una key SIN bucket, con TTL fijo
+    `settings.alert_cooldown_sec` (900s por default) — persiste a través de
+    varias ventanas seguidas. Solo la llamada que logra setearla con
+    `SET NX` dispara `send_alert`; mientras el cooldown no expiró, cualquier
+    ventana nueva que vuelva a cruzar el umbral no re-alerta, aunque el
+    contador de esa ventana sí siga incrementándose normalmente.
+
+    El envío en sí (`send_alert`) se dispara con `asyncio.create_task` en
+    vez de `await` inline: mandar el email no debe agregarle latencia al
+    request/la llamada que cruzó el umbral, que ya viene degradada (un 5xx,
+    o una falla/lentitud del LLM) — es best-effort y nunca propaga
+    excepción, así que no hace falta esperarlo.
 
     Devuelve True si esta llamada disparó la alerta.
     """
     bucket = int(time.time()) // window_sec
     count_key = f"{key_prefix}:count:{bucket}"
-    alerted_key = f"{key_prefix}:alerted:{bucket}"
-    ttl = window_sec + 10
+    cooldown_key = f"{key_prefix}:cooldown"
+    count_ttl = window_sec + 10
 
     try:
         pipe = redis.pipeline()
         pipe.incr(count_key)
-        pipe.expire(count_key, ttl)
+        pipe.expire(count_key, count_ttl)
         results = await pipe.execute()
         count = int(results[0])
 
         if count < threshold:
             return False
 
-        already_alerted = not await redis.set(alerted_key, "1", nx=True, ex=ttl)
+        settings = get_settings()
+        already_alerted = not await redis.set(
+            cooldown_key, "1", nx=True, ex=settings.alert_cooldown_sec
+        )
         if already_alerted:
             return False
     except Exception as exc:
@@ -137,5 +165,5 @@ async def record_event_and_maybe_alert(
         logger.warning("record_event_and_maybe_alert falló (Redis no disponible?): %s", exc)
         return False
 
-    await send_alert(title, message)
+    _fire_and_forget(send_alert(title, message))
     return True
