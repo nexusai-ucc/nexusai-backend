@@ -9,7 +9,7 @@ con mocks. Sin llamadas reales a Groq.
 from __future__ import annotations
 
 import base64
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import FastAPI
@@ -74,14 +74,25 @@ async def test_transcribe_returns_text(client, mock_provider):
     mock_provider.transcribe.assert_awaited_once()
 
 
-async def test_transcribe_defaults_language_to_spanish(client, mock_provider):
+async def test_transcribe_autodetects_language_by_default(client, mock_provider):
+    """The plugin sends no language: none must be forced (it broke non-Spanish audio)."""
     await client.post(
         "/api/v1/voice/transcribe",
         json={"content_b64": _AUDIO_B64, "mime_type": "audio/webm"},
     )
 
     _, kwargs = mock_provider.transcribe.call_args
-    assert kwargs["language"] == "es"
+    assert kwargs["language"] is None
+
+
+async def test_transcribe_passes_explicit_language(client, mock_provider):
+    await client.post(
+        "/api/v1/voice/transcribe",
+        json={"content_b64": _AUDIO_B64, "mime_type": "audio/webm", "language": "en"},
+    )
+
+    _, kwargs = mock_provider.transcribe.call_args
+    assert kwargs["language"] == "en"
 
 
 async def test_transcribe_rejects_invalid_base64(client):
@@ -142,3 +153,22 @@ async def test_transcribe_propagates_provider_error_as_503(client, mock_provider
     )
 
     assert response.status_code == 503
+
+
+async def test_provider_omits_language_when_not_given():
+    """Without a language the SDK call must not carry one, so the model detects it."""
+    provider = TranscriptionProvider(api_key="test-key")
+    provider.client = MagicMock()
+    provider.client.audio.transcriptions.create = AsyncMock(
+        return_value=MagicMock(text=" hello ")
+    )
+
+    text = await provider.transcribe(b"audio", "q.webm", "audio/webm")
+
+    assert text == "hello"
+    _, kwargs = provider.client.audio.transcriptions.create.call_args
+    assert "language" not in kwargs
+
+    await provider.transcribe(b"audio", "q.webm", "audio/webm", language="en")
+    _, kwargs = provider.client.audio.transcriptions.create.call_args
+    assert kwargs["language"] == "en"

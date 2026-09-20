@@ -82,6 +82,16 @@ async def test_no_interactions_returns_empty_without_llm_call(
     mock_llm.chat_completion.assert_not_called()
 
 
+async def test_topic_labels_follow_the_language_of_the_questions(client, mock_llm):
+    """The prompt must ask for labels in the questions' language, not leave it open."""
+    mock_llm.chat_completion.return_value = _llm_response({"topics": []})
+
+    await client.post("/api/v1/analytics/faq-topics", json=_BASE_PAYLOAD)
+
+    system_msg = mock_llm.chat_completion.call_args.args[0][0]["content"]
+    assert "mismo idioma que las preguntas" in system_msg
+
+
 async def test_topics_recompute_count_from_assigned_indices(client, mock_llm):
     mock_llm.chat_completion.return_value = _llm_response(
         {

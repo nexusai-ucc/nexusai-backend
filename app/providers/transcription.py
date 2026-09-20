@@ -37,17 +37,25 @@ class TranscriptionProvider:
         )
 
     async def transcribe(
-        self, audio_bytes: bytes, filename: str, mime_type: str, language: str = "es"
+        self,
+        audio_bytes: bytes,
+        filename: str,
+        mime_type: str,
+        language: Optional[str] = None,
     ) -> str:
         """Transcribe un audio corto (pregunta hablada) a texto.
 
         `file` se pasa como tupla (nombre, bytes, mime_type) — formato que
         acepta el SDK de OpenAI para uploads en memoria, sin tocar disco.
+
+        Sin `language` el modelo detecta el idioma hablado; forzar uno rompe las
+        preguntas dichas en otro.
         """
+        kwargs = {"language": language} if language else {}
         result = await self.client.audio.transcriptions.create(
             model=self.model,
             file=(filename, io.BytesIO(audio_bytes), mime_type),
-            language=language,
+            **kwargs,
         )
         return result.text.strip()
 

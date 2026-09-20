@@ -189,7 +189,8 @@ async def faq_topics(
                 f"en como máximo {_FAQ_MAX_TOPICS} grupos. Tu salida es JSON.\n\n"
                 "Devolvé EXCLUSIVAMENTE un JSON con esta forma exacta:\n"
                 '{"topics": [{"label": "<tema en 3-6 palabras>", "question_indices": [0, 2, 5]}]}\n'
-                "- label: nombrá el tema/subtema concreto que agrupa esas preguntas.\n"
+                "- label: nombrá el tema/subtema concreto que agrupa esas preguntas, "
+                "en el mismo idioma que las preguntas (si mezclan idiomas, el predominante).\n"
                 "- question_indices: los índices (de la lista numerada) que pertenecen a ese tema.\n"
                 "- Cada índice de la lista debe aparecer en como máximo un grupo.\n"
                 "- No inventes preguntas ni cambies su texto — solo agrupá y etiquetá."
