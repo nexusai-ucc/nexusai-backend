@@ -265,7 +265,8 @@ Te paso los resúmenes individuales de los documentos indexados de su curso (o
 de la unidad que eligió repasar). Combinalos en un único resumen de repaso.
 
 Instrucciones:
-- Escribí en español.
+- Escribí en el mismo idioma que los resúmenes individuales (si mezclan
+  idiomas, usá el predominante).
 - Organizá el resumen por tema, no por documento — si dos documentos cubren
   lo mismo, combiná esa información en un solo bloque en vez de repetirla.
 - Cuando menciones un tema puntual, indicá entre paréntesis de qué archivo

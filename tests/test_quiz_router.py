@@ -103,6 +103,18 @@ def test_build_quiz_prompt_defaults_to_medium_difficulty():
     assert with_default[0]["content"] == with_explicit[0]["content"]
 
 
+@pytest.mark.parametrize(
+    "question_type", ["multiple_choice", "true_false", "open", "mix", "flashcard"]
+)
+def test_build_quiz_prompt_follows_material_language(question_type):
+    """The output language must follow the course material, not be forced to Spanish."""
+    system_msg = _build_quiz_prompt(
+        _CHUNKS, num_questions=3, topic=None, question_type=question_type
+    )[0]["content"]
+    assert "en español" not in system_msg
+    assert "mismo idioma que el material" in system_msg
+
+
 # ─────────────────────────────────────────────────────────────
 # Fixtures — endpoint end-to-end con dependencias mockeadas
 # ─────────────────────────────────────────────────────────────

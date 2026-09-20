@@ -946,8 +946,10 @@ def _build_quiz_prompt(
 
     system = (
         f"Sos un generador de quizzes académicos de NexusAI. "
-        f"Producís preguntas de {type_desc} en español, basadas estrictamente "
-        "en el material académico del curso del alumno. Tu salida es JSON.\n\n"
+        f"Producís preguntas de {type_desc} basadas estrictamente "
+        "en el material académico del curso del alumno. Escribí las preguntas, "
+        "las opciones y las explicaciones en el mismo idioma que el material "
+        "(si mezcla idiomas, usá el predominante). Tu salida es JSON.\n\n"
         f"{difficulty_line}\n\n"
         "REGLA CRÍTICA: Solo podés generar preguntas sobre contenido que esté "
         "explícita y directamente presente en el material entregado.\n"
@@ -1190,11 +1192,11 @@ async def evaluate_open_answer(
                 "Evaluás respuestas abiertas de alumnos comparándolas con el contenido del curso. "
                 "Tu salida es JSON.\n\n"
                 "Devolvé EXCLUSIVAMENTE un JSON con esta forma exacta:\n"
-                '{"correct": true, "score": 0.85, "feedback": "<feedback detallado en español>"}\n'
+                '{"correct": true, "score": 0.85, "feedback": "<feedback detallado>"}\n'
                 "- correct: true si el alumno demostró comprensión del concepto principal.\n"
                 "- score: valor entre 0.0 y 1.0 representando la calidad de la respuesta.\n"
-                "- feedback: feedback constructivo en español; mencioná qué estuvo bien, "
-                "qué faltó y cuál es la respuesta correcta completa."
+                "- feedback: feedback constructivo, en el mismo idioma que el material del curso; "
+                "mencioná qué estuvo bien, qué faltó y cuál es la respuesta correcta completa."
             ),
         },
         {
@@ -1436,9 +1438,10 @@ async def review_suggestions(
                 "Tu salida es JSON.\n\n"
                 "Devolvé EXCLUSIVAMENTE un JSON con esta forma exacta:\n"
                 '{"suggestions": [{"group": 0, "topic": "<subtema en 3-6 palabras>", '
-                '"suggestion": "<2-4 oraciones en español, concretas y accionables>"}]}\n'
+                '"suggestion": "<2-4 oraciones, concretas y accionables>"}]}\n'
                 "- topic: nombrá el/los conceptos puntuales que fallan, NO el nombre del archivo.\n"
                 "- suggestion: explicá qué patrón de error ves y qué debería releer/practicar.\n"
+                "- Escribí topic y suggestion en el mismo idioma que las preguntas recibidas.\n"
                 "- Devolvé un objeto de 'suggestions' por cada grupo recibido, con el mismo índice 'group'."
             ),
         },
