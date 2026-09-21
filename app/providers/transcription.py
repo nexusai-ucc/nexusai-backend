@@ -51,12 +51,15 @@ class TranscriptionProvider:
         Sin `language` el modelo detecta el idioma hablado; forzar uno rompe las
         preguntas dichas en otro.
         """
-        kwargs = {"language": language} if language else {}
-        result = await self.client.audio.transcriptions.create(
-            model=self.model,
-            file=(filename, io.BytesIO(audio_bytes), mime_type),
-            **kwargs,
-        )
+        file = (filename, io.BytesIO(audio_bytes), mime_type)
+        if language:
+            result = await self.client.audio.transcriptions.create(
+                model=self.model, file=file, language=language
+            )
+        else:
+            result = await self.client.audio.transcriptions.create(
+                model=self.model, file=file
+            )
         return result.text.strip()
 
 
