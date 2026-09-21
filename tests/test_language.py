@@ -142,3 +142,30 @@ def test_localized_defaults_to_spanish():
     assert localized("en", "hola", "hello") == "hello"
     assert localized("es", "hola", "hello") == "hola"
     assert localized(None, "hola", "hello") == "hola"
+
+
+def test_fallback_is_used_when_the_sources_are_too_short_to_decide():
+    """A two-word question such as "foreign key" has no function words to detect."""
+    messages = [{"role": "user", "content": "foreign key"}]
+
+    out = with_language_directive(messages, "foreign key", fallback="en")
+
+    assert out[-1]["content"].endswith(language_directive("en"))
+
+
+def test_fallback_does_not_override_a_clearly_detected_language():
+    spanish = [{"role": "user", "content": "x"}]
+    english = [{"role": "user", "content": "x"}]
+
+    # Spanish text with an English interface stays as it is (no directive).
+    assert with_language_directive(spanish, ES_TEXT, fallback="en") is spanish
+    # English text with a Spanish interface still gets the English directive.
+    out = with_language_directive(english, EN_TEXT, fallback="es")
+    assert out[-1]["content"].endswith(language_directive("en"))
+
+
+def test_spanish_or_missing_fallback_adds_nothing():
+    messages = [{"role": "user", "content": "foreign key"}]
+
+    assert with_language_directive(messages, "foreign key", fallback="es") is messages
+    assert with_language_directive(messages, "foreign key", fallback=None) is messages

@@ -186,15 +186,20 @@ def language_directive(lang: str) -> str:
 
 
 def with_language_directive(
-    messages: list[dict[str, str]], *sources: str | None
+    messages: list[dict[str, str]],
+    *sources: str | None,
+    fallback: str | None = None,
 ) -> list[dict[str, str]]:
     """Return a copy of ``messages`` whose last user message ends with a language directive.
 
-    The language is detected from ``sources``. Nothing is added when it cannot be
-    determined or when it is the prompts' own language, so callers can use this
-    unconditionally.
+    The language is detected from ``sources``. When the sources are too short or
+    mixed to decide (a two-word question such as "foreign key"), ``fallback`` is
+    used instead: callers pass the language of the user's interface. A text that
+    clearly is in another language wins over the fallback. Nothing is added when
+    the language cannot be determined or is the prompts' own language, so callers
+    can use this unconditionally.
     """
-    lang = detect_language(*sources)
+    lang = detect_language(*sources) or fallback
     if lang is None or lang == _PROMPT_LANGUAGE:
         return messages
     out = [dict(m) for m in messages]

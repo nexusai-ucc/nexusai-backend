@@ -225,3 +225,49 @@ async def test_messages_blocked_english_question_gets_an_english_message(
 
     assert response.status_code == 400
     assert response.json()["detail"] == moderation_module.BLOCKED_MESSAGE_EN
+
+
+async def _answer_messages_for(client, mock_llm, question, accept_language=None):
+    """Post a question and return the messages the chat sent to the LLM for the answer."""
+    with patch("app.shared.moderation.get_settings", return_value=_fake_settings()):
+        mock_llm.chat_completion.side_effect = [
+            MagicMock(text='{"flagged": false, "categories": []}'),
+            MagicMock(text="ok", prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        ]
+        headers = {"Accept-Language": accept_language} if accept_language else {}
+        response = await client.post(
+            "/api/v1/chat/messages",
+            json={**_PAYLOAD, "question": question},
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    return mock_llm.chat_completion.await_args_list[1].args[0]
+
+
+async def test_messages_short_english_question_follows_the_interface_language(
+    client, mock_db, mock_embeddings, mock_llm
+):
+    """A two-word question such as "foreign key" has no function words to detect,
+    so the interface language decides.
+
+    Before the fallback, this kind of question was answered in Spanish even with
+    Moodle in English."""
+    from app.shared.language import language_directive
+
+    with_header = await _answer_messages_for(client, mock_llm, "foreign key", "en")
+    assert with_header[-1]["content"].endswith(language_directive("en"))
+
+    mock_llm.reset_mock()
+    without_header = await _answer_messages_for(client, mock_llm, "foreign key")
+    assert "IMPORTANT: write your entire answer" not in without_header[-1]["content"]
+
+
+async def test_messages_spanish_question_stays_spanish_with_an_english_interface(
+    client, mock_db, mock_embeddings, mock_llm
+):
+    messages = await _answer_messages_for(
+        client, mock_llm, "¿Qué es una clave foránea y para qué sirve?", "en"
+    )
+
+    assert "IMPORTANT: write your entire answer" not in messages[-1]["content"]

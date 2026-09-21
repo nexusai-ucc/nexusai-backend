@@ -134,7 +134,7 @@ def _blocked(source: str, categories: list[str]) -> ModerationResult:
 
 
 async def moderate_text(
-    text: str, *, llm: Optional[LLMProvider] = None
+    text: str, *, llm: Optional[LLMProvider] = None, language: Optional[str] = None
 ) -> ModerationResult:
     """Clasifica `text` como aceptable o no. Nunca levanta excepción.
 
@@ -142,10 +142,11 @@ async def moderate_text(
     proveedor activo, ver ADR-003) — se usa solo como fallback si no hay
     `MODERATION_API_KEY` configurada o si la Moderation API de OpenAI falla.
 
-    El mensaje de bloqueo sale en inglés si `text` está en inglés.
+    El mensaje de bloqueo sale en inglés si `language` es "en" o, si no se pasa,
+    si `text` está en inglés.
     """
     result = await _moderate_text(text, llm=llm)
-    if result.blocked_message and detect_language(text) == "en":
+    if result.blocked_message and (language or detect_language(text)) == "en":
         return replace(
             result,
             blocked_message=_ENGLISH_MESSAGES.get(

@@ -62,7 +62,12 @@ from app.db.session import get_db
 from app.documents.retriever import retrieve_context
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
-from app.shared.language import localized, resolve_language, with_language_directive
+from app.shared.language import (
+    localized,
+    resolve_language,
+    ui_language,
+    with_language_directive,
+)
 from app.shared.config import get_settings
 from app.shared.moderation import moderate_text
 
@@ -1178,6 +1183,7 @@ async def generate_exam(
 async def evaluate_open_answer(
     payload: EvaluateRequest,
     _body: Annotated[bytes, Depends(verify_hmac)],
+    request: Request,
     llm: LLMProvider = Depends(get_llm_provider),
 ) -> EvaluateResponse:
     """Evalúa la respuesta libre de un alumno usando LLM (SP-05).
@@ -1186,7 +1192,11 @@ async def evaluate_open_answer(
     """
     # ----- Moderación de contenido — antes de gastar tokens evaluando la
     # respuesta. Ver app/shared/moderation.py. -----
-    moderation = await moderate_text(payload.user_answer, llm=llm)
+    moderation = await moderate_text(
+        payload.user_answer,
+        llm=llm,
+        language=resolve_language(request, payload.user_answer),
+    )
     if not moderation.allowed:
         log_moderation_block(
             endpoint="quiz.evaluate",
@@ -1225,7 +1235,11 @@ async def evaluate_open_answer(
         },
     ]
     messages = with_language_directive(
-        messages, payload.question, payload.model_answer, payload.user_answer
+        messages,
+        payload.question,
+        payload.model_answer,
+        payload.user_answer,
+        fallback=ui_language(request),
     )
 
     try:

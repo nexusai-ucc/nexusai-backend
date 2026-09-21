@@ -21,7 +21,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, List
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,7 +31,7 @@ from app.auth.hmac import verify_hmac
 from app.db.models import InteractionLog
 from app.db.session import get_db
 from app.providers.llm import LLMProvider, get_llm_provider
-from app.shared.language import with_language_directive
+from app.shared.language import ui_language, with_language_directive
 
 logger = logging.getLogger("nexusai.analytics")
 
@@ -149,6 +149,7 @@ class FaqTopicsResponse(BaseModel):
 async def faq_topics(
     payload: FaqTopicsRequest,
     _body: Annotated[bytes, Depends(verify_hmac)],
+    request: Request,
     db: AsyncSession = Depends(get_db),
     llm: LLMProvider = Depends(get_llm_provider),
 ) -> FaqTopicsResponse:
@@ -203,7 +204,9 @@ async def faq_topics(
         },
     ]
 
-    messages = with_language_directive(messages, *(row.question for row in rows))
+    messages = with_language_directive(
+        messages, *(row.question for row in rows), fallback=ui_language(request)
+    )
 
     try:
         result_llm = await llm.chat_completion(
