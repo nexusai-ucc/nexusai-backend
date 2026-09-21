@@ -203,3 +203,25 @@ async def test_messages_asks_for_english_when_the_question_is_in_english(
     answer_messages = mock_llm.chat_completion.await_args_list[1].args[0]
     assert answer_messages[-1]["role"] == "user"
     assert answer_messages[-1]["content"].endswith(language_directive("en"))
+
+
+async def test_messages_blocked_english_question_gets_an_english_message(
+    client, mock_db, mock_embeddings, mock_llm
+):
+    from app.shared import moderation as moderation_module
+
+    with patch("app.shared.moderation.get_settings", return_value=_fake_settings()):
+        mock_llm.chat_completion.return_value = MagicMock(
+            text='{"flagged": true, "categories": ["hate"]}'
+        )
+
+        response = await client.post(
+            "/api/v1/chat/messages",
+            json={
+                **_PAYLOAD,
+                "question": "What is the difference and why is it so bad?",
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == moderation_module.BLOCKED_MESSAGE_EN

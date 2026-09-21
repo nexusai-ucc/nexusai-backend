@@ -43,13 +43,14 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional
 
 import httpx
 
 from app.providers.llm import LLMProvider
 from app.shared.config import get_settings
+from app.shared.language import detect_language
 
 logger = logging.getLogger("nexusai.moderation")
 
@@ -63,6 +64,22 @@ _SERVICE_UNAVAILABLE_MESSAGE = (
     "El servicio de moderación no está disponible en este momento. "
     "Intentá de nuevo en unos minutos."
 )
+
+# English versions, used when the moderated text is English (the student sees them as is).
+BLOCKED_MESSAGE_EN = (
+    "Your message could not be processed because it does not follow the platform's "
+    "usage rules. Please rephrase it avoiding offensive or inappropriate content "
+    "and try again."
+)
+
+_SERVICE_UNAVAILABLE_MESSAGE_EN = (
+    "The moderation service is not available right now. Try again in a few minutes."
+)
+
+_ENGLISH_MESSAGES = {
+    BLOCKED_MESSAGE: BLOCKED_MESSAGE_EN,
+    _SERVICE_UNAVAILABLE_MESSAGE: _SERVICE_UNAVAILABLE_MESSAGE_EN,
+}
 
 _OPENAI_MODERATION_URL = "https://api.openai.com/v1/moderations"
 _OPENAI_MODERATION_MODEL = "omni-moderation-latest"
@@ -124,7 +141,23 @@ async def moderate_text(
     `llm` es el `LLMProvider` ya inyectado por el endpoint llamante (mismo
     proveedor activo, ver ADR-003) — se usa solo como fallback si no hay
     `MODERATION_API_KEY` configurada o si la Moderation API de OpenAI falla.
+
+    El mensaje de bloqueo sale en inglés si `text` está en inglés.
     """
+    result = await _moderate_text(text, llm=llm)
+    if result.blocked_message and detect_language(text) == "en":
+        return replace(
+            result,
+            blocked_message=_ENGLISH_MESSAGES.get(
+                result.blocked_message, result.blocked_message
+            ),
+        )
+    return result
+
+
+async def _moderate_text(
+    text: str, *, llm: Optional[LLMProvider] = None
+) -> ModerationResult:
     settings = get_settings()
 
     if not settings.moderation_enabled:

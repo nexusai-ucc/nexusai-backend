@@ -236,3 +236,47 @@ async def test_falla_abierto_cuando_redis_no_responde() -> None:
         window_sec=DAY,
         scope="daily",
     )
+
+
+@pytest.mark.parametrize("scope", ["minute", "daily"])
+async def test_limit_message_is_english_when_the_question_is_english(
+    fake_redis_counter: FakeRedis, scope: str
+) -> None:
+    """The student sees this message as is, so it follows the question's language."""
+    window = MINUTE if scope == "minute" else DAY
+    await check_rate_limit(
+        user_id=1, redis=fake_redis_counter, limit=1, window_sec=window, scope=scope
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await check_rate_limit(
+            user_id=1,
+            redis=fake_redis_counter,
+            limit=1,
+            window_sec=window,
+            scope=scope,
+            language="en",
+        )
+
+    message = exc_info.value.detail["message"]
+    assert "limit of 1 queries" in message
+    assert "Superaste" not in message and "Alcanzaste" not in message
+
+
+async def test_limit_message_stays_spanish_by_default(
+    fake_redis_counter: FakeRedis,
+) -> None:
+    await check_rate_limit(
+        user_id=1, redis=fake_redis_counter, limit=1, window_sec=DAY, scope="daily"
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await check_rate_limit(
+            user_id=1,
+            redis=fake_redis_counter,
+            limit=1,
+            window_sec=DAY,
+            scope="daily",
+        )
+
+    assert "Alcanzaste tu límite de 1 consultas" in exc_info.value.detail["message"]

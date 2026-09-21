@@ -39,7 +39,7 @@ from app.infrastructure.redis_client import get_redis
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, StreamToken, StreamUsage, get_llm_provider
 from app.shared.config import get_settings
-from app.shared.language import with_language_directive
+from app.shared.language import detect_language, with_language_directive
 from app.shared.error_monitoring import (
     record_llm_failure_and_maybe_alert,
     record_llm_slow_and_maybe_alert,
@@ -195,6 +195,7 @@ async def messages(
         limit=settings.rate_limit_per_user_minute,
         window_sec=60,
         scope="minute",
+        language=detect_language(payload.question),
     )
     await check_rate_limit(
         user_id=payload.user_id,
@@ -202,6 +203,7 @@ async def messages(
         limit=settings.rate_limit_per_user_daily,
         window_sec=86400,
         scope="daily",
+        language=detect_language(payload.question),
     )
 
     # ----- Moderación de contenido — antes de cualquier escritura o gasto de
@@ -432,6 +434,7 @@ async def messages_stream(
         limit=settings.rate_limit_per_user_minute,
         window_sec=60,
         scope="minute",
+        language=detect_language(payload.question),
     )
     await check_rate_limit(
         user_id=payload.user_id,
@@ -439,6 +442,7 @@ async def messages_stream(
         limit=settings.rate_limit_per_user_daily,
         window_sec=86400,
         scope="daily",
+        language=detect_language(payload.question),
     )
 
     # ----- Moderación de contenido — antes de abrir el stream (que ya
