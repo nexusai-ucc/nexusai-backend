@@ -82,6 +82,23 @@ async def test_no_interactions_returns_empty_without_llm_call(
     mock_llm.chat_completion.assert_not_called()
 
 
+async def test_asks_for_english_labels_when_the_questions_are_in_english(
+    client, mock_db, mock_llm
+):
+    from app.shared.language import language_directive
+
+    mock_db.execute.return_value.all.return_value = [
+        _row("What is the difference between 2NF and 3NF?", 6),
+        _row("When is the midterm and how long is it?", 5),
+    ]
+    mock_llm.chat_completion.return_value = _llm_response({"topics": []})
+
+    await client.post("/api/v1/analytics/faq-topics", json=_BASE_PAYLOAD)
+
+    messages = mock_llm.chat_completion.call_args.args[0]
+    assert messages[-1]["content"].endswith(language_directive("en"))
+
+
 async def test_topic_labels_follow_the_language_of_the_questions(client, mock_llm):
     """The prompt must ask for labels in the questions' language, not leave it open."""
     mock_llm.chat_completion.return_value = _llm_response({"topics": []})

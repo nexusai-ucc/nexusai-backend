@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import Chunk, Document
 from app.providers.llm import LLMProvider
 from app.shared.config import get_settings
+from app.shared.language import detect_language, language_directive
 
 logger = logging.getLogger("nexusai.documents.summarizer")
 
@@ -60,6 +61,10 @@ CONTENIDO:
 """
 
 
+# Bump it whenever the summary prompt changes in a way that should invalidate the cache.
+_PROMPT_VERSION = "p2"
+
+
 def _cache_key(document: Document, model: str) -> str:
     """Key de Redis para el resumen de un documento (PERF-02).
 
@@ -70,9 +75,13 @@ def _cache_key(document: Document, model: str) -> str:
 
     Incluye también el modelo: si el equipo cambia `LLM_MODEL`, los resúmenes
     se regeneran con el modelo nuevo en vez de servir los del anterior.
+
+    Y la versión del prompt (`_PROMPT_VERSION`): al cambiar cómo se pide el
+    idioma, los resúmenes viejos (en español aunque el documento estuviera en
+    inglés) dejan de servirse y se regeneran.
     """
     fingerprint = document.file_hash or document.updated_at.isoformat()
-    return f"{_CACHE_PREFIX}:{document.id}:{model}:{fingerprint}"
+    return f"{_CACHE_PREFIX}:{document.id}:{model}:{_PROMPT_VERSION}:{fingerprint}"
 
 
 async def _cache_get(cache: Any, key: str) -> Optional[dict]:
@@ -173,6 +182,9 @@ async def _load_document_for_summary(
         filename=document.filename,
         content=concatenated.strip(),
     )
+    lang = detect_language(concatenated)
+    if lang:
+        prompt = f"{prompt}\n\n{language_directive(lang)}"
     return document, prompt, chunks_used, total_chunks
 
 
@@ -377,6 +389,9 @@ async def summarize_pre_exam(
         for r in per_doc_summaries
     )
     prompt = _PRE_EXAM_SYNTHESIS_PROMPT_TEMPLATE.format(summaries_block=summaries_block)
+    lang = detect_language(*(r["summary"] for r in per_doc_summaries))
+    if lang:
+        prompt = f"{prompt}\n\n{language_directive(lang)}"
 
     try:
         synthesis = await llm.chat_completion(

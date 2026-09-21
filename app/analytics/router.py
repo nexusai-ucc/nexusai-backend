@@ -31,6 +31,7 @@ from app.auth.hmac import verify_hmac
 from app.db.models import InteractionLog
 from app.db.session import get_db
 from app.providers.llm import LLMProvider, get_llm_provider
+from app.shared.language import with_language_directive
 
 logger = logging.getLogger("nexusai.analytics")
 
@@ -201,6 +202,8 @@ async def faq_topics(
             "content": questions_block,
         },
     ]
+
+    messages = with_language_directive(messages, *(row.question for row in rows))
 
     try:
         result_llm = await llm.chat_completion(
