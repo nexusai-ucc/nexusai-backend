@@ -205,7 +205,7 @@ def with_language_directive(
     return out
 
 
-def ui_language(request: "Request") -> str | None:
+def ui_language(request: Request) -> str | None:
     """Return "en" or "es" from the ``Accept-Language`` header, or None.
 
     The Moodle plugin sends the language of the user's interface in that header.
@@ -220,7 +220,7 @@ def ui_language(request: "Request") -> str | None:
     return None
 
 
-def resolve_language(request: "Request", *texts: str | None) -> str | None:
+def resolve_language(request: Request, *texts: str | None) -> str | None:
     """Interface language from the header, else detected from ``texts``."""
     return ui_language(request) or detect_language(*texts)
 
