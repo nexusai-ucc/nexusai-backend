@@ -19,6 +19,7 @@ content") on material it accepted without it. When the language cannot be determ
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
 
 # Function words that are frequent in one language and (almost) absent in the other.
 # Ambiguous tokens (a, no, me, he, son, die, ...) are left out on purpose.
@@ -137,6 +138,9 @@ _ES_WORDS = frozenset(
     ]
 )
 
+if TYPE_CHECKING:
+    from starlette.requests import Request
+
 _TOKEN = re.compile(r"[a-záéíóúñü]+")
 
 # Below this many function-word hits the text is too short to decide. Two is enough
@@ -182,15 +186,20 @@ def language_directive(lang: str) -> str:
 
 
 def with_language_directive(
-    messages: list[dict[str, str]], *sources: str | None
+    messages: list[dict[str, str]],
+    *sources: str | None,
+    fallback: str | None = None,
 ) -> list[dict[str, str]]:
     """Return a copy of ``messages`` whose last user message ends with a language directive.
 
-    The language is detected from ``sources``. Nothing is added when it cannot be
-    determined or when it is the prompts' own language, so callers can use this
-    unconditionally.
+    The language is detected from ``sources``. When the sources are too short or
+    mixed to decide (a two-word question such as "foreign key"), ``fallback`` is
+    used instead: callers pass the language of the user's interface. A text that
+    clearly is in another language wins over the fallback. Nothing is added when
+    the language cannot be determined or is the prompts' own language, so callers
+    can use this unconditionally.
     """
-    lang = detect_language(*sources)
+    lang = detect_language(*sources) or fallback
     if lang is None or lang == _PROMPT_LANGUAGE:
         return messages
     out = [dict(m) for m in messages]
@@ -199,3 +208,28 @@ def with_language_directive(
             message["content"] = f"{message['content']}\n\n{language_directive(lang)}"
             break
     return out
+
+
+def ui_language(request: Request) -> str | None:
+    """Return "en" or "es" from the ``Accept-Language`` header, or None.
+
+    The Moodle plugin sends the language of the user's interface in that header.
+    It is the right signal for fixed messages that have no text to detect the
+    language from (for example "this course has no indexed material yet").
+    """
+    header = request.headers.get("accept-language", "")
+    for part in header.split(","):
+        primary = part.split(";")[0].strip().lower().replace("_", "-").split("-")[0]
+        if primary in _NAMES:
+            return primary
+    return None
+
+
+def resolve_language(request: Request, *texts: str | None) -> str | None:
+    """Interface language from the header, else detected from ``texts``."""
+    return ui_language(request) or detect_language(*texts)
+
+
+def localized(lang: str | None, spanish: str, english: str) -> str:
+    """Pick the English text for "en"; Spanish otherwise (the historical default)."""
+    return english if lang == "en" else spanish

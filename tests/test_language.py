@@ -5,6 +5,9 @@ import pytest
 from app.shared.language import (
     detect_language,
     language_directive,
+    localized,
+    resolve_language,
+    ui_language,
     with_language_directive,
 )
 
@@ -101,3 +104,68 @@ def test_no_user_message_is_a_noop():
     messages = [{"role": "system", "content": "x"}]
 
     assert with_language_directive(messages, EN_TEXT) == messages
+
+
+class _Req:
+    """Minimal stand-in for a request: only its headers matter here."""
+
+    def __init__(self, accept_language: str | None = None) -> None:
+        self.headers = (
+            {} if accept_language is None else {"accept-language": accept_language}
+        )
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ("en", "en"),
+        ("es", "es"),
+        ("en-US,en;q=0.9", "en"),
+        ("es_AR", "es"),
+        ("fr, en;q=0.5", "en"),
+        ("fr", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_ui_language_reads_the_accept_language_header(header, expected):
+    assert ui_language(_Req(header)) == expected
+
+
+def test_resolve_language_prefers_the_header_over_detection():
+    assert resolve_language(_Req("es"), EN_TEXT) == "es"
+    assert resolve_language(_Req(), EN_TEXT) == "en"
+    assert resolve_language(_Req(), "hi") is None
+
+
+def test_localized_defaults_to_spanish():
+    assert localized("en", "hola", "hello") == "hello"
+    assert localized("es", "hola", "hello") == "hola"
+    assert localized(None, "hola", "hello") == "hola"
+
+
+def test_fallback_is_used_when_the_sources_are_too_short_to_decide():
+    """A two-word question such as "foreign key" has no function words to detect."""
+    messages = [{"role": "user", "content": "foreign key"}]
+
+    out = with_language_directive(messages, "foreign key", fallback="en")
+
+    assert out[-1]["content"].endswith(language_directive("en"))
+
+
+def test_fallback_does_not_override_a_clearly_detected_language():
+    spanish = [{"role": "user", "content": "x"}]
+    english = [{"role": "user", "content": "x"}]
+
+    # Spanish text with an English interface stays as it is (no directive).
+    assert with_language_directive(spanish, ES_TEXT, fallback="en") is spanish
+    # English text with a Spanish interface still gets the English directive.
+    out = with_language_directive(english, EN_TEXT, fallback="es")
+    assert out[-1]["content"].endswith(language_directive("en"))
+
+
+def test_spanish_or_missing_fallback_adds_nothing():
+    messages = [{"role": "user", "content": "foreign key"}]
+
+    assert with_language_directive(messages, "foreign key", fallback="es") is messages
+    assert with_language_directive(messages, "foreign key", fallback=None) is messages

@@ -154,3 +154,27 @@ def test_summary_cache_key_changes_with_the_prompt_version():
     key = summarizer._cache_key(document, "model-x")
 
     assert summarizer._PROMPT_VERSION in key
+
+
+async def test_thread_summary_uses_the_interface_language_for_very_short_posts(
+    forums_client, mock_llm
+):
+    """Short technical posts cannot be detected; the interface language decides."""
+    mock_llm.chat_completion.return_value = MagicMock(
+        text='{"summary": "s", "key_points": [], "resolved": true}'
+    )
+    payload = _summary_payload("foreign key?", "primary key")
+
+    await forums_client.post(
+        "/api/v1/forums/summarize-thread",
+        json=payload,
+        headers={"Accept-Language": "en"},
+    )
+    with_header = mock_llm.chat_completion.await_args.args[0]
+
+    mock_llm.chat_completion.reset_mock()
+    await forums_client.post("/api/v1/forums/summarize-thread", json=payload)
+    without_header = mock_llm.chat_completion.await_args.args[0]
+
+    assert with_header[-1]["content"].endswith(EN_DIRECTIVE)
+    assert "IMPORTANT: write your entire answer" not in without_header[-1]["content"]

@@ -256,3 +256,49 @@ async def test_malformed_llm_json_falls_back_to_fail_safe_not_crash():
 
     assert result.allowed is True
     assert result.source == "fail_open"
+
+
+async def test_blocked_message_is_english_for_an_english_text():
+    """The student sees the message as is, so it must follow the language of the text."""
+    settings = _settings(moderation_api_key=None)
+    llm = _mock_llm(json.dumps({"flagged": True, "categories": ["hate"]}))
+
+    with patch("app.shared.moderation.get_settings", return_value=settings):
+        result = await moderation.moderate_text(
+            "What is the difference between these two things and why is it so bad?",
+            llm=llm,
+        )
+
+    assert result.allowed is False
+    assert result.blocked_message == moderation.BLOCKED_MESSAGE_EN
+
+
+async def test_blocked_message_stays_spanish_for_a_spanish_or_unclear_text():
+    settings = _settings(moderation_api_key=None)
+    llm = _mock_llm(json.dumps({"flagged": True, "categories": ["hate"]}))
+
+    with patch("app.shared.moderation.get_settings", return_value=settings):
+        spanish = await moderation.moderate_text(
+            "¿Cuál es la diferencia entre estas dos cosas y por qué es tan malo?",
+            llm=llm,
+        )
+        unclear = await moderation.moderate_text("xyz", llm=llm)
+
+    assert spanish.blocked_message == moderation.BLOCKED_MESSAGE
+    assert unclear.blocked_message == moderation.BLOCKED_MESSAGE
+
+
+async def test_service_unavailable_message_is_english_for_an_english_text():
+    settings = _settings(moderation_api_key="sk-test", moderation_fail_open=False)
+    llm = AsyncMock(spec=LLMProvider)
+    llm.chat_completion.side_effect = Exception("LLM down")
+
+    with patch("app.shared.moderation.get_settings", return_value=settings):
+        with patch("app.shared.moderation.httpx.AsyncClient") as mock_client_cls:
+            mock_client_cls.return_value.__aenter__.side_effect = Exception("down")
+
+            result = await moderation.moderate_text(
+                "What does the professor say about the exam and when is it?", llm=llm
+            )
+
+    assert result.blocked_message == moderation._SERVICE_UNAVAILABLE_MESSAGE_EN

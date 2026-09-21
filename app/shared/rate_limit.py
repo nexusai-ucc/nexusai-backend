@@ -15,6 +15,13 @@ _MESSAGES = {
     "daily": "Alcanzaste tu límite de {limit} consultas de hoy. Volvé a intentarlo mañana.",
 }
 
+# The student sees this text as is (the frontend shows the message of our own rate
+# limiter), so it follows the language of the question when it is English.
+_MESSAGES_EN = {
+    "minute": "You exceeded the limit of {limit} queries per minute. Wait a moment and try again.",
+    "daily": "You reached your limit of {limit} queries for today. Try again tomorrow.",
+}
+
 
 async def check_rate_limit(
     user_id: int,
@@ -22,6 +29,7 @@ async def check_rate_limit(
     limit: int,
     window_sec: int = 60,
     scope: str = "minute",
+    language: str | None = None,
 ) -> None:
     """Lanza HTTP 429 si user_id superó `limit` llamadas en `window_sec` segundos.
 
@@ -82,7 +90,8 @@ async def check_rate_limit(
 
     if count > limit:
         retry_after = window_sec - (int(time.time()) % window_sec)
-        message_template = _MESSAGES.get(scope, _MESSAGES["minute"])
+        messages = _MESSAGES_EN if language == "en" else _MESSAGES
+        message_template = messages.get(scope, messages["minute"])
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail={

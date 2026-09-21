@@ -42,7 +42,7 @@ import uuid
 from typing import Annotated, List, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Path, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -56,7 +56,7 @@ from app.documents.retriever import format_context_for_prompt, retrieve_context
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
 from app.shared.moderation import moderate_text
-from app.shared.language import with_language_directive
+from app.shared.language import resolve_language, ui_language, with_language_directive
 
 _logger = logging.getLogger(__name__)
 
@@ -350,6 +350,7 @@ Respondé con un JSON válido con exactamente estas claves (sin texto antes ni d
 async def summarize_thread(
     payload: SummarizeThreadRequest,
     _body: Annotated[bytes, Depends(verify_hmac)],
+    request: Request,
     llm: LLMProvider = Depends(get_llm_provider),
 ) -> SummarizeThreadResponse:
     """Resume un hilo de foro usando el LLM.
@@ -368,7 +369,11 @@ async def summarize_thread(
         },
     ]
 
-    messages = with_language_directive(messages, *(p.content for p in payload.posts))
+    messages = with_language_directive(
+        messages,
+        *(p.content for p in payload.posts),
+        fallback=ui_language(request),
+    )
     try:
         result = await llm.chat_completion(messages)
     except Exception as exc:
@@ -471,6 +476,7 @@ MATERIAL DEL CURSO (fragmentos relevantes recuperados por búsqueda semántica):
 async def suggest_reply(
     payload: SuggestReplyRequest,
     _body: Annotated[bytes, Depends(verify_hmac)],
+    request: Request,
     db: AsyncSession = Depends(get_db),
     embeddings: EmbeddingProvider = Depends(get_embedding_provider),
     llm: LLMProvider = Depends(get_llm_provider),
@@ -495,7 +501,11 @@ async def suggest_reply(
     # prompt más abajo), así que contenido inapropiado en cualquier post
     # anterior del hilo puede colarse en `suggested_reply` igual que si
     # viniera de `payload.question`. -----
-    moderation = await moderate_text(f"{payload.question}\n\n{thread_text}", llm=llm)
+    moderation = await moderate_text(
+        f"{payload.question}\n\n{thread_text}",
+        llm=llm,
+        language=resolve_language(request, payload.question),
+    )
     if not moderation.allowed:
         log_moderation_block(
             endpoint="forums.suggest_reply",
@@ -543,7 +553,9 @@ async def suggest_reply(
         },
     ]
 
-    messages = with_language_directive(messages, payload.question, thread_text)
+    messages = with_language_directive(
+        messages, payload.question, thread_text, fallback=ui_language(request)
+    )
     try:
         result = await llm.chat_completion(messages)
     except Exception as exc:
@@ -705,6 +717,7 @@ encabezados."""
 async def weekly_digest(
     payload: WeeklyDigestRequest,
     _body: Annotated[bytes, Depends(verify_hmac)],
+    request: Request,
     llm: LLMProvider = Depends(get_llm_provider),
     db: AsyncSession = Depends(get_db),
 ) -> WeeklyDigestResponse:
@@ -747,6 +760,7 @@ async def weekly_digest(
     messages = with_language_directive(
         messages,
         *(p.content for d in payload.discussions for p in d.posts),
+        fallback=ui_language(request),
     )
     try:
         result = await llm.chat_completion(messages)
