@@ -39,6 +39,7 @@ from app.infrastructure.redis_client import get_redis
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, StreamToken, StreamUsage, get_llm_provider
 from app.shared.config import get_settings
+from app.shared.language import with_language_directive
 from app.shared.error_monitoring import (
     record_llm_failure_and_maybe_alert,
     record_llm_slow_and_maybe_alert,
@@ -287,6 +288,7 @@ async def messages(
             continue
         llm_messages.append({"role": message.role, "content": message.content})
     llm_messages.append({"role": "user", "content": payload.question})
+    llm_messages = with_language_directive(llm_messages, payload.question)
 
     # ----- BACK-11: Llamada al LLM (con retry interno en LLMProvider) -----
     llm_start = time.perf_counter()
@@ -569,6 +571,7 @@ async def messages_stream(
                         {"role": message.role, "content": message.content}
                     )
                 llm_messages.append({"role": "user", "content": payload.question})
+                llm_messages = with_language_directive(llm_messages, payload.question)
 
                 # Stream del LLM.
                 full_text_parts: list[str] = []

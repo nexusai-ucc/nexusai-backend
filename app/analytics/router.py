@@ -31,6 +31,7 @@ from app.auth.hmac import verify_hmac
 from app.db.models import InteractionLog
 from app.db.session import get_db
 from app.providers.llm import LLMProvider, get_llm_provider
+from app.shared.language import with_language_directive
 
 logger = logging.getLogger("nexusai.analytics")
 
@@ -189,7 +190,8 @@ async def faq_topics(
                 f"en como máximo {_FAQ_MAX_TOPICS} grupos. Tu salida es JSON.\n\n"
                 "Devolvé EXCLUSIVAMENTE un JSON con esta forma exacta:\n"
                 '{"topics": [{"label": "<tema en 3-6 palabras>", "question_indices": [0, 2, 5]}]}\n'
-                "- label: nombrá el tema/subtema concreto que agrupa esas preguntas.\n"
+                "- label: nombrá el tema/subtema concreto que agrupa esas preguntas, "
+                "en el mismo idioma que las preguntas (si mezclan idiomas, el predominante).\n"
                 "- question_indices: los índices (de la lista numerada) que pertenecen a ese tema.\n"
                 "- Cada índice de la lista debe aparecer en como máximo un grupo.\n"
                 "- No inventes preguntas ni cambies su texto — solo agrupá y etiquetá."
@@ -200,6 +202,8 @@ async def faq_topics(
             "content": questions_block,
         },
     ]
+
+    messages = with_language_directive(messages, *(row.question for row in rows))
 
     try:
         result_llm = await llm.chat_completion(

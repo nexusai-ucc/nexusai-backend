@@ -56,6 +56,7 @@ from app.documents.retriever import format_context_for_prompt, retrieve_context
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
 from app.shared.moderation import moderate_text
+from app.shared.language import with_language_directive
 
 _logger = logging.getLogger(__name__)
 
@@ -367,6 +368,7 @@ async def summarize_thread(
         },
     ]
 
+    messages = with_language_directive(messages, *(p.content for p in payload.posts))
     try:
         result = await llm.chat_completion(messages)
     except Exception as exc:
@@ -541,6 +543,7 @@ async def suggest_reply(
         },
     ]
 
+    messages = with_language_directive(messages, payload.question, thread_text)
     try:
         result = await llm.chat_completion(messages)
     except Exception as exc:
@@ -741,6 +744,10 @@ async def weekly_digest(
         },
     ]
 
+    messages = with_language_directive(
+        messages,
+        *(p.content for d in payload.discussions for p in d.posts),
+    )
     try:
         result = await llm.chat_completion(messages)
     except Exception as exc:

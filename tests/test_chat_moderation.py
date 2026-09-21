@@ -175,3 +175,31 @@ async def test_messages_moderation_failure_is_fail_safe_not_500(
 
     assert response.status_code == 200
     assert response.json()["answer"] == "La respuesta es..."
+
+
+async def test_messages_asks_for_english_when_the_question_is_in_english(
+    client, mock_db, mock_embeddings, mock_llm
+):
+    """The prompts are in Spanish; without an explicit directive the answer came back in Spanish."""
+    from app.shared.language import language_directive
+
+    with patch("app.shared.moderation.get_settings", return_value=_fake_settings()):
+        mock_llm.chat_completion.side_effect = [
+            MagicMock(text='{"flagged": false, "categories": []}'),
+            MagicMock(
+                text="A foreign key references...",
+                prompt_tokens=10,
+                completion_tokens=5,
+                total_tokens=15,
+            ),
+        ]
+
+        response = await client.post(
+            "/api/v1/chat/messages",
+            json={**_PAYLOAD, "question": "What does a foreign key do?"},
+        )
+
+    assert response.status_code == 200
+    answer_messages = mock_llm.chat_completion.await_args_list[1].args[0]
+    assert answer_messages[-1]["role"] == "user"
+    assert answer_messages[-1]["content"].endswith(language_directive("en"))

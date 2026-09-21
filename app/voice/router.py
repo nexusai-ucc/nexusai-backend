@@ -18,7 +18,7 @@ from __future__ import annotations
 import base64
 import binascii
 import logging
-from typing import Annotated
+from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -51,7 +51,9 @@ SUPPORTED_AUDIO_MIME_TYPES = {
 class TranscribeRequest(BaseModel):
     content_b64: str = Field(min_length=1)
     mime_type: str = Field(min_length=1, max_length=100)
-    language: str = Field(default="es", min_length=2, max_length=5)
+    # None = the model detects the spoken language. The plugin does not send it,
+    # and forcing one language breaks questions spoken in any other.
+    language: Optional[str] = Field(default=None, min_length=2, max_length=5)
 
 
 class TranscribeResponse(BaseModel):
