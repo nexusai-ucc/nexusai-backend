@@ -624,3 +624,29 @@ async def test_reindex_document_success_resets_status_and_deletes_old_chunks(
     assert mock_db.execute.call_count == 2
     delete_call_sql = str(mock_db.execute.call_args_list[1].args[0]).lower()
     assert "chunk" in delete_call_sql
+
+
+async def test_reindex_409_messages_follow_the_interface_language(
+    client, mock_db, tmp_path, monkeypatch
+):
+    """Both 409s tell the teacher which button to use, so they follow Accept-Language."""
+    monkeypatch.setattr("app.documents.router.UPLOADS_DIR", tmp_path)
+
+    no_path = _make_doc(status="indexed", storage_path=None)
+    mock_db.execute.return_value = _exec_result(scalar=no_path)
+    url = f"/api/v1/documents/{no_path.id}/reindex"
+    english = await client.post(url, headers={"Accept-Language": "en"})
+    default = await client.post(url)
+
+    assert english.status_code == 409
+    assert "Use 'Replace'" in english.json()["detail"]
+    assert "Usá 'Reemplazar'" in default.json()["detail"]
+
+    gone = _make_doc(status="indexed", storage_path="does-not-exist.pdf")
+    mock_db.execute.return_value = _exec_result(scalar=gone)
+    url = f"/api/v1/documents/{gone.id}/reindex"
+    english = await client.post(url, headers={"Accept-Language": "en"})
+    default = await client.post(url)
+
+    assert "no longer available" in english.json()["detail"]
+    assert "ya no está disponible" in default.json()["detail"]
