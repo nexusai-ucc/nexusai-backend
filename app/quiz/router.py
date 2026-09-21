@@ -39,7 +39,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Any, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from sqlalchemy import delete, desc, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -62,7 +62,7 @@ from app.db.session import get_db
 from app.documents.retriever import retrieve_context
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
-from app.shared.language import with_language_directive
+from app.shared.language import localized, resolve_language, with_language_directive
 from app.shared.config import get_settings
 from app.shared.moderation import moderate_text
 
@@ -987,6 +987,7 @@ def _build_quiz_prompt(
 async def generate_quiz(
     payload: QuizRequest,
     _body: Annotated[bytes, Depends(verify_hmac)],
+    request: Request,
     db: AsyncSession = Depends(get_db),
     llm: LLMProvider = Depends(get_llm_provider),
     embeddings: EmbeddingProvider = Depends(get_embedding_provider),
@@ -1070,9 +1071,12 @@ async def generate_quiz(
         if not answer.startswith("YES"):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=(
+                detail=localized(
+                    resolve_language(request, topic),
                     f"No encontré material sobre '{topic}' en los archivos del curso. "
-                    "Intentá con un tema que esté cubierto en los archivos indexados."
+                    "Intentá con un tema que esté cubierto en los archivos indexados.",
+                    f"I couldn't find material about '{topic}' in the course files. "
+                    "Try a topic that is covered in the indexed files.",
                 ),
             )
 
@@ -1084,7 +1088,11 @@ async def generate_quiz(
     if not chunks:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Este curso todavía no tiene material indexado para generar un quiz.",
+            detail=localized(
+                resolve_language(request),
+                "Este curso todavía no tiene material indexado para generar un quiz.",
+                "This course doesn't have indexed material yet to generate a quiz.",
+            ),
         )
 
     # 2) Pedir al LLM la generación + parseo/validación/enriquecimiento (compartido con /generate-exam).
@@ -1117,6 +1125,7 @@ async def generate_quiz(
 async def generate_exam(
     payload: ExamGenerateRequest,
     _body: Annotated[bytes, Depends(verify_hmac)],
+    request: Request,
     db: AsyncSession = Depends(get_db),
     llm: LLMProvider = Depends(get_llm_provider),
 ) -> QuizResponse:
@@ -1139,7 +1148,11 @@ async def generate_exam(
     if not chunks:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Los archivos seleccionados no tienen material indexado en este curso.",
+            detail=localized(
+                resolve_language(request),
+                "Los archivos seleccionados no tienen material indexado en este curso.",
+                "The selected files have no indexed material in this course.",
+            ),
         )
 
     questions = await _run_quiz_generation(

@@ -35,7 +35,15 @@ from typing import Annotated, Optional
 from uuid import UUID
 
 import redis.asyncio as redis_async
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
@@ -50,6 +58,7 @@ from app.documents.summarizer import summarize_document, summarize_pre_exam
 from app.infrastructure.redis_client import get_redis
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
+from app.shared.language import localized, resolve_language
 from app.shared.retry import async_retry
 
 logger = logging.getLogger("nexusai.documents")
@@ -473,6 +482,7 @@ async def replace_document(
 async def reindex_document(
     document_id: UUID,
     _body: Annotated[bytes, Depends(verify_hmac)],
+    request: Request,
     db: AsyncSession = Depends(get_db),
     embeddings: EmbeddingProvider = Depends(get_embedding_provider),
 ) -> DocumentOut:
@@ -494,14 +504,26 @@ async def reindex_document(
     if not document.storage_path:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Este documento no tiene un archivo guardado para reindexar. Usá 'Reemplazar' para subir uno nuevo.",
+            detail=localized(
+                resolve_language(request),
+                "Este documento no tiene un archivo guardado para reindexar. "
+                "Usá 'Reemplazar' para subir uno nuevo.",
+                "This document has no stored file to reindex. "
+                "Use 'Replace' to upload a new one.",
+            ),
         )
 
     file_path = UPLOADS_DIR / document.storage_path
     if not file_path.exists():
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="El archivo original ya no está disponible en el servidor. Usá 'Reemplazar' para subir uno nuevo.",
+            detail=localized(
+                resolve_language(request),
+                "El archivo original ya no está disponible en el servidor. "
+                "Usá 'Reemplazar' para subir uno nuevo.",
+                "The original file is no longer available on the server. "
+                "Use 'Replace' to upload a new one.",
+            ),
         )
     file_bytes = file_path.read_bytes()
 
