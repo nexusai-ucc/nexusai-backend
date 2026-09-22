@@ -19,6 +19,12 @@ class ChatRequest(BaseModel):
     course_ids: Optional[List[int]] = None
     # Mapa {str(course_id): nombre} para que el LLM cite la materia en multi-curso.
     course_names: Optional[Dict[str, str]] = None
+    # Presupuesto de tokens por rol (app/shared/token_budget.py). Resuelto
+    # server-side en el plugin PHP vía has_capability('local/nexusai:manage', ...)
+    # — el mismo criterio que ya usa visibility_helper.php — NUNCA se confía en
+    # un rol mandado por el JS del navegador. Default False = alumno (límite
+    # más conservador) si algún cliente viejo no manda el campo.
+    is_teacher: bool = False
 
 
 class MessageOut(BaseModel):

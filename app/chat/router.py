@@ -11,6 +11,10 @@ Sprint 3 additions:
   - BACK-14: rate limiting por user_id (20 req/min + límite diario), logging
              estructurado JSON con request_id + course_id + user_id + tokens
              + latencia.
+
+Presupuesto de tokens por rol (complementa BACK-14): limita el CONSUMO REAL
+en tokens por hora y por día, diferenciado alumno/docente. Ver
+app/shared/token_budget.py.
 """
 
 from __future__ import annotations
@@ -46,6 +50,7 @@ from app.shared.error_monitoring import (
 )
 from app.shared.moderation import moderate_text
 from app.shared.rate_limit import check_rate_limit
+from app.shared.token_budget import check_token_budget, record_token_usage
 
 import redis.asyncio as redis_async
 
@@ -97,6 +102,17 @@ async def _get_or_create_session(
     db.add(session)
     await db.flush()
     return session
+
+
+def _token_budget_limits(settings, is_teacher: bool) -> tuple[int, int]:
+    """Devuelve (límite horario, límite diario) de tokens según el rol.
+
+    is_teacher viene resuelto server-side en el plugin PHP (has_capability),
+    nunca del JS del navegador — ver comentario en ChatRequest.is_teacher.
+    """
+    if is_teacher:
+        return settings.token_budget_teacher_hourly, settings.token_budget_teacher_daily
+    return settings.token_budget_student_hourly, settings.token_budget_student_daily
 
 
 def _build_system_prompt(retrieved_context: str, is_multicourse: bool = False) -> str:
@@ -201,6 +217,30 @@ async def messages(
         user_id=payload.user_id,
         redis=redis,
         limit=settings.rate_limit_per_user_daily,
+        window_sec=86400,
+        scope="daily",
+        language=resolve_language(request, payload.question),
+    )
+
+    # ----- Presupuesto de tokens por rol (complementa el rate limit de
+    # arriba — ver app/shared/token_budget.py). Antes de moderación porque
+    # moderate_text puede llamar al LLM (caso borderline) y eso también
+    # gasta tokens del presupuesto. -----
+    token_hourly_limit, token_daily_limit = _token_budget_limits(
+        settings, payload.is_teacher
+    )
+    await check_token_budget(
+        user_id=payload.user_id,
+        redis=redis,
+        limit=token_hourly_limit,
+        window_sec=3600,
+        scope="hourly",
+        language=resolve_language(request, payload.question),
+    )
+    await check_token_budget(
+        user_id=payload.user_id,
+        redis=redis,
+        limit=token_daily_limit,
         window_sec=86400,
         scope="daily",
         language=resolve_language(request, payload.question),
@@ -316,6 +356,18 @@ async def messages(
     llm_latency_ms = (time.perf_counter() - llm_start) * 1000
     await record_llm_slow_and_maybe_alert(
         redis, endpoint="messages", latency_ms=llm_latency_ms
+    )
+
+    # Registrar el consumo real de esta request en el presupuesto de tokens
+    # (ver check_token_budget más arriba — recién ahora se conoce el costo real).
+    await record_token_usage(
+        user_id=payload.user_id, redis=redis, tokens=result.total_tokens, window_sec=3600
+    )
+    await record_token_usage(
+        user_id=payload.user_id,
+        redis=redis,
+        tokens=result.total_tokens,
+        window_sec=86400,
     )
 
     # ----- BACK-12: Persistir mensaje del asistente con token counts -----
@@ -446,6 +498,27 @@ async def messages_stream(
         user_id=payload.user_id,
         redis=redis,
         limit=settings.rate_limit_per_user_daily,
+        window_sec=86400,
+        scope="daily",
+        language=resolve_language(request, payload.question),
+    )
+
+    # ----- Presupuesto de tokens por rol (ver app/shared/token_budget.py). -----
+    token_hourly_limit, token_daily_limit = _token_budget_limits(
+        settings, payload.is_teacher
+    )
+    await check_token_budget(
+        user_id=payload.user_id,
+        redis=redis,
+        limit=token_hourly_limit,
+        window_sec=3600,
+        scope="hourly",
+        language=resolve_language(request, payload.question),
+    )
+    await check_token_budget(
+        user_id=payload.user_id,
+        redis=redis,
+        limit=token_daily_limit,
         window_sec=86400,
         scope="daily",
         language=resolve_language(request, payload.question),
@@ -615,6 +688,22 @@ async def messages_stream(
                 llm_latency_ms = (time.perf_counter() - llm_start) * 1000
                 await record_llm_slow_and_maybe_alert(
                     redis, endpoint="stream", latency_ms=llm_latency_ms
+                )
+
+                # Registrar el consumo real de esta request en el presupuesto
+                # de tokens (ver check_token_budget más arriba).
+                stream_total_tokens = usage_seen.total_tokens if usage_seen else 0
+                await record_token_usage(
+                    user_id=payload.user_id,
+                    redis=redis,
+                    tokens=stream_total_tokens,
+                    window_sec=3600,
+                )
+                await record_token_usage(
+                    user_id=payload.user_id,
+                    redis=redis,
+                    tokens=stream_total_tokens,
+                    window_sec=86400,
                 )
 
                 # Persistir el mensaje completo del asistente.

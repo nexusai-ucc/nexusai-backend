@@ -102,6 +102,18 @@ class Settings(BaseSettings):
     rate_limit_per_user_daily: int = 50
     rate_limit_per_user_minute: int = 20
 
+    # Presupuesto de tokens por rol (ver app/shared/token_budget.py).
+    # Complementa rate_limit_per_user_*: ese limita CANTIDAD de requests,
+    # esto limita el COSTO real en tokens — cubre el caso de un usuario que
+    # hace pocas consultas pero muy largas (historial extenso, respuestas
+    # largas) y agotaría presupuesto real sin llegar nunca al límite de
+    # requests. Docentes tienen un techo más alto porque generan quizzes,
+    # exámenes y resúmenes de foro además de chatear.
+    token_budget_student_hourly: int = 8000
+    token_budget_student_daily: int = 40000
+    token_budget_teacher_hourly: int = 20000
+    token_budget_teacher_daily: int = 100000
+
     # Alertas mínimas (ver ADR-012 y app/shared/alerting.py).
     #
     # alert_smtp_*/alert_email_to: envío por email vía SMTP (pensado para
