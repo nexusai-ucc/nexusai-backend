@@ -14,26 +14,32 @@ síntesis para combinarlos en un solo resumen de repaso, mismo criterio de "una
 sola llamada de síntesis" ya usado en Study Plan y en el FAQ dashboard.
 
 PERF-02: esos resúmenes por documento se piden al LLM en paralelo (con tope de
-concurrencia) y se cachean en Redis por versión del archivo. Antes eran N
-llamadas en serie sin cache, que es lo que hacía que el resumen pre-parcial
-tardara minutos y se pasara del timeout del cliente PHP.
+concurrencia). Antes eran N llamadas en serie, que es lo que hacía que el
+resumen pre-parcial tardara minutos y se pasara del timeout del cliente PHP.
+
+COST-02: los resúmenes (el de cada documento y el de repaso pre-examen) se
+guardan en la base hasta que cambie el archivo, el modelo o el prompt, en vez
+de vencer a las 24 h en Redis. Todos los alumnos leen el mismo sin volver a
+pagarlo. Ver summary_store.py.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Optional
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Chunk, Document
+from app.documents import summary_store
 from app.providers.llm import LLMProvider
 from app.shared.config import get_settings
 from app.shared.language import detect_language, language_directive
+from app.shared.usage_ledger import UsageRecord, record_usage
 
 logger = logging.getLogger("nexusai.documents.summarizer")
 
@@ -61,67 +67,69 @@ CONTENIDO:
 """
 
 
-# Bump it whenever the summary prompt changes in a way that should invalidate the cache.
+# Bump it whenever the summary prompt changes in a way that should invalidate
+# the stored summaries.
 _PROMPT_VERSION = "p2"
+# Same for the pre-exam synthesis prompt (_PRE_EXAM_SYNTHESIS_PROMPT_TEMPLATE).
+_SYNTHESIS_PROMPT_VERSION = "s1"
 
 
-def _cache_key(document: Document, model: str) -> str:
-    """Key de Redis para el resumen de un documento (PERF-02).
+def _summary_key(document: Document, model: str) -> str:
+    """Clave del resumen guardado de un documento (COST-02).
 
     Incluye una huella del archivo (`file_hash`, o `updated_at` si el hash no
     está) para que reemplazar un documento manteniendo su id (CONT-07 / #356)
-    genere una key distinta — o sea, la entrada vieja queda huérfana y expira
-    sola por TTL, sin necesidad de invalidar nada a mano.
+    genere una clave distinta: el resumen viejo deja de servirse solo.
 
     Incluye también el modelo: si el equipo cambia `LLM_MODEL`, los resúmenes
-    se regeneran con el modelo nuevo en vez de servir los del anterior.
-
-    Y la versión del prompt (`_PROMPT_VERSION`): al cambiar cómo se pide el
-    idioma, los resúmenes viejos (en español aunque el documento estuviera en
-    inglés) dejan de servirse y se regeneran.
+    se regeneran con el modelo nuevo en vez de servir los del anterior. Y la
+    versión del prompt (`_PROMPT_VERSION`): al cambiar cómo se pide el
+    resumen, los viejos dejan de servirse.
     """
     fingerprint = document.file_hash or document.updated_at.isoformat()
-    return f"{_CACHE_PREFIX}:{document.id}:{model}:{_PROMPT_VERSION}:{fingerprint}"
+    return summary_store.make_key(
+        "document", str(document.id), model, _PROMPT_VERSION, fingerprint
+    )
 
 
-async def _cache_get(cache: Any, key: str) -> Optional[dict]:
-    """Lee un resumen cacheado. Nunca propaga: si Redis está caído o devolvió
-    basura, se comporta como un miss y el resumen se regenera."""
-    try:
-        raw = await cache.get(key)
-    except Exception as exc:
-        logger.warning(
-            "Cache de resúmenes no disponible en lectura: %s: %s",
-            type(exc).__name__,
-            exc,
+def _pre_exam_key(course_id: int, document_keys: list[str], model: str) -> str:
+    """Clave del resumen de repaso: depende de la lista de documentos con sus
+    huellas (ya están dentro de cada clave de documento), del modelo y de las
+    dos versiones de prompt. Si cambia el material o se agrega un documento,
+    es otra clave."""
+    return summary_store.make_key(
+        "pre_exam",
+        str(course_id),
+        model,
+        _PROMPT_VERSION,
+        _SYNTHESIS_PROMPT_VERSION,
+        *sorted(document_keys),
+    )
+
+
+@dataclass
+class _Generated:
+    """Un resumen recién generado y lo que costó."""
+
+    payload: dict
+    model: Optional[str]
+    provider: Optional[str]
+    prompt_tokens: int
+    completion_tokens: int
+
+
+async def _record_hit(llm: LLMProvider, stored: summary_store.StoredSummary) -> None:
+    """Deja en el registro de consumo que este pedido salió de lo guardado:
+    0 tokens gastados y los que se ahorró."""
+    await record_usage(
+        UsageRecord(
+            kind="llm",
+            provider=stored.provider or llm.provider_name,
+            model=stored.model or llm.model,
+            cache_hit=True,
+            saved_tokens=stored.tokens,
         )
-        return None
-
-    if not raw:
-        return None
-
-    try:
-        value = json.loads(raw)
-    except (TypeError, ValueError):
-        logger.warning("Entrada de cache corrupta en %s — se regenera el resumen", key)
-        return None
-
-    return value if isinstance(value, dict) else None
-
-
-async def _cache_set(cache: Any, key: str, value: dict, ttl_sec: int) -> None:
-    """Guarda un resumen en cache. Nunca propaga — no poder cachear no es
-    motivo para fallar un resumen que ya se generó bien."""
-    if ttl_sec <= 0:
-        return
-    try:
-        await cache.setex(key, ttl_sec, json.dumps(value, ensure_ascii=False))
-    except Exception as exc:
-        logger.warning(
-            "Cache de resúmenes no disponible en escritura: %s: %s",
-            type(exc).__name__,
-            exc,
-        )
+    )
 
 
 async def _load_document_for_summary(
@@ -188,29 +196,19 @@ async def _load_document_for_summary(
     return document, prompt, chunks_used, total_chunks
 
 
-async def _summarize_loaded_document(
+async def _generate_summary(
     document: Document,
     prompt: str,
     chunks_used: int,
     total_chunks: int,
     llm: LLMProvider,
-    cache: Any = None,
-) -> dict:
-    """Resuelve el resumen de un documento ya leído de la DB: cache primero,
-    LLM si hay miss. No toca la DB — se puede correr en paralelo con otros.
+) -> _Generated:
+    """Genera el resumen de un documento ya leído de la DB. No toca la DB — se
+    puede correr en paralelo con otros.
 
     Raises:
         RuntimeError: si el LLM falla al generar el resumen.
     """
-    settings = get_settings()
-    key = _cache_key(document, llm.model) if cache is not None else None
-
-    if key is not None:
-        cached = await _cache_get(cache, key)
-        if cached is not None:
-            logger.info("Resumen servido desde cache para documento %s", document.id)
-            return cached
-
     try:
         result = await llm.chat_completion(
             messages=[{"role": "user", "content": prompt}],
@@ -221,18 +219,37 @@ async def _summarize_loaded_document(
     except Exception as exc:
         raise RuntimeError("LLM summary generation failed") from exc
 
-    payload = {
-        "document_id": str(document.id),
-        "document_filename": document.filename,
-        "summary": summary_text,
-        "chunks_used": chunks_used,
-        "total_chunks": total_chunks,
-    }
+    return _Generated(
+        payload={
+            "document_id": str(document.id),
+            "document_filename": document.filename,
+            "summary": summary_text,
+            "chunks_used": chunks_used,
+            "total_chunks": total_chunks,
+        },
+        model=result.model or None,
+        provider=result.provider or None,
+        prompt_tokens=result.prompt_tokens,
+        completion_tokens=result.completion_tokens,
+    )
 
-    if key is not None:
-        await _cache_set(cache, key, payload, settings.summary_cache_ttl_sec)
 
-    return payload
+async def _save_document_summary(
+    db: AsyncSession, document: Document, key: str, generated: _Generated
+) -> None:
+    await summary_store.save(
+        db,
+        cache_key=key,
+        kind=summary_store.KIND_DOCUMENT,
+        course_id=document.course_id,
+        document_id=document.id,
+        prompt_version=_PROMPT_VERSION,
+        payload=generated.payload,
+        model=generated.model,
+        provider=generated.provider,
+        prompt_tokens=generated.prompt_tokens,
+        completion_tokens=generated.completion_tokens,
+    )
 
 
 async def summarize_document(
@@ -240,10 +257,11 @@ async def summarize_document(
     course_id: int,
     db: AsyncSession,
     llm: LLMProvider,
-    cache: Any = None,
 ) -> dict:
     """
-    Genera un resumen del documento usando el LLM.
+    Devuelve el resumen del documento: el guardado si el archivo, el modelo y
+    el prompt no cambiaron (0 tokens), o uno nuevo generado con el LLM, que
+    queda guardado para los que lo pidan después (COST-02).
 
     Args:
         document_id: UUID del documento a resumir.
@@ -251,10 +269,6 @@ async def summarize_document(
                    al curso del usuario (aislamiento multi-curso).
         db: sesión async de SQLAlchemy.
         llm: instancia de LLMProvider.
-        cache: cliente Redis opcional (PERF-02). Si se pasa, el resumen se
-               sirve de cache cuando ya existe uno para esa versión del
-               archivo. Si es None, se llama al LLM siempre — comportamiento
-               idéntico al previo a PERF-02.
 
     Returns:
         dict con: document_id, document_filename, summary, chunks_used, total_chunks.
@@ -266,9 +280,19 @@ async def summarize_document(
     document, prompt, chunks_used, total_chunks = await _load_document_for_summary(
         document_id, course_id, db
     )
-    return await _summarize_loaded_document(
-        document, prompt, chunks_used, total_chunks, llm, cache
+    key = _summary_key(document, llm.model)
+
+    stored = await summary_store.lookup(db, key)
+    if stored is not None:
+        logger.info("Resumen servido desde lo guardado para documento %s", document.id)
+        await _record_hit(llm, stored)
+        return stored.payload
+
+    generated = await _generate_summary(
+        document, prompt, chunks_used, total_chunks, llm
     )
+    await _save_document_summary(db, document, key, generated)
+    return generated.payload
 
 
 _PRE_EXAM_SYNTHESIS_PROMPT_TEMPLATE = """\
@@ -297,11 +321,15 @@ async def summarize_pre_exam(
     db: AsyncSession,
     llm: LLMProvider,
     section: Optional[int] = None,
-    cache: Any = None,
 ) -> dict:
     """
     Genera un resumen de repaso combinando todo el material indexado y
     relevante para un próximo examen (BUS-04).
+
+    Si el material, el modelo y los prompts no cambiaron desde la última vez,
+    devuelve el resumen guardado sin llamar al LLM (COST-02). Si no, reusa los
+    resúmenes guardados de cada documento, genera solo los que faltan y
+    guarda todo.
 
     Args:
         course_id: ID del curso.
@@ -309,7 +337,6 @@ async def summarize_pre_exam(
         llm: instancia de LLMProvider.
         section: unidad/sección opcional para acotar el material (BUS-05).
                  Si es None, se usa todo el material indexado del curso.
-        cache: cliente Redis opcional — se propaga a cada resumen individual.
 
     Returns:
         dict con: summary, documents_used (lista de {document_id, filename}),
@@ -329,16 +356,9 @@ async def summarize_pre_exam(
     if not docs:
         return {"summary": "", "documents_used": [], "total_documents": 0}
 
-    # 1) Resumen individual por documento, en dos fases (PERF-02).
-    #
-    # Antes esto era un for secuencial de N llamadas al LLM: con ~8 documentos
-    # indexados el endpoint tardaba más que el CURLOPT_TIMEOUT de 120s del
-    # cliente PHP del plugin, o sea que además de lento se moría por timeout
-    # antes de responder.
-    #
-    # Fase A — lecturas de DB, EN SERIE. `AsyncSession` no es seguro de usar
-    # concurrentemente: paralelizar acá corrompe la sesión. Es barato igual,
-    # son queries indexadas.
+    # Fase A — lecturas de DB, EN SERIE (PERF-02). `AsyncSession` no es seguro
+    # de usar concurrentemente: paralelizar acá corrompe la sesión. Es barato
+    # igual, son queries indexadas.
     loaded: list[tuple[Document, str, int, int]] = []
     for doc_id, filename in docs:
         try:
@@ -352,18 +372,44 @@ async def summarize_pre_exam(
     if not loaded:
         return {"summary": "", "documents_used": [], "total_documents": 0}
 
-    # Fase B — llamadas al LLM, EN PARALELO con un tope de concurrencia. El
-    # tope existe por la cuota gratuita de Gemini: disparar 8 requests juntas
-    # se come el rate limit y devuelve 429/503 en vez de ir más rápido.
+    keys = [_summary_key(item[0], llm.model) for item in loaded]
+
+    # El resumen de repaso completo, si ya existe para este mismo material.
+    pre_exam_key = _pre_exam_key(course_id, keys, llm.model)
+    stored_pre_exam = await summary_store.lookup(db, pre_exam_key)
+    if stored_pre_exam is not None:
+        logger.info(
+            "Resumen pre-examen servido desde lo guardado (curso %s)", course_id
+        )
+        await _record_hit(llm, stored_pre_exam)
+        return stored_pre_exam.payload
+
+    # Los resúmenes por documento que ya están guardados no se piden de nuevo.
+    resolved: dict[int, dict] = {}
+    doc_tokens = 0
+    missing: list[int] = []
+    for index, key in enumerate(keys):
+        stored = await summary_store.lookup(db, key)
+        if stored is None:
+            missing.append(index)
+            continue
+        await _record_hit(llm, stored)
+        resolved[index] = stored.payload
+        doc_tokens += stored.tokens
+
+    # Fase B — llamadas al LLM de los que faltan, EN PARALELO con un tope de
+    # concurrencia. El tope existe por la cuota gratuita de Gemini: disparar 8
+    # requests juntas se come el rate limit y devuelve 429/503 en vez de ir
+    # más rápido.
     settings = get_settings()
     semaphore = asyncio.Semaphore(max(1, settings.summary_max_concurrency))
 
-    async def _one(loaded_doc: tuple[Document, str, int, int]) -> Optional[dict]:
-        document, prompt, chunks_used, total_chunks = loaded_doc
+    async def _one(index: int) -> tuple[int, Optional[_Generated]]:
+        document, prompt, chunks_used, total_chunks = loaded[index]
         async with semaphore:
             try:
-                return await _summarize_loaded_document(
-                    document, prompt, chunks_used, total_chunks, llm, cache
+                return index, await _generate_summary(
+                    document, prompt, chunks_used, total_chunks, llm
                 )
             except RuntimeError as exc:
                 # Un documento que falla no tira abajo el repaso entero —
@@ -374,15 +420,24 @@ async def summarize_pre_exam(
                     document.filename,
                     exc,
                 )
-                return None
+                return index, None
 
-    results = await asyncio.gather(*(_one(item) for item in loaded))
-    per_doc_summaries = [r for r in results if r is not None]
+    all_generated = True
+    for index, generated in await asyncio.gather(*(_one(i) for i in missing)):
+        if generated is None:
+            all_generated = False
+            continue
+        resolved[index] = generated.payload
+        doc_tokens += generated.prompt_tokens + generated.completion_tokens
+        # Fase C — guardado, EN SERIE (misma sesión).
+        await _save_document_summary(db, loaded[index][0], keys[index], generated)
+
+    per_doc_summaries = [resolved[i] for i in sorted(resolved)]
 
     if not per_doc_summaries:
         return {"summary": "", "documents_used": [], "total_documents": 0}
 
-    # 2) Un único LLM call de síntesis — combina los resúmenes ya generados
+    # Un único LLM call de síntesis — combina los resúmenes ya generados
     # (cada uno acotado a 200-400 palabras) en un solo resumen de repaso.
     summaries_block = "\n\n".join(
         f'Archivo: "{r["document_filename"]}"\n{r["summary"]}'
@@ -403,7 +458,7 @@ async def summarize_pre_exam(
     except Exception as exc:
         raise RuntimeError("LLM pre-exam synthesis failed") from exc
 
-    return {
+    result = {
         "summary": summary_text,
         "documents_used": [
             {"document_id": r["document_id"], "filename": r["document_filename"]}
@@ -411,3 +466,24 @@ async def summarize_pre_exam(
         ],
         "total_documents": len(per_doc_summaries),
     }
+
+    # Solo se guarda si entraron todos los documentos: un repaso armado con
+    # menos porque uno falló no tiene que quedar como "el resumen del curso".
+    if all_generated:
+        await summary_store.save(
+            db,
+            cache_key=pre_exam_key,
+            kind=summary_store.KIND_PRE_EXAM,
+            course_id=course_id,
+            document_id=None,
+            prompt_version=f"{_PROMPT_VERSION}+{_SYNTHESIS_PROMPT_VERSION}",
+            payload=result,
+            model=synthesis.model or None,
+            provider=synthesis.provider or None,
+            # Lo que se ahorra en un acierto es la síntesis más los resúmenes
+            # por documento que hubo que generar o que ya estaban guardados.
+            prompt_tokens=synthesis.prompt_tokens + doc_tokens,
+            completion_tokens=synthesis.completion_tokens,
+        )
+
+    return result

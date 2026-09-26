@@ -1,24 +1,28 @@
 """
-Tests del summarizer de documentos (BUS-03 / BUS-04) con foco en PERF-02:
-cache en Redis y paralelización del resumen pre-parcial.
+Tests del summarizer de documentos (BUS-03 / BUS-04): resúmenes permanentes
+(COST-02) y paralelización del resumen pre-parcial (PERF-02).
 
-La DB y el LLM van mockeados — lo que se verifica acá es la coreografía
-(cuántas veces se llama al LLM, qué se cachea, qué pasa si Redis se cae), no
-la calidad del resumen.
+La DB y el LLM van mockeados y el almacén de resúmenes es uno en memoria — lo
+que se verifica acá es la coreografía (cuántas veces se llama al LLM, qué se
+guarda, cuándo se invalida), no la calidad del resumen.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.documents import summarizer
+from app.documents import summarizer, summary_store
 from app.documents.summarizer import summarize_document, summarize_pre_exam
+
+# Las funciones reales del almacén, antes de que el fixture las reemplace.
+_real_lookup = summary_store.lookup
+_real_save = summary_store.save
+_real_make_key = summary_store.make_key
 
 
 def _fake_document(
@@ -64,111 +68,61 @@ def _fake_llm(
     return llm
 
 
-def _fake_cache() -> MagicMock:
-    cache = MagicMock()
-    cache.get = AsyncMock(return_value=None)
-    cache.setex = AsyncMock(return_value=True)
-    return cache
+class _FakeStore:
+    """Reemplaza a summary_store: guarda en un dict y cuenta los accesos, sin base."""
+
+    def __init__(self) -> None:
+        self.rows: dict[str, summary_store.StoredSummary] = {}
+        self.saved: list[dict] = []
+        self.lookups: list[str] = []
+
+    async def lookup(self, db, cache_key):
+        self.lookups.append(cache_key)
+        return self.rows.get(cache_key)
+
+    async def save(self, db, **kwargs):
+        self.saved.append(kwargs)
+        self.rows[kwargs["cache_key"]] = summary_store.StoredSummary(
+            payload=kwargs["payload"],
+            model=kwargs["model"],
+            provider=kwargs["provider"],
+            prompt_tokens=kwargs["prompt_tokens"],
+            completion_tokens=kwargs["completion_tokens"],
+        )
+
+
+@pytest.fixture(autouse=True)
+def store(monkeypatch) -> _FakeStore:
+    """Todos los tests del módulo corren con un almacén en memoria (sin base)
+    y capturan el registro de aciertos de caché."""
+    fake = _FakeStore()
+    monkeypatch.setattr(summary_store, "lookup", fake.lookup)
+    monkeypatch.setattr(summary_store, "save", fake.save)
+    hits: list = []
+
+    async def fake_record(record):
+        hits.append(record)
+
+    monkeypatch.setattr(summarizer, "record_usage", fake_record)
+    fake.usage_records = hits
+    return fake
 
 
 # ============================================================
-# Cache de resúmenes por documento (PERF-02)
+# Resúmenes permanentes por documento (COST-02)
 # ============================================================
 
 
 @pytest.mark.asyncio
-async def test_summarize_document_caches_result_after_generating():
-    """Un miss de cache genera el resumen y lo guarda con TTL."""
+async def test_summarize_document_stores_result_after_generating(store):
+    """Un miss genera el resumen y lo guarda, con lo que costó generarlo."""
     document = _fake_document()
     db = _fake_db(document, [_fake_chunk("contenido del apunte", 0)])
     llm = _fake_llm()
-    cache = _fake_cache()
-
-    result = await summarize_document(
-        document_id=document.id, course_id=7, db=db, llm=llm, cache=cache
-    )
-
-    assert result["summary"] == "resumen generado"
-    llm.chat_completion.assert_awaited_once()
-    cache.setex.assert_awaited_once()
-
-    key, ttl, raw = cache.setex.await_args.args
-    assert str(document.id) in key
-    assert "hash-abc" in key  # huella del archivo
-    assert "gemini-3.5-flash" in key  # modelo, para no servir resúmenes de otro
-    assert ttl > 0
-    assert json.loads(raw)["summary"] == "resumen generado"
-
-
-@pytest.mark.asyncio
-async def test_summarize_document_serves_from_cache_without_calling_llm():
-    """Un hit de cache devuelve el resumen guardado y NO llama al LLM."""
-    document = _fake_document()
-    db = _fake_db(document, [_fake_chunk("contenido", 0)])
-    llm = _fake_llm()
-
-    cached = {
-        "document_id": str(document.id),
-        "document_filename": "apunte.pdf",
-        "summary": "resumen cacheado",
-        "chunks_used": 1,
-        "total_chunks": 1,
-    }
-    cache = _fake_cache()
-    cache.get = AsyncMock(return_value=json.dumps(cached))
-
-    result = await summarize_document(
-        document_id=document.id, course_id=7, db=db, llm=llm, cache=cache
-    )
-
-    assert result["summary"] == "resumen cacheado"
-    llm.chat_completion.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_summarize_document_survives_redis_being_down():
-    """Si Redis está caído, el resumen se genera igual — la cache es una
-    optimización, no una dependencia dura."""
-    document = _fake_document()
-    db = _fake_db(document, [_fake_chunk("contenido", 0)])
-    llm = _fake_llm()
-
-    cache = _fake_cache()
-    cache.get = AsyncMock(side_effect=ConnectionError("redis caído"))
-    cache.setex = AsyncMock(side_effect=ConnectionError("redis caído"))
-
-    result = await summarize_document(
-        document_id=document.id, course_id=7, db=db, llm=llm, cache=cache
-    )
-
-    assert result["summary"] == "resumen generado"
-    llm.chat_completion.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_summarize_document_regenerates_on_corrupt_cache_entry():
-    """Una entrada de cache que no es JSON válido se trata como miss."""
-    document = _fake_document()
-    db = _fake_db(document, [_fake_chunk("contenido", 0)])
-    llm = _fake_llm()
-
-    cache = _fake_cache()
-    cache.get = AsyncMock(return_value="{no es json")
-
-    result = await summarize_document(
-        document_id=document.id, course_id=7, db=db, llm=llm, cache=cache
-    )
-
-    assert result["summary"] == "resumen generado"
-    llm.chat_completion.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_summarize_document_without_cache_always_calls_llm():
-    """Sin cache pasada, el comportamiento es el previo a PERF-02."""
-    document = _fake_document()
-    db = _fake_db(document, [_fake_chunk("contenido", 0)])
-    llm = _fake_llm()
+    llm.chat_completion.return_value.prompt_tokens = 300
+    llm.chat_completion.return_value.completion_tokens = 120
+    llm.chat_completion.return_value.model = "gemini-3.5-flash"
+    llm.chat_completion.return_value.provider = "google"
 
     result = await summarize_document(
         document_id=document.id, course_id=7, db=db, llm=llm
@@ -176,19 +130,146 @@ async def test_summarize_document_without_cache_always_calls_llm():
 
     assert result["summary"] == "resumen generado"
     llm.chat_completion.assert_awaited_once()
+    [saved] = store.saved
+    assert saved["kind"] == "document"
+    assert saved["document_id"] == document.id
+    assert saved["course_id"] == 7
+    assert saved["payload"]["summary"] == "resumen generado"
+    assert (saved["prompt_tokens"], saved["completion_tokens"]) == (300, 120)
+    assert (saved["model"], saved["provider"]) == ("gemini-3.5-flash", "google")
+    assert store.usage_records == []  # un miss no es un acierto de caché
 
 
 @pytest.mark.asyncio
-async def test_cache_key_changes_when_document_is_replaced():
-    """Reemplazar un documento manteniendo su id (CONT-07) cambia la key, así
+async def test_summarize_document_serves_stored_summary_without_calling_llm(store):
+    """Un acierto devuelve lo guardado, NO llama al LLM y deja registrado que
+    salió de la caché con los tokens que se ahorró."""
+    document = _fake_document()
+    llm = _fake_llm()
+    stored_payload = {
+        "document_id": str(document.id),
+        "document_filename": "apunte.pdf",
+        "summary": "resumen guardado",
+        "chunks_used": 1,
+        "total_chunks": 1,
+    }
+    store.rows[summarizer._summary_key(document, llm.model)] = (
+        summary_store.StoredSummary(
+            payload=stored_payload,
+            model="gpt-4o-mini",
+            provider="openai",
+            prompt_tokens=300,
+            completion_tokens=120,
+        )
+    )
+    db = _fake_db(document, [_fake_chunk("contenido", 0)])
+
+    result = await summarize_document(
+        document_id=document.id, course_id=7, db=db, llm=llm
+    )
+
+    assert result["summary"] == "resumen guardado"
+    llm.chat_completion.assert_not_awaited()
+    assert store.saved == []
+    [hit] = store.usage_records
+    assert hit.cache_hit is True
+    assert hit.saved_tokens == 420
+    assert (hit.provider, hit.model) == ("openai", "gpt-4o-mini")
+    assert hit.prompt_tokens == 0 and hit.completion_tokens == 0
+
+
+@pytest.mark.asyncio
+async def test_second_request_for_same_document_costs_nothing(store):
+    """Dos alumnos piden el mismo resumen: el LLM se llama una sola vez."""
+    document = _fake_document()
+    llm = _fake_llm()
+
+    first = await summarize_document(
+        document_id=document.id,
+        course_id=7,
+        db=_fake_db(document, [_fake_chunk("contenido", 0)]),
+        llm=llm,
+    )
+    second = await summarize_document(
+        document_id=document.id,
+        course_id=7,
+        db=_fake_db(document, [_fake_chunk("contenido", 0)]),
+        llm=llm,
+    )
+
+    assert first["summary"] == second["summary"]
+    llm.chat_completion.assert_awaited_once()
+    assert len(store.usage_records) == 1
+
+
+@pytest.mark.asyncio
+async def test_summary_key_changes_when_document_is_replaced():
+    """Reemplazar un documento manteniendo su id (CONT-07) cambia la clave, así
     que no se sirve el resumen del archivo viejo."""
     document = _fake_document(file_hash="hash-original")
-    key_before = summarizer._cache_key(document, "gemini-3.5-flash")
+    key_before = summarizer._summary_key(document, "gemini-3.5-flash")
 
     document.file_hash = "hash-nuevo"
-    key_after = summarizer._cache_key(document, "gemini-3.5-flash")
+    key_after = summarizer._summary_key(document, "gemini-3.5-flash")
 
     assert key_before != key_after
+
+
+@pytest.mark.asyncio
+async def test_summary_key_changes_with_model_and_prompt_version(monkeypatch):
+    document = _fake_document()
+    base = summarizer._summary_key(document, "gemini-3.5-flash")
+
+    assert summarizer._summary_key(document, "gpt-4o-mini") != base
+    monkeypatch.setattr(summarizer, "_PROMPT_VERSION", "p99")
+    assert summarizer._summary_key(document, "gemini-3.5-flash") != base
+
+
+@pytest.mark.asyncio
+async def test_summary_key_is_stable_for_the_same_document():
+    document = _fake_document()
+    assert summarizer._summary_key(document, "m") == summarizer._summary_key(
+        document, "m"
+    )
+
+
+# ============================================================
+# Almacén (summary_store) — tolerancia a fallas de la base
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_store_lookup_returns_none_when_the_database_fails():
+    db = MagicMock()
+    db.begin_nested = MagicMock(side_effect=RuntimeError("base caída"))
+
+    assert await _real_lookup(db, "clave") is None
+
+
+@pytest.mark.asyncio
+async def test_store_save_never_raises_when_the_database_fails():
+    db = MagicMock()
+    db.begin_nested = MagicMock(side_effect=RuntimeError("base caída"))
+
+    await _real_save(
+        db,
+        cache_key="k",
+        kind="document",
+        course_id=1,
+        document_id=None,
+        prompt_version="p2",
+        payload={},
+        model=None,
+        provider=None,
+        prompt_tokens=0,
+        completion_tokens=0,
+    )
+
+
+def test_store_make_key_is_stable_and_depends_on_every_part():
+    assert _real_make_key("a", "b") == _real_make_key("a", "b")
+    assert _real_make_key("a", "b") != _real_make_key("a", "c")
+    assert _real_make_key("ab", "c") != _real_make_key("a", "bc")
 
 
 # ============================================================
@@ -332,3 +413,104 @@ async def test_pre_exam_summary_returns_empty_without_indexed_documents():
 
     assert result == {"summary": "", "documents_used": [], "total_documents": 0}
     llm.chat_completion.assert_not_awaited()
+
+
+# ============================================================
+# Resumen pre-examen permanente (COST-02)
+# ============================================================
+
+
+def _pre_exam_setup(n: int = 3):
+    documents = [_fake_document(f"doc{i}.pdf", f"hash-{i}") for i in range(n)]
+    chunks_by_doc = {
+        d.id: [_fake_chunk(f"contenido {i}", 0)] for i, d in enumerate(documents)
+    }
+    return documents, chunks_by_doc
+
+
+@pytest.mark.asyncio
+async def test_pre_exam_summary_is_stored_and_served_without_any_llm_call(store):
+    """El primer pedido genera todo y lo guarda; el segundo, con el mismo
+    material, no llama al LLM ni una vez (ni por documento ni la síntesis)."""
+    documents, chunks_by_doc = _pre_exam_setup(3)
+    llm = _fake_llm()
+
+    first = await summarize_pre_exam(
+        course_id=7, db=_pre_exam_db(documents, chunks_by_doc), llm=llm
+    )
+    calls_after_first = llm.chat_completion.await_count
+    second = await summarize_pre_exam(
+        course_id=7, db=_pre_exam_db(documents, chunks_by_doc), llm=llm
+    )
+
+    assert calls_after_first == 4  # 3 resúmenes + 1 síntesis
+    assert llm.chat_completion.await_count == calls_after_first
+    assert second == first
+    kinds = sorted(saved["kind"] for saved in store.saved)
+    assert kinds == ["document", "document", "document", "pre_exam"]
+    assert len(store.usage_records) == 1
+    assert store.usage_records[0].cache_hit is True
+
+
+@pytest.mark.asyncio
+async def test_pre_exam_summary_only_regenerates_the_changed_document(store):
+    """Si cambió un documento, solo ese se vuelve a resumir: los demás salen
+    de lo guardado. La síntesis se rehace porque cambió el material."""
+    documents, chunks_by_doc = _pre_exam_setup(3)
+    llm = _fake_llm()
+    await summarize_pre_exam(
+        course_id=7, db=_pre_exam_db(documents, chunks_by_doc), llm=llm
+    )
+    llm.chat_completion.reset_mock()
+    store.usage_records.clear()
+
+    documents[1].file_hash = "hash-reemplazado"  # CONT-07: mismo id, archivo nuevo
+    await summarize_pre_exam(
+        course_id=7, db=_pre_exam_db(documents, chunks_by_doc), llm=llm
+    )
+
+    assert llm.chat_completion.await_count == 2  # el documento nuevo + la síntesis
+    assert len(store.usage_records) == 2  # los otros dos documentos: aciertos
+
+
+@pytest.mark.asyncio
+async def test_pre_exam_summary_is_not_stored_when_a_document_failed(store):
+    """Un repaso armado con menos documentos porque uno falló no queda como
+    "el resumen del curso"."""
+    documents, chunks_by_doc = _pre_exam_setup(3)
+    calls = {"n": 0}
+
+    async def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("LLM caído")
+        result = MagicMock()
+        result.text = "resumen"
+        result.prompt_tokens = 10
+        result.completion_tokens = 5
+        result.model = "m"
+        result.provider = "p"
+        return result
+
+    llm = _fake_llm()
+    llm.chat_completion = AsyncMock(side_effect=flaky)
+
+    result = await summarize_pre_exam(
+        course_id=7, db=_pre_exam_db(documents, chunks_by_doc), llm=llm
+    )
+
+    assert result["total_documents"] == 2
+    kinds = sorted(saved["kind"] for saved in store.saved)
+    assert kinds == ["document", "document"]  # los dos que salieron, ningún pre_exam
+
+
+@pytest.mark.asyncio
+async def test_pre_exam_key_depends_on_the_document_set_and_versions(monkeypatch):
+    keys = ["k1", "k2"]
+    base = summarizer._pre_exam_key(7, keys, "m")
+
+    assert summarizer._pre_exam_key(7, ["k2", "k1"], "m") == base  # el orden no importa
+    assert summarizer._pre_exam_key(7, keys + ["k3"], "m") != base  # otro documento
+    assert summarizer._pre_exam_key(8, keys, "m") != base  # otro curso
+    monkeypatch.setattr(summarizer, "_SYNTHESIS_PROMPT_VERSION", "s99")
+    assert summarizer._pre_exam_key(7, keys, "m") != base

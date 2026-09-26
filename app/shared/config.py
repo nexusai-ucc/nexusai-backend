@@ -58,9 +58,10 @@ class Settings(BaseSettings):
 
     # Resúmenes de documentos (PERF-02) — ver documents/summarizer.py.
     #
-    # summary_cache_ttl_sec: cuánto vive en Redis el resumen ya generado de un
-    #   documento. La cache key incluye el hash/fecha del archivo, así que
-    #   reemplazar un documento (CONT-07) invalida su entrada sola. 0 = sin cache.
+    # summary_cache_ttl_sec: SIN USO desde COST-02 (issue #521): los resúmenes ya
+    #   no vencen a las 24 h en Redis, se guardan en la tabla document_summaries
+    #   hasta que cambie el archivo, el modelo o el prompt. Se conserva el campo
+    #   para no romper los .env que todavía lo traen.
     # summary_max_concurrency: cuántos resúmenes de documento se piden al LLM en
     #   paralelo dentro del resumen pre-parcial. Subirlo acelera cursos con mucho
     #   material, pero contra la cuota gratuita de Gemini aumenta la chance de

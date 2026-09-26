@@ -696,3 +696,49 @@ class LlmUsageDaily(Base):
     cost_usd: Mapped[Decimal] = mapped_column(Numeric(14, 8), nullable=False, default=0)
     cache_hits: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     saved_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class DocumentSummary(Base):
+    """Resumen ya generado, guardado hasta que cambie lo que lo originó (COST-02, issue #521).
+
+    Reemplaza a la caché de Redis de 24 h (PERF-02): el resumen de un documento
+    se genera una vez y lo leen todos los alumnos, sin volver a pagarlo.
+
+    `cache_key` es un hash de todo lo que define el resultado: el documento y
+    la huella de su archivo (o, para el resumen pre-examen, la lista de
+    documentos con sus huellas), el modelo configurado y las versiones del
+    prompt. Si cambia cualquiera, la clave es otra y la fila vieja deja de
+    servirse; la de un documento se borra en cascada con él.
+    """
+
+    __tablename__ = "document_summaries"
+    __table_args__ = (Index("ix_document_summaries_course_id", "course_id"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    cache_key: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    # document | pre_exam
+    kind: Mapped[str] = mapped_column(String(12), nullable=False)
+    course_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # NULL para el pre-examen, que combina varios documentos.
+    document_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    prompt_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    # Modelo y proveedor que respondieron de verdad (puede ser un fallback).
+    model: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    provider: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    # Tokens que costó generarlo: es lo que se ahorra en cada acierto.
+    prompt_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    hits: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    last_hit_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
