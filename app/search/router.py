@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.hmac import verify_hmac
 from app.db.session import get_db
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
+from app.shared.visibility import VisibleCmids, enforce_visible_cmids
 
 logger = logging.getLogger("nexusai.search")
 router = APIRouter()
@@ -53,6 +54,7 @@ _HYBRID_SQL = text("""
         d.course_id IN :course_ids
         AND d.status = 'indexed'
         AND c.embedding IS NOT NULL
+        AND (NOT CAST(:filter_cmids AS boolean) OR d.cmid IN :visible_cmids)
         AND (CAST(:material_type AS text) IS NULL OR d.mime_type = CAST(:material_type AS text))
         AND (
             (CAST(:section AS integer) IS NULL AND NOT CAST(:section_unassigned AS boolean))
@@ -66,7 +68,10 @@ _HYBRID_SQL = text("""
         )
     ORDER BY combined_score DESC
     LIMIT :top_k
-""").bindparams(bindparam("course_ids", expanding=True))
+""").bindparams(
+    bindparam("course_ids", expanding=True),
+    bindparam("visible_cmids", expanding=True),
+)
 
 
 class SearchRequest(BaseModel):
@@ -78,6 +83,8 @@ class SearchRequest(BaseModel):
     material_type: Optional[str] = Field(default=None)
     section: Optional[int] = Field(default=None)
     section_unassigned: bool = Field(default=False)
+    # Actividades del curso que el usuario puede ver (VIS-01).
+    visible_cmids: VisibleCmids = None
 
 
 class SearchResult(BaseModel):
@@ -110,6 +117,9 @@ async def search(
     ids_to_query = [i for i in ids_to_query if i > 0]
     if not ids_to_query:
         return SearchResponse(query=payload.query, results=[], total=0)
+    visible_cmids = enforce_visible_cmids(payload.visible_cmids)
+    if visible_cmids is not None and not visible_cmids:
+        return SearchResponse(query=payload.query, results=[], total=0)
 
     try:
         question_vector = await embeddings.embed(payload.query)
@@ -121,6 +131,9 @@ async def search(
                 "query_embedding": embedding_str,
                 "query_text": payload.query,
                 "course_ids": ids_to_query,
+                "filter_cmids": visible_cmids is not None,
+                # Con el filtro apagado el valor no se usa, pero IN () vacío no es válido.
+                "visible_cmids": visible_cmids or [0],
                 "top_k": payload.top_k,
                 "filename_pattern": f"%{payload.query.strip()}%",
                 "material_type": payload.material_type,

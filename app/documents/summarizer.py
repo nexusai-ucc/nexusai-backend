@@ -136,6 +136,7 @@ async def _load_document_for_summary(
     document_id: UUID,
     course_id: int,
     db: AsyncSession,
+    visible_cmids: Optional[list[int]] = None,
 ) -> tuple[Document, str, int, int]:
     """Trae de la DB todo lo que hace falta para resumir un documento.
 
@@ -148,8 +149,9 @@ async def _load_document_for_summary(
         (document, prompt, chunks_used, total_chunks)
 
     Raises:
-        LookupError: si el documento no existe, no pertenece al course_id, o
-                     no tiene chunks indexados.
+        LookupError: si el documento no existe, no pertenece al course_id, no
+                     es visible para el usuario (VIS-01) o no tiene chunks
+                     indexados.
     """
     doc_result = await db.execute(select(Document).where(Document.id == document_id))
     document = doc_result.scalar_one_or_none()
@@ -160,6 +162,10 @@ async def _load_document_for_summary(
         raise LookupError(
             f"Document {document_id} does not belong to course {course_id}"
         )
+    # Mismo error que "no existe": no revelar que hay material oculto. Va antes
+    # de leer resúmenes guardados, que solo se sirven de acá en adelante.
+    if visible_cmids is not None and document.cmid not in visible_cmids:
+        raise LookupError(f"Document {document_id} not found")
 
     chunks_result = await db.execute(
         select(Chunk.content, Chunk.chunk_index)
@@ -257,6 +263,7 @@ async def summarize_document(
     course_id: int,
     db: AsyncSession,
     llm: LLMProvider,
+    visible_cmids: Optional[list[int]] = None,
 ) -> dict:
     """
     Devuelve el resumen del documento: el guardado si el archivo, el modelo y
@@ -269,6 +276,8 @@ async def summarize_document(
                    al curso del usuario (aislamiento multi-curso).
         db: sesión async de SQLAlchemy.
         llm: instancia de LLMProvider.
+        visible_cmids: actividades visibles para el usuario (VIS-01); si el
+                       documento no está entre ellas se trata como inexistente.
 
     Returns:
         dict con: document_id, document_filename, summary, chunks_used, total_chunks.
@@ -278,7 +287,7 @@ async def summarize_document(
         RuntimeError: si el LLM falla al generar el resumen.
     """
     document, prompt, chunks_used, total_chunks = await _load_document_for_summary(
-        document_id, course_id, db
+        document_id, course_id, db, visible_cmids
     )
     key = _summary_key(document, llm.model)
 
@@ -321,6 +330,7 @@ async def summarize_pre_exam(
     db: AsyncSession,
     llm: LLMProvider,
     section: Optional[int] = None,
+    visible_cmids: Optional[list[int]] = None,
 ) -> dict:
     """
     Genera un resumen de repaso combinando todo el material indexado y
@@ -337,6 +347,11 @@ async def summarize_pre_exam(
         llm: instancia de LLMProvider.
         section: unidad/sección opcional para acotar el material (BUS-05).
                  Si es None, se usa todo el material indexado del curso.
+        visible_cmids: actividades visibles para el usuario (VIS-01); solo se
+                       resume material de esas. Las claves guardadas salen de
+                       los documentos incluidos, así que dos usuarios con
+                       distinta visibilidad nunca comparten un resumen que
+                       mezcle material que uno de ellos no puede ver.
 
     Returns:
         dict con: summary, documents_used (lista de {document_id, filename}),
@@ -349,6 +364,10 @@ async def summarize_pre_exam(
     )
     if section is not None:
         stmt = stmt.where(Document.section == section)
+    if visible_cmids is not None:
+        if not visible_cmids:
+            return {"summary": "", "documents_used": [], "total_documents": 0}
+        stmt = stmt.where(Document.cmid.in_(visible_cmids))
 
     docs_result = await db.execute(stmt.order_by(Document.filename))
     docs = docs_result.all()
@@ -362,7 +381,9 @@ async def summarize_pre_exam(
     loaded: list[tuple[Document, str, int, int]] = []
     for doc_id, filename in docs:
         try:
-            loaded.append(await _load_document_for_summary(doc_id, course_id, db))
+            loaded.append(
+                await _load_document_for_summary(doc_id, course_id, db, visible_cmids)
+            )
         except LookupError as exc:
             logger.warning(
                 "Pre-exam summary: skipping document %s (%s): %s", doc_id, filename, exc

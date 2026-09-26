@@ -211,6 +211,14 @@ class Settings(BaseSettings):
     usage_ledger_enabled: bool = True
     usage_ledger_detail_days: int = 396
 
+    # Visibilidad del material (VIS-01, issue #536) — ver app/shared/visibility.py.
+    #
+    # require_visible_cmids: si un pedido que lee documentos no trae la lista
+    #   `visible_cmids` (las actividades de Moodle que el usuario puede ver), se
+    #   rechaza. Es lo que impide saltear el filtro. Apagarlo solo tiene sentido
+    #   para un despliegue escalonado: sin la lista, el pedido ve todo el curso.
+    require_visible_cmids: bool = True
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

@@ -13,7 +13,7 @@ get_db/get_embedding_provider reemplazados con mocks.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import FastAPI
@@ -71,7 +71,12 @@ async def client(mock_db, mock_embeddings):
         yield c
 
 
-_BASE_PAYLOAD = {"query": "bayes", "course_id": 1, "user_id": 1}
+_BASE_PAYLOAD = {
+    "query": "bayes",
+    "course_id": 1,
+    "user_id": 1,
+    "visible_cmids": [101],
+}
 
 
 async def test_search_returns_200_with_expected_shape(client):
@@ -180,3 +185,60 @@ async def test_search_result_echoes_section(client, mock_db):
 
     data = response.json()
     assert data["results"][0]["section"] == 2
+
+
+# ─────────────────────────────────────────────────────────────
+# VIS-01: solo material de actividades visibles para el usuario
+# ─────────────────────────────────────────────────────────────
+
+
+async def test_search_without_visible_cmids_is_rejected(client, mock_db):
+    payload = {k: v for k, v in _BASE_PAYLOAD.items() if k != "visible_cmids"}
+
+    response = await client.post("/api/v1/search", json=payload)
+
+    assert response.status_code == 422
+    assert "visible_cmids" in response.json()["detail"]
+    mock_db.execute.assert_not_called()
+
+
+async def test_search_with_empty_visible_cmids_returns_nothing_without_querying(
+    client, mock_db, mock_embeddings
+):
+    response = await client.post(
+        "/api/v1/search", json={**_BASE_PAYLOAD, "visible_cmids": []}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 0
+    mock_db.execute.assert_not_called()
+    mock_embeddings.embed.assert_not_called()
+
+
+async def test_search_threads_visible_cmids_into_query_params(client, mock_db):
+    await client.post(
+        "/api/v1/search", json={**_BASE_PAYLOAD, "visible_cmids": [101, 205]}
+    )
+
+    params = mock_db.execute.call_args.args[1]
+    assert params["filter_cmids"] is True
+    assert params["visible_cmids"] == [101, 205]
+
+
+async def test_search_filters_by_cmid_in_the_sql():
+    from app.search.router import _HYBRID_SQL
+
+    assert "d.cmid IN :visible_cmids" in _HYBRID_SQL.text
+
+
+async def test_search_without_the_requirement_does_not_filter(client, mock_db):
+    payload = {k: v for k, v in _BASE_PAYLOAD.items() if k != "visible_cmids"}
+
+    with patch(
+        "app.shared.visibility.get_settings",
+        return_value=SimpleNamespace(require_visible_cmids=False),
+    ):
+        response = await client.post("/api/v1/search", json=payload)
+
+    assert response.status_code == 200
+    assert mock_db.execute.call_args.args[1]["filter_cmids"] is False

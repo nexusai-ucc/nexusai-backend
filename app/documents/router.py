@@ -58,6 +58,7 @@ from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
 from app.shared.language import localized, resolve_language
 from app.shared.retry import async_retry
+from app.shared.visibility import VisibleCmids, enforce_visible_cmids
 
 logger = logging.getLogger("nexusai.documents")
 
@@ -107,6 +108,15 @@ class DocumentUploadRequest(BaseModel):
     section: Optional[int] = Field(
         default=None, ge=0, description="Número de sección/unidad del curso (BUS-05)"
     )
+    cmid: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Actividad de Moodle de la que sale el documento (VIS-01). Define "
+            "quién puede ver su contenido en las respuestas; sin cmid no se "
+            "usa en ninguna."
+        ),
+    )
 
 
 class DocumentOut(BaseModel):
@@ -118,6 +128,7 @@ class DocumentOut(BaseModel):
     filename: str
     mime_type: str
     section: Optional[int] = None
+    cmid: Optional[int] = None
     status: str  # pending | indexing | indexed | error
     error_message: Optional[str] = None
     created_at: Optional[datetime] = None
@@ -132,6 +143,7 @@ class DocumentOut(BaseModel):
             filename=doc.filename,
             mime_type=doc.mime_type,
             section=doc.section,
+            cmid=doc.cmid,
             status=doc.status,
             error_message=doc.error_message,
             created_at=doc.created_at,
@@ -333,8 +345,16 @@ async def upload_document(
     )
     existing = existing_result.scalar_one_or_none()
     if existing is not None:
-        response.status_code = status.HTTP_200_OK
-        return DocumentOut.from_orm(existing)
+        # VIS-01: un documento que ya estaba indexado sin actividad adopta la
+        # que llega ahora. Si ya tiene otra, no se le cambia: se sigue con la
+        # colisión de nombre de abajo.
+        if existing.cmid is None and payload.cmid is not None:
+            existing.cmid = payload.cmid
+            await db.commit()
+            await db.refresh(existing)
+        if existing.cmid is None or existing.cmid == payload.cmid:
+            response.status_code = status.HTTP_200_OK
+            return DocumentOut.from_orm(existing)
 
     # Detectar colisión de nombre: mismo course_id + filename, estado activo.
     # Se excluye 'error' porque un intento fallido no debe bloquear re-subida.
@@ -363,6 +383,7 @@ async def upload_document(
         filename=payload.filename,
         mime_type=payload.mime_type,
         section=payload.section,
+        cmid=payload.cmid,
         status="pending",
         file_hash=file_hash,
     )
@@ -715,6 +736,7 @@ class SummarizeRequest(BaseModel):
     document_id: UUID
     course_id: int = Field(gt=0)
     user_id: int = Field(gt=0)
+    visible_cmids: VisibleCmids = None
 
 
 class SummarizeResponse(BaseModel):
@@ -741,12 +763,14 @@ async def summarize_document_endpoint(
     prompt, así que volver a pedirlo (cualquier alumno, cualquier día) no
     vuelve a gastar tokens.
     """
+    visible_cmids = enforce_visible_cmids(payload.visible_cmids)
     try:
         result = await summarize_document(
             document_id=payload.document_id,
             course_id=payload.course_id,
             db=db,
             llm=llm,
+            visible_cmids=visible_cmids,
         )
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
@@ -763,6 +787,7 @@ class PreExamSummaryRequest(BaseModel):
     course_id: int = Field(gt=0)
     user_id: int = Field(gt=0)
     section: Optional[int] = Field(default=None)
+    visible_cmids: VisibleCmids = None
 
 
 class DocumentUsed(BaseModel):
@@ -795,12 +820,14 @@ async def pre_exam_summary_endpoint(
     el mismo repaso pedido de nuevo (por cualquier alumno) no gasta tokens, y
     si cambió un documento solo se vuelve a resumir ese.
     """
+    visible_cmids = enforce_visible_cmids(payload.visible_cmids)
     try:
         result = await summarize_pre_exam(
             course_id=payload.course_id,
             db=db,
             llm=llm,
             section=payload.section,
+            visible_cmids=visible_cmids,
         )
     except RuntimeError as exc:
         raise HTTPException(

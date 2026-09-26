@@ -54,6 +54,7 @@ def _make_doc(**kwargs) -> SimpleNamespace:
         filename="apuntes.pdf",
         mime_type="application/pdf",
         section=None,
+        cmid=None,
         status="pending",
         error_message=None,
         file_hash=_PDF_HASH,

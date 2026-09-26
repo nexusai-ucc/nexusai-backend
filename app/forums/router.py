@@ -56,6 +56,7 @@ from app.documents.retriever import format_context_for_prompt, retrieve_context
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
 from app.shared.moderation import moderate_text
+from app.shared.visibility import VisibleCmids, enforce_visible_cmids
 from app.shared.language import resolve_language, ui_language, with_language_directive
 
 _logger = logging.getLogger(__name__)
@@ -428,6 +429,8 @@ class SuggestReplyRequest(BaseModel):
         max_length=_MAX_CHARS_QUESTION,
         description="Texto del post al que se responde (para RAG y contexto del LLM)",
     )
+    # Actividades del curso que puede ver quien pide la sugerencia (VIS-01).
+    visible_cmids: VisibleCmids = None
 
 
 class SuggestReplyResponse(BaseModel):
@@ -518,11 +521,14 @@ async def suggest_reply(
             status_code=status.HTTP_400_BAD_REQUEST, detail=moderation.blocked_message
         )
 
+    visible_cmids = enforce_visible_cmids(payload.visible_cmids)
+
     # 1. RAG: buscar material del curso relevante a la pregunta.
     try:
         chunks = await retrieve_context(
             question=payload.question,
             course_id=payload.course_id,
+            visible_cmids=visible_cmids,
             db=db,
             embeddings=embeddings,
             top_k=_MAX_CONTEXT_CHUNKS,

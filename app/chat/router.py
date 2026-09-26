@@ -50,6 +50,7 @@ from app.shared.error_monitoring import (
 )
 from app.shared.moderation import moderate_text
 from app.shared.rate_limit import check_rate_limit
+from app.shared.visibility import enforce_visible_cmids
 from app.shared.token_budget import (
     estimate_tokens,
     estimate_tokens_for_messages,
@@ -208,6 +209,7 @@ async def messages(
     settings = get_settings()
     start_time = time.perf_counter()
     request_id = getattr(request.state, "request_id", "-")
+    visible_cmids = enforce_visible_cmids(payload.visible_cmids)
 
     # ----- BACK-14: Rate limiting por user_id (por minuto + diario) -----
     await check_rate_limit(
@@ -344,6 +346,7 @@ async def messages(
             question=payload.question,
             course_id=payload.course_id,
             course_ids=payload.course_ids,
+            visible_cmids=visible_cmids,
             db=db,
             embeddings=embeddings,
             top_k=5,
@@ -564,6 +567,7 @@ async def messages_stream(
     """
     settings = get_settings()
     request_id = getattr(request.state, "request_id", "-")
+    visible_cmids = enforce_visible_cmids(payload.visible_cmids)
 
     await check_rate_limit(
         user_id=payload.user_id,
@@ -694,6 +698,7 @@ async def messages_stream(
                         question=payload.question,
                         course_id=payload.course_id,
                         course_ids=payload.course_ids,
+                        visible_cmids=visible_cmids,
                         db=db,
                         embeddings=embeddings,
                         top_k=5,

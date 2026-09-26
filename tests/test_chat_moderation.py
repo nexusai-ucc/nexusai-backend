@@ -27,6 +27,7 @@ _PAYLOAD = {
     "question": "¿Qué es el teorema de Bayes?",
     "course_id": 1,
     "user_id": 7,
+    "visible_cmids": [101],
 }
 
 
@@ -271,3 +272,37 @@ async def test_messages_spanish_question_stays_spanish_with_an_english_interface
     )
 
     assert "IMPORTANT: write your entire answer" not in messages[-1]["content"]
+
+
+async def test_messages_without_visible_cmids_is_rejected(client, mock_db, mock_llm):
+    payload = {k: v for k, v in _PAYLOAD.items() if k != "visible_cmids"}
+
+    response = await client.post("/api/v1/chat/messages", json=payload)
+
+    assert response.status_code == 422
+    assert "visible_cmids" in response.json()["detail"]
+    mock_llm.chat_completion.assert_not_called()
+    mock_db.execute.assert_not_called()
+
+
+async def test_messages_passes_visible_cmids_to_the_retriever(client, mock_llm):
+    mock_llm.chat_completion.side_effect = [
+        MagicMock(text='{"flagged": false, "categories": []}'),
+        MagicMock(
+            text="La respuesta es...",
+            prompt_tokens=10,
+            completion_tokens=5,
+            total_tokens=15,
+        ),
+    ]
+    with (
+        patch("app.shared.moderation.get_settings", return_value=_fake_settings()),
+        patch(
+            "app.chat.router.retrieve_context", new=AsyncMock(return_value=[])
+        ) as retrieve,
+    ):
+        response = await client.post("/api/v1/chat/messages", json=_PAYLOAD)
+
+    assert response.status_code == 200
+    retrieve.assert_awaited_once()
+    assert retrieve.await_args.kwargs["visible_cmids"] == [101]

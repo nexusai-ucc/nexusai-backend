@@ -194,6 +194,7 @@ async def test_generate_flashcards_returns_200_with_expected_shape(client):
         "num_questions": 1,
         "question_type": "flashcard",
         "difficulty": "hard",
+        "visible_cmids": [101],
     }
 
     response = await client.post("/api/v1/quiz/generate", json=payload)
@@ -708,7 +709,7 @@ async def test_generate_quiz_404_message_follows_the_interface_language(
     client, mock_db
 ):
     mock_db.execute.return_value.all.return_value = []
-    payload = {"course_id": 1, "user_id": 9}
+    payload = {"course_id": 1, "user_id": 9, "visible_cmids": [101]}
     url = "/api/v1/quiz/generate"
 
     english = await client.post(url, json=payload, headers={"Accept-Language": "en-US"})

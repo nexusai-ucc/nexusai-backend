@@ -31,6 +31,7 @@ class Document(Base):
     __table_args__ = (
         Index("ix_documents_course_id", "course_id"),
         Index("ix_documents_course_id_section", "course_id", "section"),
+        Index("ix_documents_cmid", "cmid"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -43,6 +44,10 @@ class Document(Base):
     # Número de sección/unidad del curso Moodle (BUS-05). Opcional: el docente
     # puede no asignarla al subir material.
     section: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Actividad de Moodle de la que salió el documento (VIS-01): define su
+    # visibilidad. NULL = no salió de una actividad y no entra en ninguna
+    # respuesta (ver app/shared/visibility.py).
+    cmid: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     file_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)

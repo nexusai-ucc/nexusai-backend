@@ -70,6 +70,7 @@ from app.shared.language import (
 )
 from app.shared.config import get_settings
 from app.shared.moderation import moderate_text
+from app.shared.visibility import VisibleCmids, enforce_visible_cmids
 from app.shared.usage_ledger import usage_scope
 
 logger = logging.getLogger("nexusai.quiz")
@@ -103,6 +104,8 @@ class QuizRequest(BaseModel):
     num_questions: int = Field(default=5, ge=1, le=10)
     question_type: str = Field(default="multiple_choice")
     difficulty: str = Field(default="medium")
+    # Actividades del curso que el usuario puede ver (VIS-01).
+    visible_cmids: VisibleCmids = None
 
     @field_validator("question_type")
     @classmethod
@@ -547,12 +550,16 @@ async def _sample_chunks_for_quiz(
     db: AsyncSession,
     course_id: int,
     limit: int = 12,
+    visible_cmids: Optional[list[int]] = None,
 ) -> list[tuple[str, str]]:
     """Devuelve [(filename, content)] de chunks aleatorios indexed del curso.
 
     No usa embeddings — random sample. Útil cuando el alumno NO especifica
-    topic y queremos variedad de temas en el quiz.
+    topic y queremos variedad de temas en el quiz. Con `visible_cmids` solo
+    toma material de actividades visibles para el usuario (VIS-01).
     """
+    if visible_cmids is not None and not visible_cmids:
+        return []
     stmt = (
         select(Document.filename, Chunk.content)
         .join(Document, Chunk.document_id == Document.id)
@@ -561,6 +568,8 @@ async def _sample_chunks_for_quiz(
         .order_by(func.random())
         .limit(limit)
     )
+    if visible_cmids is not None:
+        stmt = stmt.where(Document.cmid.in_(visible_cmids))
     result = await db.execute(stmt)
     return [(row.filename, row.content) for row in result.all()]
 
@@ -1003,6 +1012,8 @@ async def generate_quiz(
     Si no hay material indexado en el curso → 404.
     Si el LLM devuelve JSON inválido o falla → 503.
     """
+    visible_cmids = enforce_visible_cmids(payload.visible_cmids)
+
     # 1) Conseguir material para el quiz.
     topic = payload.topic.strip() if payload.topic else None
     has_topic = bool(topic)
@@ -1016,6 +1027,7 @@ async def generate_quiz(
             retrieved = await retrieve_context(
                 question=topic,
                 course_id=payload.course_id,
+                visible_cmids=visible_cmids,
                 db=db,
                 embeddings=embeddings,
                 top_k=5,
@@ -1090,7 +1102,9 @@ async def generate_quiz(
         chunks = [(c.document_filename, c.content) for c in retrieved]
     else:
         # Modo variedad: sampling aleatorio del material del curso.
-        chunks = await _sample_chunks_for_quiz(db, payload.course_id, limit=12)
+        chunks = await _sample_chunks_for_quiz(
+            db, payload.course_id, limit=12, visible_cmids=visible_cmids
+        )
 
     if not chunks:
         raise HTTPException(

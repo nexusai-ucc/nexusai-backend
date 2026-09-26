@@ -8,6 +8,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.shared.visibility import VisibleCmids
+
 
 class ChatRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
@@ -25,6 +27,9 @@ class ChatRequest(BaseModel):
     # un rol mandado por el JS del navegador. Default False = alumno (límite
     # más conservador) si algún cliente viejo no manda el campo.
     is_teacher: bool = False
+    # Actividades del curso que el usuario puede ver, calculadas por el plugin
+    # (VIS-01, ver app/shared/visibility.py). Sin la lista el pedido se rechaza.
+    visible_cmids: VisibleCmids = None
 
 
 class MessageOut(BaseModel):
