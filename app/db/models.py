@@ -1,16 +1,19 @@
 import uuid
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any, List, Optional
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     Boolean,
     Computed,
+    Date,
     DateTime,
     Float,
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -542,3 +545,154 @@ class ForumWebhookConfig(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+
+
+class LlmUsage(Base):
+    """Una fila por cada llamada a un proveedor de IA (COST-01, issue #519).
+
+    Cubre LLM, embeddings y transcripción de voz, más los bloqueos de
+    moderación y los intentos fallidos de cada eslabón de la cadena de
+    fallback. Lo escribe app/shared/usage_ledger.py desde la capa de
+    proveedores, así que no depende de que cada endpoint se acuerde de
+    registrar su consumo.
+    """
+
+    __tablename__ = "llm_usage"
+    __table_args__ = (
+        Index("ix_llm_usage_created_at", "created_at"),
+        Index("ix_llm_usage_course_id_created_at", "course_id", "created_at"),
+        Index("ix_llm_usage_feature_created_at", "feature", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    # llm | embedding | transcription | moderation
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    # Ruta que originó la llamada, p. ej. "chat.stream" o "quiz.generate".
+    feature: Mapped[str] = mapped_column(String(80), nullable=False)
+    provider: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    model: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    fallback: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # ok | error | quota | blocked
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cached_prompt_tokens: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    embedding_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    audio_seconds: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # NULL = modelo sin precio cargado en model_prices.
+    cost_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 8), nullable=True)
+    cache_hit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    saved_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # True si el proveedor no informó los tokens y se estimaron con tiktoken.
+    estimated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    latency_ms: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    course_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # student | teacher | system | unknown
+    role: Mapped[str] = mapped_column(String(10), nullable=False, default="unknown")
+    request_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    client_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+
+
+class ModelPrice(Base):
+    """Precio por modelo, en USD, con fecha de vigencia (COST-01, issue #519).
+
+    El costo de cada fila de llm_usage se calcula con el precio vigente al
+    momento de la llamada, así que un cambio de precio no reescribe el
+    historial. Se carga a mano con scripts/model_prices.py.
+    """
+
+    __tablename__ = "model_prices"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "model",
+            "valid_from",
+            name="uq_model_prices_provider_model_from",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    provider: Mapped[str] = mapped_column(String(40), nullable=False)
+    model: Mapped[str] = mapped_column(String(120), nullable=False)
+    input_per_mtok: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), nullable=False, default=0
+    )
+    output_per_mtok: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), nullable=False, default=0
+    )
+    # NULL = los tokens cacheados se cobran como entrada normal.
+    cached_input_per_mtok: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(12, 6), nullable=True
+    )
+    embedding_per_mtok: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), nullable=False, default=0
+    )
+    audio_per_minute: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), nullable=False, default=0
+    )
+    valid_from: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class LlmUsageDaily(Base):
+    """Resumen diario de llm_usage (COST-01, issue #519).
+
+    scripts/rollup_llm_usage.py pasa acá el detalle más viejo que
+    USAGE_LEDGER_DETAIL_DAYS y lo borra de llm_usage. Las columnas de la
+    clave no admiten NULL (course_id 0, strings vacíos) para que la
+    restricción única funcione como clave del upsert.
+    """
+
+    __tablename__ = "llm_usage_daily"
+    __table_args__ = (
+        UniqueConstraint(
+            "day",
+            "client_id",
+            "course_id",
+            "role",
+            "feature",
+            "kind",
+            "provider",
+            "model",
+            "status",
+            name="uq_llm_usage_daily_key",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    day: Mapped[date] = mapped_column(Date, nullable=False)
+    client_id: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    course_id: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    role: Mapped[str] = mapped_column(String(10), nullable=False, default="unknown")
+    feature: Mapped[str] = mapped_column(String(80), nullable=False)
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    provider: Mapped[str] = mapped_column(String(40), nullable=False, default="")
+    model: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    calls: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cached_prompt_tokens: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    embedding_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    audio_seconds: Mapped[float] = mapped_column(Float, nullable=False, default=0)
+    cost_usd: Mapped[Decimal] = mapped_column(Numeric(14, 8), nullable=False, default=0)
+    cache_hits: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    saved_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

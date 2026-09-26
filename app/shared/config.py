@@ -203,6 +203,13 @@ class Settings(BaseSettings):
     moderation_api_key: Optional[str] = None
     moderation_fail_open: bool = True
 
+    # Registro de consumo por llamada a proveedor (COST-01, issue #519) —
+    # ver app/shared/usage_ledger.py. usage_ledger_detail_days: cuánto vive
+    # el detalle por llamada antes de que scripts/rollup_llm_usage.py lo
+    # resuma por día (13 meses por default).
+    usage_ledger_enabled: bool = True
+    usage_ledger_detail_days: int = 396
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

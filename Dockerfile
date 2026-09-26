@@ -79,6 +79,10 @@ COPY --chown=nexusai:nexusai migrations/ ./migrations/
 # encuentre. Sin esto, los comandos alembic dentro del container fallan con
 # "No config file 'alembic.ini' found".
 COPY --chown=nexusai:nexusai alembic.ini ./alembic.ini
+# Scripts de mantenimiento que tocan la base (precios de modelos, backfill y
+# resumen del registro de consumo): en producción Postgres no expone puertos,
+# así que corren dentro del contenedor con `docker exec`.
+COPY --chown=nexusai:nexusai scripts/ ./scripts/
 # entrypoint corre `alembic upgrade head` antes de levantar uvicorn.
 # Tiene que copiarse antes de cambiar a USER nexusai para poder hacer chmod.
 COPY entrypoint.sh ./entrypoint.sh

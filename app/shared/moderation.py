@@ -51,6 +51,7 @@ import httpx
 from app.providers.llm import LLMProvider
 from app.shared.config import get_settings
 from app.shared.language import detect_language
+from app.shared.usage_ledger import usage_scope
 
 logger = logging.getLogger("nexusai.moderation")
 
@@ -229,12 +230,13 @@ async def _moderate_via_llm(text: str, llm: LLMProvider) -> ModerationResult:
         {"role": "system", "content": _CLASSIFIER_SYSTEM_PROMPT},
         {"role": "user", "content": text[:_LLM_CLASSIFIER_MAX_CHARS]},
     ]
-    result = await llm.chat_completion(
-        messages,
-        response_format={"type": "json_object"},
-        temperature=0.0,
-        reasoning_effort="none",
-    )
+    with usage_scope("moderation"):
+        result = await llm.chat_completion(
+            messages,
+            response_format={"type": "json_object"},
+            temperature=0.0,
+            reasoning_effort="none",
+        )
     tokens_used = result.total_tokens
 
     raw = result.text.strip()

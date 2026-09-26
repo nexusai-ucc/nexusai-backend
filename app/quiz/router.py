@@ -70,6 +70,7 @@ from app.shared.language import (
 )
 from app.shared.config import get_settings
 from app.shared.moderation import moderate_text
+from app.shared.usage_ledger import usage_scope
 
 logger = logging.getLogger("nexusai.quiz")
 
@@ -1061,11 +1062,12 @@ async def generate_quiz(
             },
         ]
         try:
-            relevance_result = await llm.chat_completion(
-                relevance_messages,
-                max_tokens=5,
-                temperature=0.0,
-            )
+            with usage_scope("relevance"):
+                relevance_result = await llm.chat_completion(
+                    relevance_messages,
+                    max_tokens=5,
+                    temperature=0.0,
+                )
             answer = relevance_result.text.strip().upper()
         except Exception as exc:
             logger.warning(

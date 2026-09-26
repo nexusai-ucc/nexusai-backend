@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import UnansweredQuestion
 from app.providers.embeddings import EmbeddingProvider
+from app.shared.usage_ledger import usage_scope
 
 logger = logging.getLogger("nexusai.gaps")
 
@@ -111,7 +112,8 @@ async def record_gap_if_needed(
         vector: Optional[list[float]] = None
         if embeddings is not None:
             try:
-                vector = await embeddings.embed(question_text)
+                with usage_scope("gap"):
+                    vector = await embeddings.embed(question_text)
             except Exception as exc:
                 logger.warning(
                     "No se pudo embeddear el gap (se registra igual, sin embedding): %s: %s",

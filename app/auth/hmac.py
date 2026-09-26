@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac as hmac_lib
+import logging
 import time
 from typing import Annotated
 
@@ -33,6 +34,9 @@ import redis.asyncio as redis_async
 
 from app.infrastructure.redis_client import get_redis
 from app.shared.config import get_settings
+from app.shared.usage_ledger import context_from_request, set_usage_context
+
+logger = logging.getLogger(__name__)
 
 # Prefijo de las keys de Redis para evitar colisión con otras features
 # (rate limiting, cache de respuestas LLM, etc.).
@@ -145,4 +149,26 @@ async def verify_hmac(
             detail="Replay detected: nonce already used",
         )
 
+    _bind_usage_context(request, body, api_key)
     return body
+
+
+def _bind_usage_context(request: Request, body: bytes, api_key: str) -> None:
+    """Deja el contexto del pedido para el registro de consumo (COST-01):
+    todo endpoint pasa por acá, así que cada llamada a un proveedor de IA
+    queda asociada a su ruta, curso, usuario y rol. Nunca rompe la
+    autenticación: si algo falla, el consumo queda con contexto vacío."""
+    try:
+        route = request.scope.get("route")
+        set_usage_context(
+            context_from_request(
+                route_path=getattr(route, "path", None) or request.url.path,
+                body=body,
+                query=request.query_params,
+                role_header=request.headers.get("x-nexusai-role"),
+                request_id=getattr(request.state, "request_id", None),
+                api_key=api_key,
+            )
+        )
+    except Exception as exc:
+        logger.warning("No se pudo armar el contexto de consumo: %s", exc)

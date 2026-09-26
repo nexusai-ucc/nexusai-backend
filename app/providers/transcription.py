@@ -15,12 +15,14 @@ devuelve `None` en vez de instanciar un client roto — el router de voz
 from __future__ import annotations
 
 import io
+import time
 from functools import lru_cache
-from typing import Optional
+from typing import Any, Optional
 
 from openai import AsyncOpenAI
 
 from app.shared.config import get_settings
+from app.shared.usage_ledger import UsageRecord, record_usage, status_for_exception
 
 _GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
@@ -50,16 +52,42 @@ class TranscriptionProvider:
 
         Sin `language` el modelo detecta el idioma hablado; forzar uno rompe las
         preguntas dichas en otro.
+
+        `verbose_json` devuelve además la duración del audio, que es lo que
+        cobra Groq por transcripción (registro de consumo, COST-01).
         """
         file = (filename, io.BytesIO(audio_bytes), mime_type)
+        kwargs: dict[str, Any] = {"model": self.model, "file": file}
         if language:
+            kwargs["language"] = language
+        started = time.perf_counter()
+        try:
             result = await self.client.audio.transcriptions.create(
-                model=self.model, file=file, language=language
+                response_format="verbose_json", **kwargs
             )
-        else:
-            result = await self.client.audio.transcriptions.create(
-                model=self.model, file=file
+        except Exception as exc:
+            await record_usage(
+                UsageRecord(
+                    kind="transcription",
+                    status=status_for_exception(exc),
+                    provider="groq",
+                    model=self.model,
+                    latency_ms=round((time.perf_counter() - started) * 1000, 1),
+                )
             )
+            raise
+        duration = getattr(result, "duration", None)
+        await record_usage(
+            UsageRecord(
+                kind="transcription",
+                provider="groq",
+                model=self.model,
+                audio_seconds=(
+                    float(duration) if isinstance(duration, (int, float)) else None
+                ),
+                latency_ms=round((time.perf_counter() - started) * 1000, 1),
+            )
+        )
         return result.text.strip()
 
 

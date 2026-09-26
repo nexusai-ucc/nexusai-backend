@@ -45,7 +45,9 @@ Ver ADR-003 (decisión multi-provider) y ADR-004 (Gemini MVP / OpenAI prod).
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, AsyncIterator, Optional, Union
@@ -55,6 +57,15 @@ from openai import AsyncOpenAI
 
 from app.shared.config import get_settings
 from app.shared.retry import async_retry
+from app.shared.usage_ledger import (
+    UsageRecord,
+    as_int,
+    llm_usage_numbers,
+    provider_from_base_url,
+    record_usage,
+    schedule_usage,
+    status_for_exception,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,12 +102,20 @@ _EFFORT_UNSET = frozenset({"", "default", "auto"})
 
 @dataclass
 class CompletionResult:
-    """Resultado de una chat completion con texto y métricas de tokens."""
+    """Resultado de una chat completion con texto y métricas de tokens.
+
+    `model`, `provider` y `fallback` dicen qué eslabón de la cadena respondió
+    de verdad (COST-01): con fallback, no es el modelo configurado primero.
+    """
 
     text: str
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    cached_prompt_tokens: int = 0
+    model: str = ""
+    provider: str = ""
+    fallback: bool = False
 
 
 @dataclass(frozen=True)
@@ -113,6 +132,10 @@ class StreamUsage:
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    cached_prompt_tokens: int = 0
+    model: str = ""
+    provider: str = ""
+    fallback: bool = False
 
 
 StreamChunk = Union[StreamToken, StreamUsage]
@@ -150,6 +173,9 @@ class LLMProvider:
             timeout=120.0,
             max_retries=0,  # Retries manejados por async_retry, no por el SDK.
         )
+        self.provider_name: str = (
+            provider_from_base_url(base_url or settings.llm_base_url) or ""
+        )
 
         # Proveedor secundario opcional — ver _FALLBACK_TRIGGERS arriba.
         self.fallback_model: Optional[str] = settings.llm_fallback_model
@@ -165,6 +191,11 @@ class LLMProvider:
                 timeout=120.0,
                 max_retries=0,
             )
+        self.fallback_provider_name: str = (
+            provider_from_base_url(settings.llm_fallback_base_url) or ""
+            if self.fallback_client
+            else ""
+        )
 
         # Modelos intermedios opcionales (INFRA-03) — mismo client que el
         # primario, ver _fallback_chain().
@@ -215,6 +246,31 @@ class LLMProvider:
             chain.append((self.fallback_client, self.fallback_model))
         return chain
 
+    def _provider_of(self, client: AsyncOpenAI) -> str:
+        """Proveedor de un eslabón: los intermedios comparten client con el primario."""
+        if self.fallback_client is not None and client is self.fallback_client:
+            return self.fallback_provider_name
+        return self.provider_name
+
+    async def _record_link_failure(
+        self,
+        chain: list[tuple[AsyncOpenAI, str]],
+        index: int,
+        exc: BaseException,
+    ) -> None:
+        """Registra el intento fallido de un eslabón (COST-01): así queda
+        medido cuántas veces entra el fallback y por qué."""
+        client, model = chain[index]
+        await record_usage(
+            UsageRecord(
+                kind="llm",
+                status=status_for_exception(exc),
+                provider=self._provider_of(client),
+                model=model,
+                fallback=index > 0,
+            )
+        )
+
     async def chat_completion(
         self,
         messages: list[dict[str, str]],
@@ -247,18 +303,44 @@ class LLMProvider:
             openai.* — errores no-retryables, o el del último eslabón de la
             cadena si todos fallan.
         """
-        response = await self._run_completion_chain(
-            self._fallback_chain(),
+        chain = self._fallback_chain()
+        started = time.perf_counter()
+
+        async def on_link_failure(index: int, exc: BaseException) -> None:
+            await self._record_link_failure(chain, index, exc)
+
+        response, index = await self._run_completion_chain(
+            chain,
             messages,
+            on_link_failure=on_link_failure,
             **self._with_reasoning_effort(kwargs, reasoning_effort),
         )
         text = response.choices[0].message.content or ""
         usage = response.usage
+        prompt, completion, cached = llm_usage_numbers(usage)
+        client, model = chain[index]
+        provider = self._provider_of(client)
+        await record_usage(
+            UsageRecord(
+                kind="llm",
+                provider=provider,
+                model=model,
+                fallback=index > 0,
+                prompt_tokens=prompt,
+                completion_tokens=completion,
+                cached_prompt_tokens=cached,
+                latency_ms=round((time.perf_counter() - started) * 1000, 1),
+            )
+        )
         return CompletionResult(
             text=text,
             prompt_tokens=usage.prompt_tokens if usage else 0,
             completion_tokens=usage.completion_tokens if usage else 0,
             total_tokens=usage.total_tokens if usage else 0,
+            cached_prompt_tokens=cached,
+            model=model,
+            provider=provider,
+            fallback=index > 0,
         )
 
     @staticmethod
@@ -285,8 +367,10 @@ class LLMProvider:
     async def _run_completion_chain(
         chain: list[tuple[AsyncOpenAI, str]],
         messages: list[dict[str, str]],
+        *,
+        on_link_failure: Optional[Any] = None,
         **kwargs: Any,
-    ) -> Any:
+    ) -> tuple[Any, int]:
         """Recorre la cadena en orden (ver _fallback_chain). Cada eslabón ya
         tiene sus propios 3 reintentos vía _create_completion/async_retry —
         recién si esos 3 fallan por _FALLBACK_TRIGGERS pasa al siguiente
@@ -300,15 +384,22 @@ class LLMProvider:
         un secundario caído (InternalServerError) hace que la excepción que
         llega al caller no sea RateLimitError — y record_llm_failure_and_maybe_alert
         (app/shared/error_monitoring.py) nunca dispara la alerta específica
-        de cuota agotada, la más urgente/accionable de las 4."""
+        de cuota agotada, la más urgente/accionable de las 4.
+
+        Devuelve la response y el índice del eslabón que respondió.
+        `on_link_failure(index, exc)` se awaitea por cada eslabón que falla
+        con un error que corta o pasa al siguiente (registro de consumo)."""
         quota_exhausted: Optional[openai.RateLimitError] = None
         for i, (client, model) in enumerate(chain):
             try:
-                return await LLMProvider._create_completion(
+                response = await LLMProvider._create_completion(
                     client, model, messages, **kwargs
                 )
+                return response, i
             except openai.RateLimitError as exc:
                 quota_exhausted = quota_exhausted or exc
+                if on_link_failure is not None:
+                    await on_link_failure(i, exc)
                 if i == len(chain) - 1:
                     raise
                 next_model = chain[i + 1][1]
@@ -320,6 +411,8 @@ class LLMProvider:
                     next_model,
                 )
             except _FALLBACK_TRIGGERS as exc:
+                if on_link_failure is not None:
+                    await on_link_failure(i, exc)
                 if i == len(chain) - 1:
                     if quota_exhausted is not None:
                         raise quota_exhausted from exc
@@ -332,12 +425,19 @@ class LLMProvider:
                     exc,
                     next_model,
                 )
+            except Exception as exc:
+                # Errores que no pasan al siguiente eslabón (timeout, auth,
+                # conexión): igual quedan registrados antes de propagar.
+                if on_link_failure is not None:
+                    await on_link_failure(i, exc)
+                raise
+        raise RuntimeError("Cadena de modelos vacía")
 
     async def _create_stream(
         self,
         messages: list[dict[str, str]],
         **kwargs: Any,
-    ) -> Any:
+    ) -> tuple[Any, int]:
         """
         Abre un stream recorriendo la cadena de fallback en orden (ver
         _fallback_chain), pasando al siguiente eslabón si la apertura falla
@@ -347,19 +447,24 @@ class LLMProvider:
         corta a mitad de la iteración (después de ya haber yieldeado texto),
         no se reintenta — mismo comportamiento que antes de INFRA-01, porque
         ya se envió output parcial al caller y no se puede "deshacer".
+
+        Devuelve el stream y el índice del eslabón que lo abrió. Cada
+        apertura fallida queda registrada (COST-01).
         """
         chain = self._fallback_chain()
         quota_exhausted: Optional[openai.RateLimitError] = None
         for i, (client, model) in enumerate(chain):
             try:
-                return await client.chat.completions.create(
+                stream = await client.chat.completions.create(
                     model=model,
                     messages=messages,  # type: ignore[arg-type]
                     stream=True,
                     **kwargs,
                 )
+                return stream, i
             except openai.RateLimitError as exc:
                 quota_exhausted = quota_exhausted or exc
+                await self._record_link_failure(chain, i, exc)
                 if i == len(chain) - 1:
                     raise
                 next_model = chain[i + 1][1]
@@ -371,6 +476,7 @@ class LLMProvider:
                     next_model,
                 )
             except _FALLBACK_TRIGGERS as exc:
+                await self._record_link_failure(chain, i, exc)
                 if i == len(chain) - 1:
                     # Ver el comentario equivalente en _run_completion_chain:
                     # priorizar la cuota agotada de un eslabón anterior sobre
@@ -386,6 +492,38 @@ class LLMProvider:
                     exc,
                     next_model,
                 )
+            except Exception as exc:
+                await self._record_link_failure(chain, i, exc)
+                raise
+        raise RuntimeError("Cadena de modelos vacía")
+
+    async def _record_stream(
+        self,
+        index: int,
+        started: float,
+        status: str,
+        usage: Optional[StreamUsage],
+        cancelled: bool,
+    ) -> None:
+        """Registra un stream terminado, cortado o fallido (COST-01)."""
+        client, model = self._fallback_chain()[index]
+        record = UsageRecord(
+            kind="llm",
+            status=status,
+            provider=self._provider_of(client),
+            model=model,
+            fallback=index > 0,
+            prompt_tokens=as_int(usage.prompt_tokens) if usage else 0,
+            completion_tokens=as_int(usage.completion_tokens) if usage else 0,
+            cached_prompt_tokens=as_int(usage.cached_prompt_tokens) if usage else 0,
+            latency_ms=round((time.perf_counter() - started) * 1000, 1),
+        )
+        if cancelled:
+            # El stream se está cerrando porque el cliente cortó: no se
+            # puede esperar dentro de la cancelación, se registra aparte.
+            schedule_usage(record)
+        else:
+            await record_usage(record)
 
     async def chat_stream(
         self,
@@ -405,16 +543,27 @@ class LLMProvider:
             Strings con incrementos de texto. Algunos chunks pueden ser "" —
             el caller debe ignorarlos al armar SSE.
         """
-        stream = await self._create_stream(
+        started = time.perf_counter()
+        stream, index = await self._create_stream(
             messages, **self._with_reasoning_effort(kwargs, reasoning_effort)
         )
 
-        async for chunk in stream:
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            if delta and delta.content:
-                yield delta.content
+        status, cancelled = "ok", False
+        try:
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta and delta.content:
+                    yield delta.content
+        except (GeneratorExit, asyncio.CancelledError):
+            cancelled = True
+            raise
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            await self._record_stream(index, started, status, None, cancelled)
 
     async def chat_completion_stream(
         self,
@@ -430,25 +579,45 @@ class LLMProvider:
         único StreamUsage con los token counts del prompt + completion. Útil para
         persistir métricas en la DB después del streaming.
         """
-        stream = await self._create_stream(
+        started = time.perf_counter()
+        stream, index = await self._create_stream(
             messages,
             stream_options={"include_usage": True},
             **self._with_reasoning_effort(kwargs, reasoning_effort),
         )
+        client, model = self._fallback_chain()[index]
+        provider = self._provider_of(client)
 
-        async for chunk in stream:
-            if chunk.choices:
-                delta = chunk.choices[0].delta
-                if delta and delta.content:
-                    yield StreamToken(text=delta.content)
-            # En el último chunk con include_usage=True, viene el usage poblado.
-            if getattr(chunk, "usage", None):
-                u = chunk.usage
-                yield StreamUsage(
-                    prompt_tokens=u.prompt_tokens or 0,
-                    completion_tokens=u.completion_tokens or 0,
-                    total_tokens=u.total_tokens or 0,
-                )
+        usage_seen: Optional[StreamUsage] = None
+        status, cancelled = "ok", False
+        try:
+            async for chunk in stream:
+                if chunk.choices:
+                    delta = chunk.choices[0].delta
+                    if delta and delta.content:
+                        yield StreamToken(text=delta.content)
+                # En el último chunk con include_usage=True, viene el usage poblado.
+                if getattr(chunk, "usage", None):
+                    u = chunk.usage
+                    _, _, cached = llm_usage_numbers(u)
+                    usage_seen = StreamUsage(
+                        prompt_tokens=u.prompt_tokens or 0,
+                        completion_tokens=u.completion_tokens or 0,
+                        total_tokens=u.total_tokens or 0,
+                        cached_prompt_tokens=cached,
+                        model=model,
+                        provider=provider,
+                        fallback=index > 0,
+                    )
+                    yield usage_seen
+        except (GeneratorExit, asyncio.CancelledError):
+            cancelled = True
+            raise
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            await self._record_stream(index, started, status, usage_seen, cancelled)
 
 
 # ============================================================

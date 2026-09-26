@@ -20,13 +20,22 @@ y se valida contra lo que devuelve el provider en el primer embed.
 
 from __future__ import annotations
 
+import time
 from functools import lru_cache
-from typing import Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from openai import AsyncOpenAI
 
 from app.shared.config import get_settings
 from app.shared.retry import async_retry
+from app.shared.token_budget import estimate_tokens
+from app.shared.usage_ledger import (
+    UsageRecord,
+    embedding_tokens,
+    provider_from_base_url,
+    record_usage,
+    status_for_exception,
+)
 
 
 class EmbeddingProvider:
@@ -53,6 +62,46 @@ class EmbeddingProvider:
             timeout=60.0,
             max_retries=0,  # Retries manejados por async_retry.
         )
+        self.provider_name: str = (
+            provider_from_base_url(base_url or settings.embedding_base_url) or ""
+        )
+
+    async def _create_recorded(
+        self, call: Callable[[], Awaitable[Any]], texts: list[str]
+    ) -> Any:
+        """Llama al endpoint de embeddings y registra el consumo (COST-01).
+
+        La API compatible de Gemini no informa tokens en embeddings: en ese
+        caso se estiman con tiktoken y la fila queda marcada como estimada."""
+        started = time.perf_counter()
+        try:
+            response = await async_retry(call)
+        except Exception as exc:
+            await record_usage(
+                UsageRecord(
+                    kind="embedding",
+                    status=status_for_exception(exc),
+                    provider=self.provider_name,
+                    model=self.model,
+                    latency_ms=round((time.perf_counter() - started) * 1000, 1),
+                )
+            )
+            raise
+        tokens = embedding_tokens(getattr(response, "usage", None))
+        estimated = tokens == 0
+        if estimated:
+            tokens = sum(estimate_tokens(t) for t in texts)
+        await record_usage(
+            UsageRecord(
+                kind="embedding",
+                provider=self.provider_name,
+                model=self.model,
+                embedding_tokens=tokens,
+                estimated=estimated,
+                latency_ms=round((time.perf_counter() - started) * 1000, 1),
+            )
+        )
+        return response
 
     async def embed(self, text: str) -> list[float]:
         """
@@ -75,12 +124,13 @@ class EmbeddingProvider:
         if not text or not text.strip():
             raise ValueError("Cannot embed empty text")
 
-        response = await async_retry(
+        response = await self._create_recorded(
             lambda: self.client.embeddings.create(
                 model=self.model,
                 input=text,
                 dimensions=self.dimensions,
-            )
+            ),
+            [text],
         )
         vector = response.data[0].embedding
 
@@ -112,12 +162,13 @@ class EmbeddingProvider:
         if any(not t or not t.strip() for t in texts):
             raise ValueError("All texts must be non-empty")
 
-        response = await async_retry(
+        response = await self._create_recorded(
             lambda: self.client.embeddings.create(
                 model=self.model,
                 input=texts,
                 dimensions=self.dimensions,
-            )
+            ),
+            texts,
         )
 
         # Re-ordenamos explícitamente por index (el SDK lo garantiza, pero por las dudas).
