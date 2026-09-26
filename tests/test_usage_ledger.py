@@ -246,12 +246,14 @@ async def test_chat_completion_records_model_and_tokens(ledger):
 
     result = await provider.chat_completion([{"role": "user", "content": "hola"}])
 
-    assert (result.model, result.fallback) == ("gemini-3.5-flash", False)
+    # El modelo y el proveedor salen de la configuración del entorno (en CI y en
+    # local no son los mismos), así que se comparan contra los del propio objeto.
+    assert (result.model, result.fallback) == (provider.model, False)
     [row] = _rows(ledger)
     assert row["kind"] == "llm" and row["status"] == "ok"
     assert (row["provider"], row["model"], row["fallback"]) == (
-        "test.example",
-        "gemini-3.5-flash",
+        provider.provider_name,
+        provider.model,
         False,
     )
     assert (row["prompt_tokens"], row["completion_tokens"]) == (120, 30)
@@ -270,17 +272,21 @@ async def test_chat_completion_records_failed_link_and_fallback(ledger):
         result = await provider.chat_completion([{"role": "user", "content": "hola"}])
 
     assert (result.model, result.provider, result.fallback) == (
-        "gpt-4o-mini",
-        "test-fallback.example",
+        provider.fallback_model,
+        provider.fallback_provider_name,
         True,
     )
     failed, ok = _rows(ledger)
     assert (failed["status"], failed["model"], failed["prompt_tokens"]) == (
         "quota",
-        "gemini-3.5-flash",
+        provider.model,
         0,
     )
-    assert (ok["status"], ok["model"], ok["fallback"]) == ("ok", "gpt-4o-mini", True)
+    assert (ok["status"], ok["model"], ok["fallback"]) == (
+        "ok",
+        provider.fallback_model,
+        True,
+    )
 
 
 async def test_chat_completion_records_error_that_does_not_fall_back(ledger):
@@ -291,7 +297,7 @@ async def test_chat_completion_records_error_that_does_not_fall_back(ledger):
         await provider.chat_completion([{"role": "user", "content": "hola"}])
 
     [row] = _rows(ledger)
-    assert (row["status"], row["model"]) == ("error", "gemini-3.5-flash")
+    assert (row["status"], row["model"]) == ("error", provider.model)
 
 
 async def test_chat_completion_stream_records_final_usage(ledger):
@@ -321,7 +327,7 @@ async def test_chat_completion_stream_records_final_usage(ledger):
     usage = chunks[-1]
     assert isinstance(usage, StreamUsage)
     assert (usage.model, usage.fallback, usage.cached_prompt_tokens) == (
-        "gemini-3.5-flash",
+        provider.model,
         False,
         5,
     )
@@ -357,7 +363,7 @@ async def test_embed_records_tokens_and_errors(ledger):
     assert (ok["kind"], ok["embedding_tokens"], ok["model"]) == (
         "embedding",
         12,
-        "models/text-embedding-004",
+        provider.model,
     )
     assert failed["status"] == "error"
 
