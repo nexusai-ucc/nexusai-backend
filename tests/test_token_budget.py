@@ -151,7 +151,10 @@ async def test_reserva_permite_mientras_no_se_alcance_el_limite(
         estimated_tokens=200,
     )
     assert reserved == 200
-    assert fake_redis_budget.store[f"nexusai:tokenbudget:{DAY}:student:1:{_bucket(DAY)}"] == 200
+    assert (
+        fake_redis_budget.store[f"nexusai:tokenbudget:{DAY}:student:1:{_bucket(DAY)}"]
+        == 200
+    )
 
 
 async def test_reserva_bloquea_al_alcanzar_el_limite_y_revierte(
@@ -335,8 +338,9 @@ def _bucket(window_sec: int) -> int:
     return int(time.time()) // window_sec
 
 
-async def test_reservas_concurrentes_no_pueden_pasar_todas_con_acumulado_viejo(
-) -> None:
+async def test_reservas_concurrentes_no_pueden_pasar_todas_con_acumulado_viejo() -> (
+    None
+):
     """Antes de reserve_token_budget, check_token_budget solo hacía GET: N
     requests concurrentes del mismo usuario podían leer el mismo acumulado
     "viejo" (0) y pasar todas, porque nada se sumaba hasta después de que el
