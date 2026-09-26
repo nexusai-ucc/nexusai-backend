@@ -62,6 +62,7 @@ class AlertsListResponse(BaseModel):
 class AlertsDueItem(BaseModel):
     id: str
     user_id: int
+    course_id: int
     event_name: str
     event_timestamp: int
     days_before: int
@@ -175,6 +176,7 @@ async def alerts_due(
             AlertsDueItem(
                 id=str(r.id),
                 user_id=r.user_id,
+                course_id=r.course_id,
                 event_name=r.event_name,
                 event_timestamp=r.event_timestamp,
                 days_before=r.days_before,
