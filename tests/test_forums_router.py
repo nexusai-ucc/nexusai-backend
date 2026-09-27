@@ -40,6 +40,8 @@ _INDEX_PAYLOAD = {
 _SIMILAR_PAYLOAD = {
     "course_id": 1,
     "text": "¿Cómo se resuelve una integral por partes?",
+    "visible_cmids": [301],
+    "group_ids": [],
 }
 
 
@@ -50,6 +52,8 @@ def _make_post_embedding(**kwargs):
         forum_post_id=10,
         discussion_id=5,
         course_id=1,
+        cmid=None,
+        group_id=None,
         content_hash=_CONTENT_HASH,
         content=_CONTENT,
         embedding=[0.1] * 768,
@@ -544,3 +548,96 @@ async def test_get_webhook_config_returns_none_when_not_configured(client, mock_
 
     assert response.status_code == 200
     assert response.json() == {"webhook_url": None}
+
+
+# ─────────────────────────────────────────────────────────────
+# VIS-06: visibilidad de los posts de foro
+# ─────────────────────────────────────────────────────────────
+
+
+def _similar_sql(mock_db) -> str:
+    from sqlalchemy.dialects import postgresql
+
+    return str(mock_db.execute.await_args.args[0].compile(dialect=postgresql.dialect()))
+
+
+async def test_similar_posts_without_visible_cmids_is_rejected(client, mock_db):
+    payload = {k: v for k, v in _SIMILAR_PAYLOAD.items() if k != "visible_cmids"}
+
+    response = await client.post("/api/v1/forums/similar-posts", json=payload)
+
+    assert response.status_code == 422
+    assert "visible_cmids" in response.json()["detail"]
+    mock_db.execute.assert_not_called()
+
+
+async def test_similar_posts_with_no_visible_forum_returns_nothing_without_embedding(
+    client, mock_db, mock_embeddings
+):
+    response = await client.post(
+        "/api/v1/forums/similar-posts", json={**_SIMILAR_PAYLOAD, "visible_cmids": []}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["similar_posts"] == []
+    mock_embeddings.embed.assert_not_called()
+    mock_db.execute.assert_not_called()
+
+
+async def test_similar_posts_filters_by_forum_and_by_the_users_groups(client, mock_db):
+    mock_db.execute.return_value.all.return_value = []
+
+    await client.post(
+        "/api/v1/forums/similar-posts",
+        json={**_SIMILAR_PAYLOAD, "visible_cmids": [301, 302], "group_ids": [7]},
+    )
+
+    sql = _similar_sql(mock_db)
+    assert "forum_post_embeddings.cmid IN" in sql
+    assert "forum_post_embeddings.group_id IS NULL" in sql
+    assert "forum_post_embeddings.group_id IN" in sql
+
+
+async def test_similar_posts_for_someone_who_sees_every_group_skips_the_group_filter(
+    client, mock_db
+):
+    mock_db.execute.return_value.all.return_value = []
+
+    await client.post(
+        "/api/v1/forums/similar-posts", json={**_SIMILAR_PAYLOAD, "all_groups": True}
+    )
+
+    sql = _similar_sql(mock_db)
+    assert "forum_post_embeddings.cmid IN" in sql
+    assert "forum_post_embeddings.group_id IS NULL" not in sql
+
+
+async def test_index_post_stores_the_forum_and_group(client, mock_db):
+    mock_db.execute.return_value.scalar_one_or_none.return_value = None
+
+    response = await client.post(
+        "/api/v1/forums/index-post",
+        json={**_INDEX_PAYLOAD, "cmid": 301, "group_id": 7},
+    )
+
+    assert response.status_code == 200
+    record = mock_db.add.call_args.args[0]
+    assert record.cmid == 301
+    assert record.group_id == 7
+
+
+async def test_index_post_with_same_content_still_updates_forum_and_group(
+    client, mock_db
+):
+    """Se movió la discusión a otro foro o grupo: no se paga otro embedding pero se actualiza."""
+    existing = _make_post_embedding(content_hash=_CONTENT_HASH, cmid=300, group_id=None)
+    mock_db.execute.return_value.scalar_one_or_none.return_value = existing
+
+    response = await client.post(
+        "/api/v1/forums/index-post",
+        json={**_INDEX_PAYLOAD, "cmid": 301, "group_id": 7},
+    )
+
+    assert response.json()["status"] == "skipped"
+    assert (existing.cmid, existing.group_id) == (301, 7)
+    mock_db.commit.assert_called_once()

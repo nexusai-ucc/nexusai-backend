@@ -165,6 +165,7 @@ class ForumPostEmbedding(Base):
     __table_args__ = (
         Index("ix_forum_post_embeddings_course_id", "course_id"),
         Index("ix_forum_post_embeddings_discussion_id", "discussion_id"),
+        Index("ix_forum_post_embeddings_cmid", "cmid"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -173,6 +174,11 @@ class ForumPostEmbedding(Base):
     forum_post_id: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
     discussion_id: Mapped[int] = mapped_column(Integer, nullable=False)
     course_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Foro (actividad de Moodle) y grupo de la discusión (VIS-06): definen quién
+    # puede ver el post. cmid NULL = no se sabe de qué foro salió y no se
+    # muestra a nadie; group_id NULL = discusión para todos los participantes.
+    cmid: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    group_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     embedding: Mapped[Optional[List[float]]] = mapped_column(

@@ -44,7 +44,7 @@ from typing import Annotated, List, Optional
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Path, Request, status
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -77,6 +77,10 @@ class IndexPostRequest(BaseModel):
     discussion_id: int = Field(gt=0, description="ID de mdl_forum_discussions")
     course_id: int = Field(gt=0)
     content: str = Field(min_length=1, max_length=10_000)
+    # Foro del que sale el post y grupo de su discusión (VIS-06): definen quién
+    # puede verlo. Sin group_id, la discusión es para todos los participantes.
+    cmid: Optional[int] = Field(default=None, gt=0)
+    group_id: Optional[int] = Field(default=None, gt=0)
 
 
 class IndexPostResponse(BaseModel):
@@ -100,6 +104,14 @@ class SimilarPostsRequest(BaseModel):
         description="Similitud mínima para considerar duplicado",
     )
     top_k: int = Field(default=_DEFAULT_TOP_K, ge=1, le=10)
+    # Foros que el usuario puede ver y sus grupos, calculados por el plugin
+    # (VIS-06). Un post se muestra si su foro está entre los visibles y su
+    # discusión no tiene grupo o es de un grupo del usuario. all_groups es para
+    # quien puede ver todos los grupos (moodle/site:accessallgroups); por defecto
+    # se restringe.
+    visible_cmids: VisibleCmids = None
+    group_ids: List[int] = Field(default_factory=list, max_length=1000)
+    all_groups: bool = False
 
 
 class SimilarPost(BaseModel):
@@ -154,6 +166,12 @@ async def index_post(
     existing = result.scalar_one_or_none()
 
     if existing is not None and existing.content_hash == content_hash:
+        # Mismo contenido: no se vuelve a pagar el embedding, pero sí se
+        # actualiza el foro y el grupo (se pudo mover la discusión).
+        if existing.cmid != payload.cmid or existing.group_id != payload.group_id:
+            existing.cmid = payload.cmid
+            existing.group_id = payload.group_id
+            await db.commit()
         return IndexPostResponse(post_id=payload.post_id, status="skipped")
 
     try:
@@ -170,12 +188,16 @@ async def index_post(
             forum_post_id=payload.post_id,
             discussion_id=payload.discussion_id,
             course_id=payload.course_id,
+            cmid=payload.cmid,
+            group_id=payload.group_id,
             content_hash=content_hash,
             content=payload.content,
             embedding=vector,
         )
         db.add(record)
     else:
+        existing.cmid = payload.cmid
+        existing.group_id = payload.group_id
         existing.content_hash = content_hash
         existing.content = payload.content
         existing.embedding = vector
@@ -211,6 +233,10 @@ async def similar_posts(
     Usa similitud coseno sobre pgvector. Solo busca dentro del mismo curso.
     Devuelve lista vacía si no hay nada por encima del threshold.
     """
+    visible_cmids = enforce_visible_cmids(payload.visible_cmids)
+    if visible_cmids is not None and not visible_cmids:
+        return SimilarPostsResponse(similar_posts=[], threshold_used=payload.threshold)
+
     try:
         vector = await embeddings.embed(payload.text)
     except Exception as exc:
@@ -239,6 +265,16 @@ async def similar_posts(
     )
     if payload.exclude_post_id is not None:
         stmt = stmt.where(ForumPostEmbedding.forum_post_id != payload.exclude_post_id)
+    if visible_cmids is not None:
+        # VIS-06: solo foros visibles; sin cmid no se sabe de qué foro sale.
+        stmt = stmt.where(ForumPostEmbedding.cmid.in_(visible_cmids))
+        if not payload.all_groups:
+            stmt = stmt.where(
+                or_(
+                    ForumPostEmbedding.group_id.is_(None),
+                    ForumPostEmbedding.group_id.in_(payload.group_ids or [0]),
+                )
+            )
 
     try:
         result = await db.execute(stmt)
