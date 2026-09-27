@@ -129,6 +129,9 @@ class DocumentOut(BaseModel):
     mime_type: str
     section: Optional[int] = None
     cmid: Optional[int] = None
+    # Huella del contenido subido (sha256 del base64 que mandó el plugin): el
+    # plugin la compara para saber si el archivo de una actividad cambió (VIS-04).
+    file_hash: Optional[str] = None
     status: str  # pending | indexing | indexed | error
     error_message: Optional[str] = None
     created_at: Optional[datetime] = None
@@ -144,6 +147,7 @@ class DocumentOut(BaseModel):
             mime_type=doc.mime_type,
             section=doc.section,
             cmid=doc.cmid,
+            file_hash=doc.file_hash,
             status=doc.status,
             error_message=doc.error_message,
             created_at=doc.created_at,
@@ -598,6 +602,7 @@ async def list_documents_by_course(
     db: AsyncSession = Depends(get_db),
     limit: Optional[int] = Query(default=None, ge=1, le=_DEFAULT_LIST_LIMIT),
     offset: int = Query(default=0, ge=0),
+    cmid: Optional[int] = Query(default=None, gt=0),
 ) -> DocumentListResponse:
     """Lista los documentos de un curso. Para la tabla en la vista docente.
 
@@ -605,6 +610,10 @@ async def list_documents_by_course(
     ExamGeneratorPanel.jsx, que necesita elegir entre todos los documentos
     indexados, no una página), se devuelve hasta `_DEFAULT_LIST_LIMIT`. La
     tabla de materiales sí manda `limit`/`offset` explícitos para paginar.
+
+    VIS-04 (#539): con `cmid` solo devuelve los documentos de esa actividad de
+    Moodle; el plugin lo usa para saber qué documento borrar o reindexar cuando
+    la actividad se borra o cambia.
     """
     if course_id <= 0:
         raise HTTPException(
@@ -613,15 +622,15 @@ async def list_documents_by_course(
 
     effective_limit = limit if limit is not None else _DEFAULT_LIST_LIMIT
 
-    total = await db.scalar(
-        select(func.count())
-        .select_from(Document)
-        .where(Document.course_id == course_id)
-    )
+    filters = [Document.course_id == course_id]
+    if cmid is not None:
+        filters.append(Document.cmid == cmid)
+
+    total = await db.scalar(select(func.count()).select_from(Document).where(*filters))
 
     result = await db.execute(
         select(Document)
-        .where(Document.course_id == course_id)
+        .where(*filters)
         .order_by(Document.created_at.desc())
         .offset(offset)
         .limit(effective_limit)

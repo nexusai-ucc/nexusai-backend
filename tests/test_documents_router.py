@@ -651,3 +651,32 @@ async def test_reindex_409_messages_follow_the_interface_language(
 
     assert "no longer available" in english.json()["detail"]
     assert "ya no está disponible" in default.json()["detail"]
+
+
+async def test_list_documents_by_cmid_filters_the_query_and_exposes_the_hash(
+    client, mock_db
+):
+    """VIS-04 (#539): con ?cmid= solo salen los documentos de esa actividad, y
+    la huella del archivo viaja para que el plugin sepa si cambió."""
+    mock_db.execute.return_value = _exec_result(
+        scalars_all=[_make_doc(status="indexed", cmid=77)]
+    )
+    mock_db.scalar.return_value = 1
+
+    response = await client.get("/api/v1/documents?course_id=1&cmid=77")
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["cmid"] == 77
+    assert item["file_hash"] == _PDF_HASH
+    sql = str(mock_db.execute.await_args.args[0])
+    assert "documents.cmid =" in sql
+
+
+async def test_list_documents_without_cmid_does_not_filter_by_it(client, mock_db):
+    mock_db.execute.return_value = _exec_result(scalars_all=[])
+    mock_db.scalar.return_value = 0
+
+    await client.get("/api/v1/documents?course_id=1")
+
+    assert "documents.cmid =" not in str(mock_db.execute.await_args.args[0])
