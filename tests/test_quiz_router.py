@@ -136,6 +136,7 @@ def mock_db():
             # real así que el id de la flashcard queda None, pero no rompe
             # el shape de la respuesta (los tests de flashcards no lo assertan).
             content_hash="dummy-hash",
+            cmid=41,
         )
     ]
     return db
@@ -1218,3 +1219,128 @@ async def test_streak_endpoint_no_activity_returns_zero(client, mock_db):
 
     assert response.status_code == 200
     assert response.json() == {"current_streak": 0, "practiced_today": False}
+
+
+# ─────────────────────────────────────────────────────────────
+# DATA-04 (#524): los datos vienen de Moodle en el pedido
+# ─────────────────────────────────────────────────────────────
+
+
+async def test_generate_flashcards_without_persisting_returns_hash_and_cmid(
+    client, mock_db
+):
+    mock_db.commit.reset_mock()
+    response = await client.post(
+        "/api/v1/quiz/generate",
+        json={
+            "course_id": 1,
+            "user_id": 1,
+            "num_questions": 1,
+            "question_type": "flashcard",
+            "visible_cmids": [41],
+            "persist_flashcards": False,
+        },
+    )
+
+    assert response.status_code == 200
+    question = response.json()["questions"][0]
+    assert len(question["content_hash"]) == 64
+    assert question["source_cmid"] == 41
+    mock_db.commit.assert_not_called()
+
+
+async def test_study_plan_with_provided_lists_does_not_read_the_database(
+    client, mock_db, mock_llm
+):
+    llm_response = {
+        "topics": [
+            {
+                "topic": "Probabilidad condicional",
+                "quiz_groups": [0],
+                "gap_groups": [0],
+                "reason": "Falla en quiz y pregunta en el chat.",
+                "suggested_quiz_topic": "Bayes",
+            }
+        ]
+    }
+    mock_llm.chat_completion.return_value = MagicMock(text=json.dumps(llm_response))
+    mock_db.execute.reset_mock()
+
+    response = await client.post(
+        "/api/v1/quiz/study-plan",
+        json={
+            **_STUDY_PLAN_PAYLOAD,
+            "errors": [
+                {
+                    "id": "e1",
+                    "question": "¿Qué es P(A|B)?",
+                    "explanation": "Probabilidad condicional.",
+                    "source_filename": "apunte1.pdf",
+                    "created_at": "2026-09-29T10:00:00Z",
+                }
+            ],
+            "gaps": [
+                {
+                    "id": "g1",
+                    "question": " Bayes? ",
+                    "created_at": "2026-09-28T10:00:00Z",
+                },
+                {
+                    "id": "g2",
+                    "question": "bayes?",
+                    "created_at": "2026-09-29T10:00:00Z",
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    topic = response.json()["topics"][0]
+    assert topic["quiz_error_ids"] == ["e1"]
+    assert sorted(topic["gap_question_ids"]) == ["g1", "g2"]
+    assert topic["gap_count"] == 2
+    mock_db.execute.assert_not_called()
+
+
+async def test_study_plan_with_empty_lists_skips_the_llm(client, mock_db, mock_llm):
+    response = await client.post(
+        "/api/v1/quiz/study-plan",
+        json={**_STUDY_PLAN_PAYLOAD, "errors": [], "gaps": []},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["topics"] == []
+    mock_llm.chat_completion.assert_not_called()
+    mock_db.execute.assert_not_called()
+
+
+async def test_review_suggestions_with_provided_errors(client, mock_db, mock_llm):
+    mock_llm.chat_completion.return_value = MagicMock(
+        text=json.dumps(
+            {"suggestions": [{"group": 0, "topic": "Bayes", "suggestion": "Repasá."}]}
+        )
+    )
+    mock_db.execute.reset_mock()
+
+    response = await client.post(
+        "/api/v1/quiz/review-suggestions",
+        json={
+            "course_id": 1,
+            "user_id": 1,
+            "errors": [
+                {
+                    "question": "q",
+                    "explanation": "e",
+                    "source_filename": "apunte1.pdf",
+                    "created_at": "2026-09-29T10:00:00Z",
+                }
+            ]
+            * 2,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_errors"] == 2
+    assert body["suggestions"][0]["error_count"] == 2
+    mock_db.execute.assert_not_called()

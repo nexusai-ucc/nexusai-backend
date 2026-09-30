@@ -71,6 +71,33 @@ def llm_indicated_no_answer(text: Optional[str]) -> bool:
     return bool(LLM_NO_ANSWER_PATTERNS.search(text))
 
 
+def is_gap(
+    *, chunks_count: int, max_similarity: Optional[float], llm_answer: Optional[str]
+) -> bool:
+    """Las dos señales de arriba: el material no respondió bien la pregunta."""
+    no_chunks = chunks_count <= 0
+    weak_match = max_similarity is not None and max_similarity < WEAK_MATCH_THRESHOLD
+    return no_chunks or weak_match or llm_indicated_no_answer(llm_answer)
+
+
+async def embed_gap_question(
+    question: str, embeddings: Optional[EmbeddingProvider]
+) -> Optional[list[float]]:
+    """Embedding de la pregunta, para agrupar gaps parecidos. None si falla."""
+    if embeddings is None:
+        return None
+    try:
+        with usage_scope("gap"):
+            return await embeddings.embed(question.strip()[:2000])
+    except Exception as exc:
+        logger.warning(
+            "No se pudo embeddear el gap (se registra igual, sin embedding): %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        return None
+
+
 async def record_gap_if_needed(
     db: AsyncSession,
     *,
@@ -98,28 +125,16 @@ async def record_gap_if_needed(
     preferible a romper el chat.
     """
     try:
-        no_chunks = chunks_count <= 0
-        weak_match = (
-            max_similarity is not None and max_similarity < WEAK_MATCH_THRESHOLD
-        )
+        if not is_gap(
+            chunks_count=chunks_count,
+            max_similarity=max_similarity,
+            llm_answer=llm_answer,
+        ):
+            return False
         llm_said_no = llm_indicated_no_answer(llm_answer)
 
-        if not (no_chunks or weak_match or llm_said_no):
-            return False
-
         question_text = question.strip()[:2000]
-
-        vector: Optional[list[float]] = None
-        if embeddings is not None:
-            try:
-                with usage_scope("gap"):
-                    vector = await embeddings.embed(question_text)
-            except Exception as exc:
-                logger.warning(
-                    "No se pudo embeddear el gap (se registra igual, sin embedding): %s: %s",
-                    type(exc).__name__,
-                    exc,
-                )
+        vector = await embed_gap_question(question_text, embeddings)
 
         gap = UnansweredQuestion(
             course_id=course_id,

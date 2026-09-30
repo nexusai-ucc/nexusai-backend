@@ -14,6 +14,11 @@ from starlette.responses import JSONResponse, Response
 
 from app.infrastructure.redis_client import get_redis
 from app.shared.error_monitoring import record_5xx_and_maybe_alert
+from app.shared.usage_ledger import (
+    USAGE_HEADER,
+    start_call_collection,
+    usage_header_value,
+)
 
 logger = logging.getLogger("nexusai.access")
 
@@ -30,6 +35,10 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         request_id = str(uuid.uuid4())
         request.state.request_id = request_id
         start = time.perf_counter()
+
+        # DATA-04: juntar las llamadas a proveedores de este pedido para el
+        # encabezado X-NexusAI-Usage (ver app/shared/usage_ledger.py).
+        calls = start_call_collection()
 
         try:
             response = await call_next(request)
@@ -56,6 +65,13 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
 
         latency_ms = round((time.perf_counter() - start) * 1000, 1)
         response.headers["X-Request-ID"] = request_id
+        # En un stream los encabezados salen antes que el consumo: el chat lo
+        # manda en su evento `done`.
+        is_stream = response.headers.get("content-type", "").startswith(
+            "text/event-stream"
+        )
+        if calls and not is_stream:
+            response.headers[USAGE_HEADER] = usage_header_value(calls)
 
         logger.info(
             json.dumps(

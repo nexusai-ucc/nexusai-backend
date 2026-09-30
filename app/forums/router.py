@@ -708,6 +708,10 @@ class WeeklyDigestRequest(BaseModel):
     discussions: List[DigestDiscussion] = Field(
         default_factory=list, max_length=_MAX_DISCUSSIONS_IN_DIGEST
     )
+    # DATA-04 (#524): en la opción C la URL del webhook del curso vive en
+    # Moodle, que la manda acá ("" = sin webhook). Sin el campo se busca en la
+    # tabla del backend, como antes.
+    webhook_url: Optional[str] = Field(default=None, max_length=2000)
 
 
 class DigestDiscussionResult(BaseModel):
@@ -817,7 +821,9 @@ async def weekly_digest(
     # FOR-07 (#378): si el docente configuró un webhook para este curso,
     # reenviar el resumen ahí además de mostrarlo en el panel. Un fallo acá
     # NUNCA debe romper la respuesta al frontend — se loguea y se ignora.
-    await _notify_webhook_if_configured(db, payload.course_id, summary)
+    await _notify_webhook_if_configured(
+        db, payload.course_id, summary, webhook_url=payload.webhook_url
+    )
 
     return WeeklyDigestResponse(
         course_id=payload.course_id,
@@ -858,18 +864,22 @@ class WebhookConfigGetResponse(BaseModel):
 
 
 async def _notify_webhook_if_configured(
-    db: AsyncSession, course_id: int, summary: Optional[str]
+    db: AsyncSession,
+    course_id: int,
+    summary: Optional[str],
+    webhook_url: Optional[str] = None,
 ) -> None:
     if not summary:
         return  # nada que notificar (mismo criterio que "sin discusiones, sin LLM")
 
-    row = await db.execute(
-        select(ForumWebhookConfig.webhook_url).where(
-            ForumWebhookConfig.course_id == course_id
+    if webhook_url is None:
+        row = await db.execute(
+            select(ForumWebhookConfig.webhook_url).where(
+                ForumWebhookConfig.course_id == course_id
+            )
         )
-    )
-    webhook_url = row.scalar_one_or_none()
-    if not webhook_url:
+        webhook_url = row.scalar_one_or_none()
+    if not webhook_url or not _re.match(r"^https?://", webhook_url):
         return
 
     try:

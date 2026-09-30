@@ -14,6 +14,12 @@ en un ContextVar, que asyncio copia a las tareas creadas durante el pedido
 
 Fail-open: registrar nunca rompe el pedido del alumno. Si la escritura
 falla, se loguea y se sigue.
+
+Consumo por pedido (DATA-04, issue #524): además de la fila en llm_usage,
+cada llamada se anota en una lista del pedido (`start_call_collection`). El
+middleware la devuelve en el encabezado `X-NexusAI-Usage` de las respuestas
+JSON y el chat en su evento `done`, para que Moodle guarde el consumo de cada
+usuario en su propia tabla (local_nexusai_usage).
 """
 
 from __future__ import annotations
@@ -110,6 +116,14 @@ class Price:
 _context: ContextVar[UsageContext] = ContextVar(
     "nexusai_usage_context", default=UsageContext()
 )
+# Lista de llamadas del pedido en curso; None fuera de un pedido HTTP.
+_calls: ContextVar[Optional[list[dict[str, Any]]]] = ContextVar(
+    "nexusai_usage_calls", default=None
+)
+
+# Tope de llamadas detalladas en el encabezado; el resto se suma en una sola.
+MAX_HEADER_CALLS = 20
+USAGE_HEADER = "X-NexusAI-Usage"
 _price_cache: dict[tuple[str, str], tuple[float, Optional[Price]]] = {}
 _background_tasks: set[asyncio.Task] = set()
 
@@ -226,6 +240,90 @@ def context_from_request(
 
 
 # ============================================================
+# Consumo por pedido
+# ============================================================
+
+
+def start_call_collection() -> list[dict[str, Any]]:
+    """Empieza a juntar las llamadas del pedido en curso y devuelve la lista.
+
+    La lista es un objeto compartido: las tareas que asyncio crea durante el
+    pedido copian el contexto pero apuntan a la misma lista, así que lo que
+    registran se ve desde el middleware que la creó.
+    """
+    calls: list[dict[str, Any]] = []
+    _calls.set(calls)
+    return calls
+
+
+def collected_calls() -> list[dict[str, Any]]:
+    """Llamadas registradas hasta ahora en el pedido (vacía fuera de uno)."""
+    return list(_calls.get() or [])
+
+
+def call_summary(record: UsageRecord, ctx: UsageContext) -> dict[str, Any]:
+    """Lo que Moodle necesita de una llamada para su tabla local_nexusai_usage."""
+    return {
+        "feature": (record.feature or ctx.feature)[:80],
+        "kind": record.kind,
+        "provider": record.provider,
+        "model": record.model,
+        "fallback": record.fallback,
+        "status": record.status,
+        "prompt_tokens": record.prompt_tokens,
+        "completion_tokens": record.completion_tokens,
+        "cached_prompt_tokens": record.cached_prompt_tokens,
+        "embedding_tokens": record.embedding_tokens,
+        "audio_seconds": record.audio_seconds,
+        "latency_ms": record.latency_ms,
+        "cache_hit": record.cache_hit,
+        "saved_tokens": record.saved_tokens,
+        "estimated": record.estimated,
+        # Se completa al guardar la fila, cuando se conoce el precio.
+        "cost_usd": None,
+    }
+
+
+def _collect(record: UsageRecord) -> Optional[dict[str, Any]]:
+    calls = _calls.get()
+    if calls is None:
+        return None
+    summary = call_summary(record, get_usage_context())
+    calls.append(summary)
+    return summary
+
+
+def usage_header_value(calls: list[dict[str, Any]]) -> str:
+    """Encabezado X-NexusAI-Usage: JSON ASCII con las llamadas del pedido.
+
+    Más de MAX_HEADER_CALLS llamadas (por ejemplo, embeddings en lote) se
+    suman en una última entrada para no pasar el tamaño de un encabezado.
+    """
+    items = calls[:MAX_HEADER_CALLS]
+    rest = calls[MAX_HEADER_CALLS:]
+    if rest:
+        merged = dict(rest[0])
+        for call in rest[1:]:
+            for key in (
+                "prompt_tokens",
+                "completion_tokens",
+                "cached_prompt_tokens",
+                "embedding_tokens",
+                "saved_tokens",
+            ):
+                merged[key] = int(merged.get(key) or 0) + int(call.get(key) or 0)
+            if merged.get("cost_usd") is not None and call.get("cost_usd") is not None:
+                merged["cost_usd"] = format(
+                    Decimal(merged["cost_usd"]) + Decimal(call["cost_usd"]), "f"
+                )
+            else:
+                merged["cost_usd"] = None
+        merged["merged_calls"] = len(rest)
+        items = items + [merged]
+    return json.dumps({"calls": items}, ensure_ascii=True, separators=(",", ":"))
+
+
+# ============================================================
 # Números de uso y costo
 # ============================================================
 
@@ -330,11 +428,12 @@ def build_row(record: UsageRecord, ctx: UsageContext) -> dict[str, Any]:
 
 async def record_usage(record: UsageRecord) -> None:
     """Escribe una fila en llm_usage. Nunca propaga excepciones."""
+    summary = _collect(record)
     if not get_settings().usage_ledger_enabled:
         return
     try:
         row = build_row(record, get_usage_context())
-        await _persist(row, record)
+        await _persist(row, record, summary)
     except Exception as exc:
         logger.warning(
             "No se pudo registrar el consumo (%s/%s): %s: %s",
@@ -357,7 +456,9 @@ def schedule_usage(record: UsageRecord) -> None:
     task.add_done_callback(_background_tasks.discard)
 
 
-async def _persist(row: dict[str, Any], record: UsageRecord) -> None:
+async def _persist(
+    row: dict[str, Any], record: UsageRecord, summary: Optional[dict[str, Any]] = None
+) -> None:
     from app.db.models import LlmUsage
     from app.db.session import get_session_factory
 
@@ -373,6 +474,8 @@ async def _persist(row: dict[str, Any], record: UsageRecord) -> None:
                 missing_price = (record.provider, record.model)
         session.add(LlmUsage(**row, cost_usd=cost))
         await session.commit()
+        if summary is not None and cost is not None:
+            summary["cost_usd"] = format(cost, "f")
 
     if missing_price:
         await _alert_missing_price(*missing_price)

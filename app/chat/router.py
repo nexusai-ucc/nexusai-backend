@@ -34,11 +34,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.analytics.logger import hash_user_id, log_interaction, log_moderation_block
 from app.auth.hmac import verify_hmac
-from app.chat.schemas import ChatRequest, ChatResponse, MessageOut
+from app.chat.schemas import (
+    ChatMetrics,
+    ChatRequest,
+    ChatResponse,
+    GapSignal,
+    MessageOut,
+)
 from app.db.models import ChatSession, Message, MessageFeedback
 from app.db.session import get_db, get_session_factory
 from app.documents.retriever import format_context_for_prompt, retrieve_context
-from app.gaps.recorder import WEAK_MATCH_THRESHOLD, record_gap_if_needed
+from app.gaps.recorder import (
+    WEAK_MATCH_THRESHOLD,
+    embed_gap_question,
+    is_gap,
+    record_gap_if_needed,
+)
 from app.infrastructure.redis_client import get_redis
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, StreamToken, StreamUsage, get_llm_provider
@@ -51,7 +62,9 @@ from app.shared.error_monitoring import (
 from app.shared.moderation import moderate_text
 from app.shared.rate_limit import check_rate_limit
 from app.shared.visibility import enforce_visible_cmids
+from app.shared.usage_ledger import collected_calls
 from app.shared.token_budget import (
+    budget_status,
     estimate_tokens,
     estimate_tokens_for_messages,
     finalize_token_usage,
@@ -110,15 +123,86 @@ async def _get_or_create_session(
     return session
 
 
-def _token_budget_limits(settings, is_teacher: bool) -> tuple[int, int]:
+def _token_budget_limits(settings, payload: ChatRequest) -> tuple[int, int]:
     """Devuelve (límite horario, límite diario) de tokens según el rol.
 
     is_teacher viene resuelto server-side en el plugin PHP (has_capability),
     nunca del JS del navegador — ver comentario en ChatRequest.is_teacher.
+    DATA-04: si Moodle manda los límites que configuró su admin, mandan esos.
     """
-    if is_teacher:
-        return settings.token_budget_teacher_hourly, settings.token_budget_teacher_daily
-    return settings.token_budget_student_hourly, settings.token_budget_student_daily
+    if payload.is_teacher:
+        hourly = settings.token_budget_teacher_hourly
+        daily = settings.token_budget_teacher_daily
+    else:
+        hourly = settings.token_budget_student_hourly
+        daily = settings.token_budget_student_daily
+    return payload.token_limit_hourly or hourly, payload.token_limit_daily or daily
+
+
+def _history_for_llm(payload: ChatRequest) -> list[dict[str, str]]:
+    """Mensajes previos que mandó Moodle, en el formato del LLM (DATA-04)."""
+    return [{"role": m.role, "content": m.content} for m in payload.history or []][-10:]
+
+
+async def _stateless_extras(
+    *,
+    payload: ChatRequest,
+    redis: redis_async.Redis,
+    embeddings: EmbeddingProvider,
+    answer: str,
+    chunks_count: int,
+    max_similarity: Optional[float],
+    has_relevant_context: bool,
+    is_multicourse: bool,
+    latency_ms: float,
+    prompt_tokens: int,
+    completion_tokens: int,
+    total_tokens: int,
+    model: str,
+    provider: str,
+    fallback: bool,
+) -> dict:
+    """Lo que Moodle guarda de una respuesta en el flujo nuevo (DATA-04).
+
+    Decide el gap (sin guardarlo) y, si lo es, calcula el embedding de la
+    pregunta para agruparlo; arma las métricas de la interacción, lo que le
+    queda al usuario de su presupuesto y el consumo de todas las llamadas del
+    pedido. En multicurso no hay gaps, igual que en el flujo anterior.
+    """
+    gap_flag = not is_multicourse and is_gap(
+        chunks_count=chunks_count, max_similarity=max_similarity, llm_answer=answer
+    )
+    embedding = (
+        await embed_gap_question(payload.question, embeddings) if gap_flag else None
+    )
+    hourly_limit, daily_limit = _token_budget_limits(get_settings(), payload)
+    metrics = ChatMetrics(
+        latency_ms=latency_ms,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        model=model,
+        provider=provider,
+        fallback=fallback,
+        chunks_retrieved=chunks_count,
+        has_relevant_context=has_relevant_context,
+        grounded=not gap_flag if not is_multicourse else has_relevant_context,
+        multicourse=is_multicourse,
+    )
+    gap = GapSignal(
+        is_gap=gap_flag,
+        max_similarity=max_similarity,
+        chunks_retrieved=chunks_count,
+        embedding=embedding,
+    )
+    return {
+        "metrics": metrics,
+        "gap": gap,
+        "budget": await budget_status(
+            payload.user_id, payload.is_teacher, redis, hourly_limit, daily_limit
+        ),
+        "usage": collected_calls(),
+    }
 
 
 def _build_system_prompt(retrieved_context: str, is_multicourse: bool = False) -> str:
@@ -236,9 +320,7 @@ async def messages(
     # del alumno (lo único conocido en este punto, antes del RAG); el resto
     # del costo real (contexto RAG + historial + completion) se ajusta más
     # abajo con finalize_token_usage una vez conocido. -----
-    token_hourly_limit, token_daily_limit = _token_budget_limits(
-        settings, payload.is_teacher
-    )
+    token_hourly_limit, token_daily_limit = _token_budget_limits(settings, payload)
     question_tokens_estimate = estimate_tokens(payload.question)
     reserved_hourly = await reserve_token_budget(
         user_id=payload.user_id,
@@ -321,12 +403,18 @@ async def messages(
             status_code=status.HTTP_400_BAD_REQUEST, detail=moderation.blocked_message
         )
 
-    session = await _get_or_create_session(db, payload)
-
-    user_message = Message(session_id=session.id, role="user", content=payload.question)
-    db.add(user_message)
-    await db.flush()
-    await db.commit()
+    # DATA-04: con `history` la conversación vive en Moodle y acá no se guarda nada.
+    stateless = payload.stateless
+    session: Optional[ChatSession] = None
+    user_message: Optional[Message] = None
+    if not stateless:
+        session = await _get_or_create_session(db, payload)
+        user_message = Message(
+            session_id=session.id, role="user", content=payload.question
+        )
+        db.add(user_message)
+        await db.flush()
+        await db.commit()
 
     # ----- BACK-11 + BACK-13: Retrieval RAG (Feature B: multi-curso opcional) -----
     # Si falla (embeddings caídos, cuota agotada, etc.), continúa SIN contexto.
@@ -370,14 +458,6 @@ async def messages(
     max_sim_for_gap = max((c.similarity for c in retrieved_chunks), default=None)
 
     # ----- Historial y construcción del prompt -----
-    history_result = await db.execute(
-        select(Message)
-        .where(Message.session_id == session.id)
-        .order_by(desc(Message.created_at), desc(Message.id))
-        .limit(10)
-    )
-    recent_messages = list(reversed(history_result.scalars().all()))
-
     llm_messages = [
         {
             "role": "system",
@@ -386,10 +466,21 @@ async def messages(
             ),
         },
     ]
-    for message in recent_messages:
-        if message.id == user_message.id:
-            continue
-        llm_messages.append({"role": message.role, "content": message.content})
+    if stateless:
+        llm_messages.extend(_history_for_llm(payload))
+    else:
+        assert session is not None and user_message is not None
+        history_result = await db.execute(
+            select(Message)
+            .where(Message.session_id == session.id)
+            .order_by(desc(Message.created_at), desc(Message.id))
+            .limit(10)
+        )
+        recent_messages = list(reversed(history_result.scalars().all()))
+        for message in recent_messages:
+            if message.id == user_message.id:
+                continue
+            llm_messages.append({"role": message.role, "content": message.content})
     llm_messages.append({"role": "user", "content": payload.question})
     llm_messages = with_language_directive(
         llm_messages, payload.question, fallback=ui_language(request)
@@ -452,6 +543,53 @@ async def messages(
         actual_tokens=result.total_tokens,
     )
 
+    if stateless:
+        has_ctx = bool(
+            retrieved_chunks
+            and max_sim_for_gap is not None
+            and max_sim_for_gap >= WEAK_MATCH_THRESHOLD
+        )
+        extras = await _stateless_extras(
+            payload=payload,
+            redis=redis,
+            embeddings=embeddings,
+            answer=result.text,
+            chunks_count=len(retrieved_chunks),
+            max_similarity=max_sim_for_gap,
+            has_relevant_context=has_ctx,
+            is_multicourse=is_multicourse,
+            latency_ms=round((time.perf_counter() - start_time) * 1000, 1),
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            total_tokens=result.total_tokens,
+            model=result.model,
+            provider=result.provider,
+            fallback=result.fallback,
+        )
+        logger.info(
+            json.dumps(
+                {
+                    "event": "chat_message",
+                    "request_id": request_id,
+                    "course_id": payload.course_id,
+                    "user_id": payload.user_id,
+                    "stateless": True,
+                    "chunks_retrieved": len(retrieved_chunks),
+                    "total_tokens": result.total_tokens,
+                    "latency_ms": extras["metrics"].latency_ms,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return ChatResponse(
+            answer=result.text,
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            total_tokens=result.total_tokens,
+            **extras,
+        )
+
+    assert session is not None and user_message is not None
     # ----- BACK-12: Persistir mensaje del asistente con token counts -----
     assistant_message = Message(
         session_id=session.id,
@@ -589,9 +727,7 @@ async def messages_stream(
     # ----- Presupuesto de tokens por rol (ver app/shared/token_budget.py).
     # Reserva atómica igual que en /messages — ver el comentario en ese
     # endpoint para el razonamiento completo. -----
-    token_hourly_limit, token_daily_limit = _token_budget_limits(
-        settings, payload.is_teacher
-    )
+    token_hourly_limit, token_daily_limit = _token_budget_limits(settings, payload)
     question_tokens_estimate = estimate_tokens(payload.question)
     reserved_hourly = await reserve_token_budget(
         user_id=payload.user_id,
@@ -684,13 +820,18 @@ async def messages_stream(
 
         async with SessionFactory() as db:
             try:
-                session = await _get_or_create_session(db, payload)
-                user_message = Message(
-                    session_id=session.id, role="user", content=payload.question
-                )
-                db.add(user_message)
-                await db.flush()
-                await db.commit()
+                # DATA-04: con `history` no se guarda nada acá (ver /messages).
+                stateless = payload.stateless
+                session: Optional[ChatSession] = None
+                user_message: Optional[Message] = None
+                if not stateless:
+                    session = await _get_or_create_session(db, payload)
+                    user_message = Message(
+                        session_id=session.id, role="user", content=payload.question
+                    )
+                    db.add(user_message)
+                    await db.flush()
+                    await db.commit()
 
                 # Retrieval RAG (tolera fallos como el endpoint sync).
                 try:
@@ -750,11 +891,13 @@ async def messages_stream(
                 # para que las pills puedan mostrar de qué materia viene cada fuente.
                 meta_payload = {
                     "type": "meta",
-                    "session_id": str(session.id),
                     "chunks": len(retrieved_chunks),
                     "sources": sources_payload,
                     "has_relevant_context": has_relevant_context,
                 }
+                # En el flujo nuevo el session_id lo pone Moodle.
+                if session is not None:
+                    meta_payload["session_id"] = str(session.id)
                 if is_multicourse and course_names_int:
                     meta_payload["course_names"] = {
                         str(k): v for k, v in course_names_int.items()
@@ -762,14 +905,6 @@ async def messages_stream(
                 yield ("data: " + json.dumps(meta_payload, ensure_ascii=False) + "\n\n")
 
                 # Historial.
-                history_result = await db.execute(
-                    select(Message)
-                    .where(Message.session_id == session.id)
-                    .order_by(desc(Message.created_at), desc(Message.id))
-                    .limit(10)
-                )
-                recent_messages = list(reversed(history_result.scalars().all()))
-
                 llm_messages = [
                     {
                         "role": "system",
@@ -778,12 +913,23 @@ async def messages_stream(
                         ),
                     },
                 ]
-                for message in recent_messages:
-                    if message.id == user_message.id:
-                        continue
-                    llm_messages.append(
-                        {"role": message.role, "content": message.content}
+                if stateless:
+                    llm_messages.extend(_history_for_llm(payload))
+                else:
+                    assert session is not None and user_message is not None
+                    history_result = await db.execute(
+                        select(Message)
+                        .where(Message.session_id == session.id)
+                        .order_by(desc(Message.created_at), desc(Message.id))
+                        .limit(10)
                     )
+                    recent_messages = list(reversed(history_result.scalars().all()))
+                    for message in recent_messages:
+                        if message.id == user_message.id:
+                            continue
+                        llm_messages.append(
+                            {"role": message.role, "content": message.content}
+                        )
                 llm_messages.append({"role": "user", "content": payload.question})
                 llm_messages = with_language_directive(
                     llm_messages, payload.question, fallback=ui_language(request)
@@ -860,6 +1006,67 @@ async def messages_stream(
                     redis, endpoint="stream", latency_ms=llm_latency_ms
                 )
 
+                if stateless:
+                    extras = await _stateless_extras(
+                        payload=payload,
+                        redis=redis,
+                        embeddings=embeddings,
+                        answer=full_text,
+                        chunks_count=len(retrieved_chunks),
+                        max_similarity=max_sim_stream,
+                        has_relevant_context=has_relevant_context,
+                        is_multicourse=is_multicourse,
+                        latency_ms=round((time.perf_counter() - start_time) * 1000, 1),
+                        prompt_tokens=usage_seen.prompt_tokens if usage_seen else 0,
+                        completion_tokens=usage_seen.completion_tokens
+                        if usage_seen
+                        else 0,
+                        total_tokens=usage_seen.total_tokens if usage_seen else 0,
+                        model=usage_seen.model if usage_seen else "",
+                        provider=usage_seen.provider if usage_seen else "",
+                        fallback=usage_seen.fallback if usage_seen else False,
+                    )
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "type": "answer_meta",
+                                "grounded": extras["metrics"].grounded,
+                            }
+                        )
+                        + "\n\n"
+                    )
+                    done_payload = {
+                        "type": "done",
+                        "prompt_tokens": extras["metrics"].prompt_tokens,
+                        "completion_tokens": extras["metrics"].completion_tokens,
+                        "total_tokens": extras["metrics"].total_tokens,
+                        "metrics": extras["metrics"].model_dump(),
+                        "gap": extras["gap"].model_dump(),
+                        "budget": extras["budget"],
+                        "usage": extras["usage"],
+                    }
+                    yield (
+                        "data: " + json.dumps(done_payload, ensure_ascii=False) + "\n\n"
+                    )
+                    logger.info(
+                        json.dumps(
+                            {
+                                "event": "chat_stream",
+                                "request_id": request_id,
+                                "course_id": payload.course_id,
+                                "user_id": payload.user_id,
+                                "stateless": True,
+                                "chunks_retrieved": len(retrieved_chunks),
+                                "total_tokens": extras["metrics"].total_tokens,
+                                "latency_ms": extras["metrics"].latency_ms,
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                    return
+
+                assert session is not None and user_message is not None
                 # Persistir el mensaje completo del asistente.
                 assistant_message = Message(
                     session_id=session.id,

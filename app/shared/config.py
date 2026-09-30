@@ -219,6 +219,11 @@ class Settings(BaseSettings):
     #   para un despliegue escalonado: sin la lista, el pedido ve todo el curso.
     require_visible_cmids: bool = True
 
+    # Export temporal de los datos del alumno para migrarlos a Moodle
+    # (DATA-04, issue #524) — ver app/migration/router.py. Apagado por
+    # defecto: se prende solo durante el corte.
+    migration_export_enabled: bool = False
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

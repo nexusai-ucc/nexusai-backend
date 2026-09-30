@@ -106,6 +106,9 @@ class QuizRequest(BaseModel):
     difficulty: str = Field(default="medium")
     # Actividades del curso que el usuario puede ver (VIS-01).
     visible_cmids: VisibleCmids = None
+    # DATA-04 (#524): en la opción C las flashcards las guarda Moodle. Con
+    # False el backend las devuelve con su `content_hash` y no las guarda.
+    persist_flashcards: bool = True
 
     @field_validator("question_type")
     @classmethod
@@ -140,6 +143,11 @@ class QuizQuestion(BaseModel):
     # el docente pidió incluir esos temas — texto exacto de FocusTopic.label,
     # o None si la pregunta no cubre ninguno de los temas provistos.
     source_topic: Optional[str] = Field(default=None, max_length=200)
+    # DATA-04 (#524): huella del contenido (flashcards) y actividad de Moodle
+    # de la fuente, para que Moodle guarde la pregunta sin duplicarla y no la
+    # muestre a quien no ve ese material.
+    content_hash: Optional[str] = Field(default=None, max_length=64)
+    source_cmid: Optional[int] = Field(default=None)
 
 
 class QuizResponse(BaseModel):
@@ -286,10 +294,31 @@ class ClearErrorsResponse(BaseModel):
     deleted: int
 
 
+class ProvidedQuizError(BaseModel):
+    """Un error de quiz guardado en Moodle, mandado en el pedido (DATA-04)."""
+
+    id: Optional[str] = Field(default=None, max_length=64)
+    question: str = Field(min_length=1, max_length=1000)
+    explanation: str = Field(default="", max_length=3000)
+    source_filename: Optional[str] = Field(default=None, max_length=255)
+    source_document_id: Optional[str] = Field(default=None, max_length=64)
+    created_at: datetime
+
+
+class ProvidedGap(BaseModel):
+    """Una pregunta sin responder guardada en Moodle (DATA-04)."""
+
+    id: Optional[str] = Field(default=None, max_length=64)
+    question: str = Field(min_length=1, max_length=2000)
+    created_at: datetime
+
+
 class ReviewSuggestionsRequest(BaseModel):
     course_id: int = Field(gt=0)
     user_id: int = Field(gt=0)
     days: int = Field(default=90, ge=1, le=365)
+    # DATA-04: con la lista, el backend no lee su base (opción C).
+    errors: Optional[List[ProvidedQuizError]] = Field(default=None, max_length=300)
 
 
 class ReviewSuggestion(BaseModel):
@@ -380,6 +409,10 @@ class StudyPlanRequest(BaseModel):
     course_id: int = Field(gt=0)
     user_id: int = Field(gt=0)
     days: int = Field(default=30, ge=1, le=365)
+    # DATA-04: con las listas (aunque vengan vacías), el backend no lee su
+    # base; ya vienen filtradas por período y sin lo que descartó el alumno.
+    errors: Optional[List[ProvidedQuizError]] = Field(default=None, max_length=300)
+    gaps: Optional[List[ProvidedGap]] = Field(default=None, max_length=500)
 
 
 class StudyPlanTopic(BaseModel):
@@ -717,17 +750,17 @@ async def _run_quiz_generation(
     # Enriquecer preguntas con el document_id del archivo fuente.
     source_filenames = {q.source_filename for q in questions if q.source_filename}
     if source_filenames:
-        doc_stmt = select(Document.filename, Document.id).where(
+        doc_stmt = select(Document.filename, Document.id, Document.cmid).where(
             Document.course_id == course_id,
             Document.filename.in_(source_filenames),
         )
-        doc_rows = await db.execute(doc_stmt)
-        doc_id_map: dict[str, str] = {
-            row.filename: str(row.id) for row in doc_rows.all()
-        }
+        doc_rows = (await db.execute(doc_stmt)).all()
+        doc_id_map: dict[str, str] = {row.filename: str(row.id) for row in doc_rows}
+        cmid_map = {row.filename: row.cmid for row in doc_rows}
         for q in questions:
             if q.source_filename and q.source_filename in doc_id_map:
                 q.source_document_id = doc_id_map[q.source_filename]
+                q.source_cmid = cmid_map.get(q.source_filename)
 
     return questions
 
@@ -1133,7 +1166,10 @@ async def generate_quiz(
     # a este endpoint (el alumno practicando); /generate-exam no admite
     # question_type='flashcard'.
     if payload.question_type == "flashcard" and questions:
-        await _persist_flashcards(db, payload.course_id, payload.topic, questions)
+        for q in questions:
+            q.content_hash = _flashcard_content_hash(q.question, q.explanation)
+        if payload.persist_flashcards:
+            await _persist_flashcards(db, payload.course_id, payload.topic, questions)
 
     return QuizResponse(
         course_id=payload.course_id,
@@ -1424,16 +1460,20 @@ async def review_suggestions(
     """
     since = datetime.now(timezone.utc) - timedelta(days=payload.days)
 
-    stmt = (
-        select(QuizError)
-        .where(QuizError.course_id == payload.course_id)
-        .where(QuizError.user_id == payload.user_id)
-        .where(QuizError.created_at >= since)
-        .order_by(desc(QuizError.created_at))
-        .limit(300)
-    )
-    result = await db.execute(stmt)
-    rows = result.scalars().all()
+    rows: list[Any]
+    if payload.errors is not None:
+        rows = sorted(payload.errors, key=lambda e: e.created_at, reverse=True)
+    else:
+        stmt = (
+            select(QuizError)
+            .where(QuizError.course_id == payload.course_id)
+            .where(QuizError.user_id == payload.user_id)
+            .where(QuizError.created_at >= since)
+            .order_by(desc(QuizError.created_at))
+            .limit(300)
+        )
+        result = await db.execute(stmt)
+        rows = list(result.scalars().all())
 
     if not rows:
         return ReviewSuggestionsResponse(
@@ -1724,6 +1764,16 @@ async def study_plan(
     """
     since = datetime.now(timezone.utc) - timedelta(days=payload.days)
 
+    if payload.errors is not None or payload.gaps is not None:
+        return await _study_plan_from(
+            payload,
+            llm,
+            quiz_rows=sorted(
+                payload.errors or [], key=lambda e: e.created_at, reverse=True
+            ),
+            top_gap_groups=_group_provided_gaps(payload.gaps or []),
+        )
+
     quiz_stmt = (
         select(QuizError)
         .where(QuizError.course_id == payload.course_id)
@@ -1755,7 +1805,47 @@ async def study_plan(
     )
     gap_rows = (await db.execute(gap_stmt)).all()
 
-    if not quiz_rows and not gap_rows:
+    top_gap_groups = [
+        {
+            "question": row.question,
+            "count": int(row.count),  # type: ignore[call-overload]
+            "ids": [str(i) for i in row.ids],
+        }
+        for row in gap_rows
+    ]
+    return await _study_plan_from(
+        payload, llm, quiz_rows=list(quiz_rows), top_gap_groups=top_gap_groups
+    )
+
+
+def _group_provided_gaps(gaps: List[ProvidedGap]) -> list[dict[str, Any]]:
+    """Agrupa las preguntas sin responder por texto normalizado, igual que la
+    consulta de la base: más repetidas y más recientes primero, hasta 20."""
+    groups: dict[str, dict[str, Any]] = {}
+    for gap in gaps:
+        key = gap.question.strip().lower()
+        g = groups.setdefault(
+            key, {"question": key, "count": 0, "ids": [], "last": gap.created_at}
+        )
+        g["count"] += 1
+        if gap.id:
+            g["ids"].append(gap.id)
+        g["last"] = max(g["last"], gap.created_at)
+    ordered = sorted(
+        groups.values(), key=lambda g: (g["count"], g["last"]), reverse=True
+    )
+    return [{k: g[k] for k in ("question", "count", "ids")} for g in ordered[:20]]
+
+
+async def _study_plan_from(
+    payload: StudyPlanRequest,
+    llm: LLMProvider,
+    *,
+    quiz_rows: list[Any],
+    top_gap_groups: list[dict[str, Any]],
+) -> StudyPlanResponse:
+    """Arma el plan con los errores y los grupos de gaps, vengan de la base o del pedido."""
+    if not quiz_rows and not top_gap_groups:
         return StudyPlanResponse(course_id=payload.course_id, topics=[])
 
     # Agrupar errores de quiz por archivo fuente (idéntico a review_suggestions).
@@ -1766,21 +1856,13 @@ async def study_plan(
             key, {"filename": r.source_filename, "count": 0, "samples": [], "ids": []}
         )
         g["count"] += 1
-        g["ids"].append(str(r.id))
+        if r.id:
+            g["ids"].append(str(r.id))
         if len(g["samples"]) < 3:
             g["samples"].append({"question": r.question, "explanation": r.explanation})
     top_quiz_groups = sorted(
         quiz_groups.values(), key=lambda g: g["count"], reverse=True
     )[:5]
-
-    top_gap_groups = [
-        {
-            "question": row.question,
-            "count": int(row.count),  # type: ignore[call-overload]
-            "ids": [str(i) for i in row.ids],
-        }
-        for row in gap_rows
-    ]
 
     prompt_blocks = []
     for i, g in enumerate(top_quiz_groups):

@@ -242,3 +242,42 @@ async def finalize_token_usage(
             delta,
             window_sec,
         )
+
+
+async def budget_status(
+    user_id: int,
+    is_teacher: bool,
+    redis: redis_async.Redis,
+    hourly_limit: int,
+    daily_limit: int,
+) -> dict | None:
+    """Cuánto le queda al usuario en cada ventana (DATA-04, issue #524).
+
+    Lo usa Moodle para la barra de límite del widget: tokens usados, límite,
+    lo que queda y en cuántos segundos se renueva cada ventana. None si Redis
+    no responde (mismo fail-open que el resto del módulo): el plugin estima
+    con su propio registro.
+    """
+    now = int(time.time())
+    windows = (("hourly", 3600, hourly_limit), ("daily", 86400, daily_limit))
+    try:
+        values = await redis.mget(
+            [_bucket_key(user_id, is_teacher, window) for _, window, _ in windows]
+        )
+    except Exception:
+        logger.error(
+            "No se pudo leer el presupuesto de tokens (Redis no disponible): user_id=%s",
+            user_id,
+        )
+        return None
+
+    status_by_scope: dict = {}
+    for (scope, window, limit), raw in zip(windows, values):
+        used = max(int(raw or 0), 0)
+        status_by_scope[scope] = {
+            "limit": limit,
+            "used": used,
+            "remaining": max(limit - used, 0),
+            "resets_in_sec": window - (now % window),
+        }
+    return status_by_scope

@@ -641,3 +641,36 @@ async def test_index_post_with_same_content_still_updates_forum_and_group(
     assert response.json()["status"] == "skipped"
     assert (existing.cmid, existing.group_id) == (301, 7)
     mock_db.commit.assert_called_once()
+
+
+async def test_weekly_digest_uses_the_webhook_moodle_sends(client, mock_db, mock_llm):
+    """DATA-04 (#524): con `webhook_url` en el pedido no se lee la base."""
+    mock_db.execute.reset_mock()
+    with patch("app.forums.router.httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client_cls.return_value.__aenter__.return_value = mock_client
+
+        response = await client.post(
+            "/api/v1/forums/weekly-digest",
+            json={**_DIGEST_PAYLOAD, "webhook_url": "https://hooks.example/abc"},
+        )
+
+    assert response.status_code == 200
+    mock_client.post.assert_awaited_once_with(
+        "https://hooks.example/abc", json={"text": "Resumen de la semana."}
+    )
+    mock_db.execute.assert_not_called()
+
+
+async def test_weekly_digest_with_empty_webhook_from_moodle_sends_nothing(
+    client, mock_db, mock_llm
+):
+    mock_db.execute.reset_mock()
+    with patch("app.forums.router.httpx.AsyncClient") as mock_client_cls:
+        response = await client.post(
+            "/api/v1/forums/weekly-digest", json={**_DIGEST_PAYLOAD, "webhook_url": ""}
+        )
+
+    assert response.status_code == 200
+    mock_client_cls.assert_not_called()
+    mock_db.execute.assert_not_called()
