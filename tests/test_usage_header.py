@@ -86,3 +86,21 @@ def test_many_calls_are_merged_into_one_entry():
 def test_header_is_ascii():
     value = usage_header_value([{"feature": "chat:ñandú"}])
     value.encode("ascii")
+
+
+def test_ledger_can_stop_storing_the_user():
+    from types import SimpleNamespace
+    from unittest.mock import patch as _patch
+
+    from app.shared.usage_ledger import UsageContext, build_row
+
+    ctx = UsageContext(feature="chat.stream", course_id=3, user_id=7, role="student")
+    record = UsageRecord(kind="llm", prompt_tokens=1)
+    with _patch(
+        "app.shared.usage_ledger.get_settings",
+        return_value=SimpleNamespace(usage_ledger_store_user_id=False),
+    ):
+        row = build_row(record, ctx)
+    assert row["user_id"] is None
+    assert row["course_id"] == 3
+    assert row["role"] == "student"

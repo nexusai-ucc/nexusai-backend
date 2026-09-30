@@ -418,7 +418,9 @@ def build_row(record: UsageRecord, ctx: UsageContext) -> dict[str, Any]:
         "course_id": record.course_id
         if record.course_id is not None
         else ctx.course_id,
-        "user_id": record.user_id if record.user_id is not None else ctx.user_id,
+        "user_id": (record.user_id if record.user_id is not None else ctx.user_id)
+        if get_settings().usage_ledger_store_user_id
+        else None,
         "role": ctx.role,
         "request_id": ctx.request_id,
         "client_id": ctx.client_id,
