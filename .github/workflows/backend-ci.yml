@@ -1,0 +1,170 @@
+name: Backend CI
+
+on:
+  push:
+    branches: [main, development]
+  pull_request:
+
+concurrency:
+  group: backend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-scan:
+    name: pip-audit
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: pip-audit
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt \
+            --ignore-vuln PYSEC-2026-1845 \
+            --ignore-vuln PYSEC-2026-1762 \
+            --ignore-vuln PYSEC-2026-1761 \
+            --ignore-vuln PYSEC-2026-161 \
+            --ignore-vuln PYSEC-2026-248 \
+            --ignore-vuln PYSEC-2026-249 \
+            --ignore-vuln PYSEC-2026-1943 \
+            --ignore-vuln PYSEC-2026-1941 \
+            --ignore-vuln PYSEC-2026-2281 \
+            --ignore-vuln PYSEC-2026-2280
+
+  lint:
+    name: Ruff + mypy
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff mypy
+
+      - name: Ruff check
+        run: ruff check app/ tests/
+
+      - name: Ruff format check
+        run: ruff format --check app/ tests/
+
+      - name: mypy
+        run: mypy app/ --ignore-missing-imports
+
+  test:
+    name: PyTest (Postgres + Redis)
+    runs-on: ubuntu-22.04
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: ci_test_user
+          POSTGRES_PASSWORD: ci_test_only_not_a_secret
+          POSTGRES_DB: ci_test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci_test_user"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      ENV: test
+      DATABASE_URL: postgresql://ci_test_user:ci_test_only_not_a_secret@localhost:5432/ci_test_db
+      REDIS_URL: redis://localhost:6379/0
+      LLM_API_KEY: dummy-ci-value
+      LLM_BASE_URL: https://generativelanguage.googleapis.com/v1beta/openai/
+      LLM_MODEL: gemini-2.0-flash
+      EMBEDDING_API_KEY: dummy-ci-value
+      EMBEDDING_BASE_URL: https://generativelanguage.googleapis.com/v1beta/openai/
+      EMBEDDING_MODEL: models/text-embedding-004
+      EMBEDDING_DIMENSIONS: 768
+      NEXUSAI_SHARED_SECRET: dummy_ci_value_32_chars_long_xx_x
+      NEXUSAI_API_KEY: dummy_ci_value_32_chars_long_xx_x
+      HMAC_REPLAY_WINDOW_SEC: 300
+      RATE_LIMIT_PER_USER_DAILY: 50
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio pytest-cov
+
+      - name: Habilitar extensión pgvector
+        env:
+          PGPASSWORD: ci_test_only_not_a_secret
+        run: psql -h localhost -U ci_test_user -d ci_test_db -c "CREATE EXTENSION IF NOT EXISTS vector;"
+
+      - name: Aplicar migraciones (si existen)
+        env:
+          PGPASSWORD: ci_test_only_not_a_secret
+        run: |
+          if [ -d migrations ]; then
+            for f in migrations/*.sql; do
+              [ -f "$f" ] || continue
+              psql -h localhost -U ci_test_user -d ci_test_db -f "$f"
+            done
+          fi
+
+      - name: PyTest con coverage
+        run: pytest --cov=app --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: coverage.xml
+          retention-days: 7
+
+  docker-build:
+    name: Docker build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (sin push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: nexusai/api:ci-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
