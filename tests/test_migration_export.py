@@ -118,3 +118,48 @@ def test_rows_turn_vectors_into_float_lists():
     )
     gap.embedding = FakeVector()  # type: ignore[assignment]
     assert _row(UnansweredQuestion, gap)["embedding"] == [0.5, 0.25]
+
+
+async def test_flashcards_carry_the_activity_of_their_document(client, mock_db):
+    from app.db.models import Flashcard
+
+    now = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    doc_id = uuid.uuid4()
+    cards = [
+        Flashcard(
+            id=uuid.uuid4(),
+            course_id=1,
+            content_hash="h1",
+            question="q1",
+            explanation="e1",
+            source_document_id=str(doc_id).upper(),
+            created_at=now,
+        ),
+        Flashcard(
+            id=uuid.uuid4(),
+            course_id=1,
+            content_hash="h2",
+            question="q2",
+            explanation="e2",
+            source_document_id="not-a-uuid",
+            created_at=now,
+        ),
+        Flashcard(
+            id=uuid.uuid4(),
+            course_id=1,
+            content_hash="h3",
+            question="q3",
+            explanation="e3",
+            created_at=now,
+        ),
+    ]
+    page = MagicMock()
+    page.scalars.return_value.all.return_value = cards
+    documents = MagicMock()
+    documents.all.return_value = [(doc_id, 42)]
+    mock_db.execute.side_effect = [page, documents]
+
+    with _enabled(True):
+        body = (await client.get("/api/v1/migration/export?table=flashcards")).json()
+
+    assert [r["source_cmid"] for r in body["rows"]] == [42, None, None]

@@ -8,6 +8,8 @@ de estos dos endpoints, firmados con HMAC igual que el resto:
 - `GET /export?table=...&after=...&limit=...`: filas de una tabla, en orden de
   creación, paginadas por cursor. Conserva los ids (UUID) para que Moodle los
   guarde en su columna `uuid` y reconstruya las relaciones.
+  Las flashcards traen además `source_cmid`, la actividad de su documento, para
+  que Moodle aplique la visibilidad del material (VIS-05).
 - `GET /export/summary`: conteos por tabla y sumas de tokens por curso y mes,
   para comparar antes y después de migrar.
 
@@ -32,6 +34,7 @@ from app.auth.hmac import verify_hmac
 from app.db.models import (
     CalendarAlert,
     ChatSession,
+    Document,
     Flashcard,
     FlashcardReview,
     ForumWebhookConfig,
@@ -92,6 +95,31 @@ def _row(model: Any, obj: Any) -> dict[str, Any]:
     return {c.key: _value(getattr(obj, c.key)) for c in model.__table__.columns}
 
 
+def _uuid_key(value: Any) -> Optional[str]:
+    """Un id de documento guardado como texto, en la forma canónica de UUID."""
+    try:
+        return str(uuid.UUID(str(value))) if value else None
+    except ValueError:
+        return None
+
+
+async def _source_cmids(db: AsyncSession, rows: list[Any]) -> dict[str, int]:
+    """Actividad (cmid) del documento de origen de cada flashcard, por id de documento."""
+    ids = {
+        uuid.UUID(key)
+        for key in (_uuid_key(row.source_document_id) for row in rows)
+        if key
+    }
+    if not ids:
+        return {}
+    result = await db.execute(
+        select(Document.id, Document.cmid).where(
+            Document.id.in_(ids), Document.cmid.is_not(None)
+        )
+    )
+    return {str(doc_id): int(cmid) for doc_id, cmid in result.all()}
+
+
 def _encode_cursor(created_at: datetime, row_id: Any) -> str:
     raw = f"{created_at.isoformat()}|{row_id}".encode()
     return base64.urlsafe_b64encode(raw).decode()
@@ -139,9 +167,16 @@ async def export_table(
     rows = list((await db.execute(stmt)).scalars().all())
     has_more = len(rows) > limit
     rows = rows[:limit]
+    out = [_row(model, r) for r in rows]
+    if model is Flashcard:
+        cmids = await _source_cmids(
+            db, [r for r in rows if r.source_document_id is not None]
+        )
+        for item in out:
+            item["source_cmid"] = cmids.get(_uuid_key(item.get("source_document_id")))
     return {
         "table": table,
-        "rows": [_row(model, r) for r in rows],
+        "rows": out,
         "next": _encode_cursor(rows[-1].created_at, rows[-1].id)
         if has_more and rows
         else None,
