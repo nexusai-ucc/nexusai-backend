@@ -173,7 +173,8 @@ async def export_table(
             db, [r for r in rows if r.source_document_id is not None]
         )
         for item in out:
-            item["source_cmid"] = cmids.get(_uuid_key(item.get("source_document_id")))
+            key = _uuid_key(item.get("source_document_id"))
+            item["source_cmid"] = cmids.get(key) if key else None
     return {
         "table": table,
         "rows": out,
