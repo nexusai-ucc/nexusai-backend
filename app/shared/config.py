@@ -58,9 +58,10 @@ class Settings(BaseSettings):
 
     # Resúmenes de documentos (PERF-02) — ver documents/summarizer.py.
     #
-    # summary_cache_ttl_sec: cuánto vive en Redis el resumen ya generado de un
-    #   documento. La cache key incluye el hash/fecha del archivo, así que
-    #   reemplazar un documento (CONT-07) invalida su entrada sola. 0 = sin cache.
+    # summary_cache_ttl_sec: SIN USO desde COST-02 (issue #521): los resúmenes ya
+    #   no vencen a las 24 h en Redis, se guardan en la tabla document_summaries
+    #   hasta que cambie el archivo, el modelo o el prompt. Se conserva el campo
+    #   para no romper los .env que todavía lo traen.
     # summary_max_concurrency: cuántos resúmenes de documento se piden al LLM en
     #   paralelo dentro del resumen pre-parcial. Subirlo acelera cursos con mucho
     #   material, pero contra la cuota gratuita de Gemini aumenta la chance de
@@ -101,6 +102,18 @@ class Settings(BaseSettings):
     # Rate limiting
     rate_limit_per_user_daily: int = 50
     rate_limit_per_user_minute: int = 20
+
+    # Presupuesto de tokens por rol (ver app/shared/token_budget.py).
+    # Complementa rate_limit_per_user_*: ese limita CANTIDAD de requests,
+    # esto limita el COSTO real en tokens — cubre el caso de un usuario que
+    # hace pocas consultas pero muy largas (historial extenso, respuestas
+    # largas) y agotaría presupuesto real sin llegar nunca al límite de
+    # requests. Docentes tienen un techo más alto porque generan quizzes,
+    # exámenes y resúmenes de foro además de chatear.
+    token_budget_student_hourly: int = 8000
+    token_budget_student_daily: int = 40000
+    token_budget_teacher_hourly: int = 20000
+    token_budget_teacher_daily: int = 100000
 
     # Alertas mínimas (ver ADR-012 y app/shared/alerting.py).
     #
@@ -190,6 +203,30 @@ class Settings(BaseSettings):
     moderation_enabled: bool = True
     moderation_api_key: Optional[str] = None
     moderation_fail_open: bool = True
+
+    # Registro de consumo por llamada a proveedor (COST-01, issue #519) —
+    # ver app/shared/usage_ledger.py. usage_ledger_detail_days: cuánto vive
+    # el detalle por llamada antes de que scripts/rollup_llm_usage.py lo
+    # resuma por día (13 meses por default).
+    usage_ledger_enabled: bool = True
+    usage_ledger_detail_days: int = 396
+    # DATA-04 (#524): en la opción C el consumo por persona lo guarda Moodle
+    # (local_nexusai_usage). En el corte se apaga y llm_usage queda sin
+    # user_id: conserva curso, rol e instalación, sin datos personales.
+    usage_ledger_store_user_id: bool = True
+
+    # Visibilidad del material (VIS-01, issue #536) — ver app/shared/visibility.py.
+    #
+    # require_visible_cmids: si un pedido que lee documentos no trae la lista
+    #   `visible_cmids` (las actividades de Moodle que el usuario puede ver), se
+    #   rechaza. Es lo que impide saltear el filtro. Apagarlo solo tiene sentido
+    #   para un despliegue escalonado: sin la lista, el pedido ve todo el curso.
+    require_visible_cmids: bool = True
+
+    # Export temporal de los datos del alumno para migrarlos a Moodle
+    # (DATA-04, issue #524) — ver app/migration/router.py. Apagado por
+    # defecto: se prende solo durante el corte.
+    migration_export_enabled: bool = False
 
     class Config:
         env_file = ".env"

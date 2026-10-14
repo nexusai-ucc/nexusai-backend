@@ -10,6 +10,7 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import InteractionLog
+from app.shared.usage_ledger import UsageRecord, schedule_usage
 
 logger = logging.getLogger("nexusai.analytics")
 
@@ -92,5 +93,16 @@ def log_moderation_block(
                 "categories": categories,
             },
             ensure_ascii=False,
+        )
+    )
+    # Registro de consumo (COST-01): el bloqueo queda como fila con status
+    # "blocked", así se puede contar junto con el resto del uso del curso.
+    schedule_usage(
+        UsageRecord(
+            kind="moderation",
+            status="blocked",
+            feature=endpoint,
+            course_id=course_id,
+            user_id=user_id,
         )
     )
