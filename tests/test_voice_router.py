@@ -122,6 +122,43 @@ async def test_transcribe_rejects_unsupported_mime_type(client):
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize(
+    ("browser_mime", "expected_mime", "expected_filename"),
+    [
+        # Chrome / Edge
+        ("audio/webm;codecs=opus", "audio/webm", "question.webm"),
+        # Firefox
+        ("audio/ogg; codecs=opus", "audio/ogg", "question.ogg"),
+        # Safari
+        ("audio/mp4;codecs=mp4a.40.2", "audio/mp4", "question.mp4"),
+        ("Audio/WebM", "audio/webm", "question.webm"),
+        ("audio/x-m4a", "audio/x-m4a", "question.m4a"),
+    ],
+)
+async def test_transcribe_accepts_mime_type_with_codec_parameters(
+    client, mock_provider, browser_mime, expected_mime, expected_filename
+):
+    """MediaRecorder reports the codec as a MIME parameter (#314): it must be accepted."""
+    response = await client.post(
+        "/api/v1/voice/transcribe",
+        json={"content_b64": _AUDIO_B64, "mime_type": browser_mime},
+    )
+
+    assert response.status_code == 200
+    kwargs = mock_provider.transcribe.await_args.kwargs
+    assert kwargs["mime_type"] == expected_mime
+    assert kwargs["filename"] == expected_filename
+
+
+async def test_transcribe_rejects_unsupported_mime_type_with_parameters(client):
+    response = await client.post(
+        "/api/v1/voice/transcribe",
+        json={"content_b64": _AUDIO_B64, "mime_type": "video/webm;codecs=vp8"},
+    )
+
+    assert response.status_code == 422
+
+
 async def test_transcribe_rejects_audio_too_large(client):
     huge = base64.b64encode(b"x" * (10 * 1024 * 1024 + 1)).decode()
 
