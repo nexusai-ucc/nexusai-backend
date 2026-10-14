@@ -21,6 +21,7 @@ import logging
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from openai import BadRequestError
 from pydantic import BaseModel, Field
 
 from app.auth.hmac import verify_hmac
@@ -124,6 +125,14 @@ async def transcribe(
             mime_type=mime_type,
             language=payload.language,
         )
+    except BadRequestError as exc:
+        # Groq rechazó el audio en sí (demasiado corto, ilegible): es un error
+        # del pedido, no una caída — un 503 acá sumaría a la alerta de 5xx.
+        _logger.info("VOICE-01: Groq rechazó el audio: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="El audio no se pudo procesar (¿demasiado corto?)",
+        ) from exc
     except Exception as exc:
         _logger.warning("VOICE-01: fallo al transcribir audio", exc_info=True)
         raise HTTPException(

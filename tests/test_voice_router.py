@@ -209,3 +209,25 @@ async def test_provider_omits_language_when_not_given():
     await provider.transcribe(b"audio", "q.webm", "audio/webm", language="en")
     _, kwargs = provider.client.audio.transcriptions.create.call_args
     assert kwargs["language"] == "en"
+
+
+async def test_transcribe_maps_provider_bad_request_to_422(client, mock_provider):
+    """Groq rejecting the audio itself (too short) is a client error, not a 5xx."""
+    import httpx
+    from openai import BadRequestError
+
+    request = httpx.Request(
+        "POST", "https://api.groq.com/openai/v1/audio/transcriptions"
+    )
+    mock_provider.transcribe.side_effect = BadRequestError(
+        "Audio file is too short",
+        response=httpx.Response(400, request=request),
+        body=None,
+    )
+
+    response = await client.post(
+        "/api/v1/voice/transcribe",
+        json={"content_b64": _AUDIO_B64, "mime_type": "audio/webm"},
+    )
+
+    assert response.status_code == 422
