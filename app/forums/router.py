@@ -44,7 +44,7 @@ from typing import Annotated, List, Optional
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Path, Request, status
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -56,6 +56,7 @@ from app.documents.retriever import format_context_for_prompt, retrieve_context
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
 from app.shared.moderation import moderate_text
+from app.shared.visibility import VisibleCmids, enforce_visible_cmids
 from app.shared.language import resolve_language, ui_language, with_language_directive
 
 _logger = logging.getLogger(__name__)
@@ -76,6 +77,10 @@ class IndexPostRequest(BaseModel):
     discussion_id: int = Field(gt=0, description="ID de mdl_forum_discussions")
     course_id: int = Field(gt=0)
     content: str = Field(min_length=1, max_length=10_000)
+    # Foro del que sale el post y grupo de su discusión (VIS-06): definen quién
+    # puede verlo. Sin group_id, la discusión es para todos los participantes.
+    cmid: Optional[int] = Field(default=None, gt=0)
+    group_id: Optional[int] = Field(default=None, gt=0)
 
 
 class IndexPostResponse(BaseModel):
@@ -99,6 +104,14 @@ class SimilarPostsRequest(BaseModel):
         description="Similitud mínima para considerar duplicado",
     )
     top_k: int = Field(default=_DEFAULT_TOP_K, ge=1, le=10)
+    # Foros que el usuario puede ver y sus grupos, calculados por el plugin
+    # (VIS-06). Un post se muestra si su foro está entre los visibles y su
+    # discusión no tiene grupo o es de un grupo del usuario. all_groups es para
+    # quien puede ver todos los grupos (moodle/site:accessallgroups); por defecto
+    # se restringe.
+    visible_cmids: VisibleCmids = None
+    group_ids: List[int] = Field(default_factory=list, max_length=1000)
+    all_groups: bool = False
 
 
 class SimilarPost(BaseModel):
@@ -153,6 +166,12 @@ async def index_post(
     existing = result.scalar_one_or_none()
 
     if existing is not None and existing.content_hash == content_hash:
+        # Mismo contenido: no se vuelve a pagar el embedding, pero sí se
+        # actualiza el foro y el grupo (se pudo mover la discusión).
+        if existing.cmid != payload.cmid or existing.group_id != payload.group_id:
+            existing.cmid = payload.cmid
+            existing.group_id = payload.group_id
+            await db.commit()
         return IndexPostResponse(post_id=payload.post_id, status="skipped")
 
     try:
@@ -169,12 +188,16 @@ async def index_post(
             forum_post_id=payload.post_id,
             discussion_id=payload.discussion_id,
             course_id=payload.course_id,
+            cmid=payload.cmid,
+            group_id=payload.group_id,
             content_hash=content_hash,
             content=payload.content,
             embedding=vector,
         )
         db.add(record)
     else:
+        existing.cmid = payload.cmid
+        existing.group_id = payload.group_id
         existing.content_hash = content_hash
         existing.content = payload.content
         existing.embedding = vector
@@ -210,6 +233,10 @@ async def similar_posts(
     Usa similitud coseno sobre pgvector. Solo busca dentro del mismo curso.
     Devuelve lista vacía si no hay nada por encima del threshold.
     """
+    visible_cmids = enforce_visible_cmids(payload.visible_cmids)
+    if visible_cmids is not None and not visible_cmids:
+        return SimilarPostsResponse(similar_posts=[], threshold_used=payload.threshold)
+
     try:
         vector = await embeddings.embed(payload.text)
     except Exception as exc:
@@ -238,6 +265,16 @@ async def similar_posts(
     )
     if payload.exclude_post_id is not None:
         stmt = stmt.where(ForumPostEmbedding.forum_post_id != payload.exclude_post_id)
+    if visible_cmids is not None:
+        # VIS-06: solo foros visibles; sin cmid no se sabe de qué foro sale.
+        stmt = stmt.where(ForumPostEmbedding.cmid.in_(visible_cmids))
+        if not payload.all_groups:
+            stmt = stmt.where(
+                or_(
+                    ForumPostEmbedding.group_id.is_(None),
+                    ForumPostEmbedding.group_id.in_(payload.group_ids or [0]),
+                )
+            )
 
     try:
         result = await db.execute(stmt)
@@ -428,6 +465,8 @@ class SuggestReplyRequest(BaseModel):
         max_length=_MAX_CHARS_QUESTION,
         description="Texto del post al que se responde (para RAG y contexto del LLM)",
     )
+    # Actividades del curso que puede ver quien pide la sugerencia (VIS-01).
+    visible_cmids: VisibleCmids = None
 
 
 class SuggestReplyResponse(BaseModel):
@@ -518,11 +557,14 @@ async def suggest_reply(
             status_code=status.HTTP_400_BAD_REQUEST, detail=moderation.blocked_message
         )
 
+    visible_cmids = enforce_visible_cmids(payload.visible_cmids)
+
     # 1. RAG: buscar material del curso relevante a la pregunta.
     try:
         chunks = await retrieve_context(
             question=payload.question,
             course_id=payload.course_id,
+            visible_cmids=visible_cmids,
             db=db,
             embeddings=embeddings,
             top_k=_MAX_CONTEXT_CHUNKS,
@@ -666,6 +708,10 @@ class WeeklyDigestRequest(BaseModel):
     discussions: List[DigestDiscussion] = Field(
         default_factory=list, max_length=_MAX_DISCUSSIONS_IN_DIGEST
     )
+    # DATA-04 (#524): en la opción C la URL del webhook del curso vive en
+    # Moodle, que la manda acá ("" = sin webhook). Sin el campo se busca en la
+    # tabla del backend, como antes.
+    webhook_url: Optional[str] = Field(default=None, max_length=2000)
 
 
 class DigestDiscussionResult(BaseModel):
@@ -775,7 +821,9 @@ async def weekly_digest(
     # FOR-07 (#378): si el docente configuró un webhook para este curso,
     # reenviar el resumen ahí además de mostrarlo en el panel. Un fallo acá
     # NUNCA debe romper la respuesta al frontend — se loguea y se ignora.
-    await _notify_webhook_if_configured(db, payload.course_id, summary)
+    await _notify_webhook_if_configured(
+        db, payload.course_id, summary, webhook_url=payload.webhook_url
+    )
 
     return WeeklyDigestResponse(
         course_id=payload.course_id,
@@ -816,18 +864,22 @@ class WebhookConfigGetResponse(BaseModel):
 
 
 async def _notify_webhook_if_configured(
-    db: AsyncSession, course_id: int, summary: Optional[str]
+    db: AsyncSession,
+    course_id: int,
+    summary: Optional[str],
+    webhook_url: Optional[str] = None,
 ) -> None:
     if not summary:
         return  # nada que notificar (mismo criterio que "sin discusiones, sin LLM")
 
-    row = await db.execute(
-        select(ForumWebhookConfig.webhook_url).where(
-            ForumWebhookConfig.course_id == course_id
+    if webhook_url is None:
+        row = await db.execute(
+            select(ForumWebhookConfig.webhook_url).where(
+                ForumWebhookConfig.course_id == course_id
+            )
         )
-    )
-    webhook_url = row.scalar_one_or_none()
-    if not webhook_url:
+        webhook_url = row.scalar_one_or_none()
+    if not webhook_url or not _re.match(r"^https?://", webhook_url):
         return
 
     try:

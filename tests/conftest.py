@@ -41,6 +41,10 @@ os.environ.setdefault("RATE_LIMIT_PER_USER_DAILY", "50")
 # ejercitan) — test_moderation.py la habilita explícitamente vía
 # app.dependency_overrides / monkeypatch de get_settings donde corresponde.
 os.environ.setdefault("MODERATION_ENABLED", "false")
+# Registro de consumo (COST-01) apagado por default: los tests existentes usan
+# SDKs mockeados y no tienen por qué depender de una base para correr.
+# test_usage_ledger.py lo prende y reemplaza la escritura.
+os.environ.setdefault("USAGE_LEDGER_ENABLED", "false")
 
 
 # ============================================================

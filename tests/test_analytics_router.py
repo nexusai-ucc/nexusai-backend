@@ -180,3 +180,30 @@ async def test_llm_call_failure_returns_503(client, mock_llm):
     response = await client.post("/api/v1/analytics/faq-topics", json=_BASE_PAYLOAD)
 
     assert response.status_code == 503
+
+
+async def test_faq_topics_with_questions_from_moodle_does_not_read_the_database(
+    client, mock_db, mock_llm
+):
+    """DATA-04 (#524): Moodle manda las preguntas del período ya agrupadas."""
+    mock_llm.chat_completion.return_value = _llm_response(
+        {"topics": [{"label": "Bayes", "question_indices": [0, 1]}]}
+    )
+    mock_db.execute.reset_mock()
+
+    response = await client.post(
+        "/api/v1/analytics/faq-topics",
+        json={
+            **_BASE_PAYLOAD,
+            "questions": [
+                {"question": "¿Qué es Bayes?", "count": 2},
+                {"question": "Teorema de Bayes", "count": 5},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_questions"] == 7
+    assert body["topics"][0]["count"] == 7
+    mock_db.execute.assert_not_called()

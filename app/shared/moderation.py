@@ -51,6 +51,7 @@ import httpx
 from app.providers.llm import LLMProvider
 from app.shared.config import get_settings
 from app.shared.language import detect_language
+from app.shared.usage_ledger import usage_scope
 
 logger = logging.getLogger("nexusai.moderation")
 
@@ -118,6 +119,13 @@ class ModerationResult:
     )
     categories: list[str] = field(default_factory=list)
     blocked_message: Optional[str] = None
+    # Tokens reales facturados por ESTA llamada de moderación — solo > 0
+    # cuando source="llm_fallback" (el único camino que pasa por el LLM
+    # principal; la Moderation API de OpenAI es un endpoint aparte, no
+    # consume del presupuesto de tokens del LLM). El caller (chat/router.py)
+    # lo suma al presupuesto de tokens del usuario vía finalize_token_usage
+    # — antes de este campo, ese costo real nunca quedaba contabilizado.
+    tokens_used: int = 0
 
 
 def _allowed(source: str) -> ModerationResult:
@@ -222,12 +230,14 @@ async def _moderate_via_llm(text: str, llm: LLMProvider) -> ModerationResult:
         {"role": "system", "content": _CLASSIFIER_SYSTEM_PROMPT},
         {"role": "user", "content": text[:_LLM_CLASSIFIER_MAX_CHARS]},
     ]
-    result = await llm.chat_completion(
-        messages,
-        response_format={"type": "json_object"},
-        temperature=0.0,
-        reasoning_effort="none",
-    )
+    with usage_scope("moderation"):
+        result = await llm.chat_completion(
+            messages,
+            response_format={"type": "json_object"},
+            temperature=0.0,
+            reasoning_effort="none",
+        )
+    tokens_used = result.total_tokens
 
     raw = result.text.strip()
     if raw.startswith("```"):
@@ -244,9 +254,11 @@ async def _moderate_via_llm(text: str, llm: LLMProvider) -> ModerationResult:
 
     parsed = json.loads(raw)
     if not parsed.get("flagged", False):
-        return _allowed("llm_fallback")
+        return replace(_allowed("llm_fallback"), tokens_used=tokens_used)
 
     categories = parsed.get("categories") or []
     if not isinstance(categories, list):
         categories = []
-    return _blocked("llm_fallback", [str(c) for c in categories])
+    return replace(
+        _blocked("llm_fallback", [str(c) for c in categories]), tokens_used=tokens_used
+    )

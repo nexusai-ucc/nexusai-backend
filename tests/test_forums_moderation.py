@@ -24,6 +24,7 @@ _SUGGEST_PAYLOAD = {
     "course_id": 1,
     "posts": [{"post_id": 1, "author": "Alumno 1", "content": "¿Cómo resuelvo esto?"}],
     "question": "¿Cómo resuelvo esto?",
+    "visible_cmids": [101],
 }
 
 
@@ -128,6 +129,7 @@ async def test_suggest_reply_blocks_flagged_content_in_thread_posts(
     payload = {
         "discussion_id": 1,
         "course_id": 1,
+        "visible_cmids": [101],
         "posts": [
             {
                 "post_id": 1,

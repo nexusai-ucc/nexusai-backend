@@ -34,7 +34,6 @@ from pathlib import Path
 from typing import Annotated, Optional
 from uuid import UUID
 
-import redis.asyncio as redis_async
 from fastapi import (
     APIRouter,
     Depends,
@@ -55,11 +54,11 @@ from app.db.session import get_db, get_session_factory
 from app.documents.extractor import SUPPORTED_MIME_TYPES
 from app.documents.pipeline import index_document
 from app.documents.summarizer import summarize_document, summarize_pre_exam
-from app.infrastructure.redis_client import get_redis
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
 from app.shared.language import localized, resolve_language
 from app.shared.retry import async_retry
+from app.shared.visibility import VisibleCmids, enforce_visible_cmids
 
 logger = logging.getLogger("nexusai.documents")
 
@@ -109,6 +108,15 @@ class DocumentUploadRequest(BaseModel):
     section: Optional[int] = Field(
         default=None, ge=0, description="Número de sección/unidad del curso (BUS-05)"
     )
+    cmid: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Actividad de Moodle de la que sale el documento (VIS-01). Define "
+            "quién puede ver su contenido en las respuestas; sin cmid no se "
+            "usa en ninguna."
+        ),
+    )
 
 
 class DocumentOut(BaseModel):
@@ -120,6 +128,10 @@ class DocumentOut(BaseModel):
     filename: str
     mime_type: str
     section: Optional[int] = None
+    cmid: Optional[int] = None
+    # Huella del contenido subido (sha256 del base64 que mandó el plugin): el
+    # plugin la compara para saber si el archivo de una actividad cambió (VIS-04).
+    file_hash: Optional[str] = None
     status: str  # pending | indexing | indexed | error
     error_message: Optional[str] = None
     created_at: Optional[datetime] = None
@@ -134,6 +146,8 @@ class DocumentOut(BaseModel):
             filename=doc.filename,
             mime_type=doc.mime_type,
             section=doc.section,
+            cmid=doc.cmid,
+            file_hash=doc.file_hash,
             status=doc.status,
             error_message=doc.error_message,
             created_at=doc.created_at,
@@ -335,8 +349,16 @@ async def upload_document(
     )
     existing = existing_result.scalar_one_or_none()
     if existing is not None:
-        response.status_code = status.HTTP_200_OK
-        return DocumentOut.from_orm(existing)
+        # VIS-01: un documento que ya estaba indexado sin actividad adopta la
+        # que llega ahora. Si ya tiene otra, no se le cambia: se sigue con la
+        # colisión de nombre de abajo.
+        if existing.cmid is None and payload.cmid is not None:
+            existing.cmid = payload.cmid
+            await db.commit()
+            await db.refresh(existing)
+        if existing.cmid is None or existing.cmid == payload.cmid:
+            response.status_code = status.HTTP_200_OK
+            return DocumentOut.from_orm(existing)
 
     # Detectar colisión de nombre: mismo course_id + filename, estado activo.
     # Se excluye 'error' porque un intento fallido no debe bloquear re-subida.
@@ -365,6 +387,7 @@ async def upload_document(
         filename=payload.filename,
         mime_type=payload.mime_type,
         section=payload.section,
+        cmid=payload.cmid,
         status="pending",
         file_hash=file_hash,
     )
@@ -579,6 +602,7 @@ async def list_documents_by_course(
     db: AsyncSession = Depends(get_db),
     limit: Optional[int] = Query(default=None, ge=1, le=_DEFAULT_LIST_LIMIT),
     offset: int = Query(default=0, ge=0),
+    cmid: Optional[int] = Query(default=None, gt=0),
 ) -> DocumentListResponse:
     """Lista los documentos de un curso. Para la tabla en la vista docente.
 
@@ -586,6 +610,10 @@ async def list_documents_by_course(
     ExamGeneratorPanel.jsx, que necesita elegir entre todos los documentos
     indexados, no una página), se devuelve hasta `_DEFAULT_LIST_LIMIT`. La
     tabla de materiales sí manda `limit`/`offset` explícitos para paginar.
+
+    VIS-04 (#539): con `cmid` solo devuelve los documentos de esa actividad de
+    Moodle; el plugin lo usa para saber qué documento borrar o reindexar cuando
+    la actividad se borra o cambia.
     """
     if course_id <= 0:
         raise HTTPException(
@@ -594,15 +622,15 @@ async def list_documents_by_course(
 
     effective_limit = limit if limit is not None else _DEFAULT_LIST_LIMIT
 
-    total = await db.scalar(
-        select(func.count())
-        .select_from(Document)
-        .where(Document.course_id == course_id)
-    )
+    filters = [Document.course_id == course_id]
+    if cmid is not None:
+        filters.append(Document.cmid == cmid)
+
+    total = await db.scalar(select(func.count()).select_from(Document).where(*filters))
 
     result = await db.execute(
         select(Document)
-        .where(Document.course_id == course_id)
+        .where(*filters)
         .order_by(Document.created_at.desc())
         .offset(offset)
         .limit(effective_limit)
@@ -717,6 +745,7 @@ class SummarizeRequest(BaseModel):
     document_id: UUID
     course_id: int = Field(gt=0)
     user_id: int = Field(gt=0)
+    visible_cmids: VisibleCmids = None
 
 
 class SummarizeResponse(BaseModel):
@@ -733,23 +762,24 @@ async def summarize_document_endpoint(
     _body: Annotated[bytes, Depends(verify_hmac)],
     db: AsyncSession = Depends(get_db),
     llm: LLMProvider = Depends(get_llm_provider),
-    redis: redis_async.Redis = Depends(get_redis),
 ) -> SummarizeResponse:
     """Genera un resumen del documento usando el LLM (BUS-03).
 
     Recupera todos los chunks del documento en orden y los envía al LLM.
     El documento debe pertenecer al course_id recibido (aislamiento multi-curso).
 
-    PERF-02: el resultado se cachea en Redis por versión del archivo, así que
-    volver a pedir el resumen del mismo documento es instantáneo.
+    COST-02: el resumen se guarda hasta que cambie el archivo, el modelo o el
+    prompt, así que volver a pedirlo (cualquier alumno, cualquier día) no
+    vuelve a gastar tokens.
     """
+    visible_cmids = enforce_visible_cmids(payload.visible_cmids)
     try:
         result = await summarize_document(
             document_id=payload.document_id,
             course_id=payload.course_id,
             db=db,
             llm=llm,
-            cache=redis,
+            visible_cmids=visible_cmids,
         )
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
@@ -766,6 +796,7 @@ class PreExamSummaryRequest(BaseModel):
     course_id: int = Field(gt=0)
     user_id: int = Field(gt=0)
     section: Optional[int] = Field(default=None)
+    visible_cmids: VisibleCmids = None
 
 
 class DocumentUsed(BaseModel):
@@ -785,7 +816,6 @@ async def pre_exam_summary_endpoint(
     _body: Annotated[bytes, Depends(verify_hmac)],
     db: AsyncSession = Depends(get_db),
     llm: LLMProvider = Depends(get_llm_provider),
-    redis: redis_async.Redis = Depends(get_redis),
 ) -> PreExamSummaryResponse:
     """Resumen de repaso combinando todo el material indexado relevante para
     un próximo examen (BUS-04). Opcionalmente acotado a una unidad/sección.
@@ -794,16 +824,19 @@ async def pre_exam_summary_endpoint(
     documentos indexados (para el curso o la sección elegida), devuelve
     summary="" sin llamar al LLM.
 
-    PERF-02: los resúmenes por documento se piden en paralelo y se cachean en
-    Redis, así que el segundo pedido del mismo curso solo paga la síntesis.
+    PERF-02: los resúmenes por documento se piden en paralelo.
+    COST-02: se guardan hasta que cambie el material, el modelo o el prompt:
+    el mismo repaso pedido de nuevo (por cualquier alumno) no gasta tokens, y
+    si cambió un documento solo se vuelve a resumir ese.
     """
+    visible_cmids = enforce_visible_cmids(payload.visible_cmids)
     try:
         result = await summarize_pre_exam(
             course_id=payload.course_id,
             db=db,
             llm=llm,
             section=payload.section,
-            cache=redis,
+            visible_cmids=visible_cmids,
         )
     except RuntimeError as exc:
         raise HTTPException(
