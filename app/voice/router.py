@@ -21,6 +21,7 @@ import logging
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from openai import BadRequestError
 from pydantic import BaseModel, Field
 
 from app.auth.hmac import verify_hmac
@@ -48,6 +49,21 @@ SUPPORTED_AUDIO_MIME_TYPES = {
 }
 
 
+# Extensión del archivo que recibe Whisper: Groq deduce el formato por la
+# extensión, y "x-m4a" (el subtipo tal cual) no es una que acepte.
+_EXTENSION_BY_MIME_TYPE = {"audio/x-m4a": "m4a"}
+
+
+def _normalize_mime_type(mime_type: str) -> str:
+    """Tipo base en minúsculas, sin parámetros.
+
+    MediaRecorder informa el codec como parámetro ("audio/webm;codecs=opus" en
+    Chrome/Edge, "audio/ogg;codecs=opus" en Firefox): comparar el string
+    entero contra SUPPORTED_AUDIO_MIME_TYPES rechazaba toda grabación real.
+    """
+    return mime_type.split(";", 1)[0].strip().lower()
+
+
 class TranscribeRequest(BaseModel):
     content_b64: str = Field(min_length=1)
     mime_type: str = Field(min_length=1, max_length=100)
@@ -72,7 +88,8 @@ async def transcribe(
             detail="Transcripción de voz no configurada",
         )
 
-    if payload.mime_type not in SUPPORTED_AUDIO_MIME_TYPES:
+    mime_type = _normalize_mime_type(payload.mime_type)
+    if mime_type not in SUPPORTED_AUDIO_MIME_TYPES:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
@@ -100,14 +117,22 @@ async def transcribe(
             detail=f"Audio too large: {len(audio_bytes)} bytes (max {MAX_AUDIO_BYTES})",
         )
 
-    ext = payload.mime_type.split("/")[-1]
+    ext = _EXTENSION_BY_MIME_TYPE.get(mime_type, mime_type.split("/")[-1])
     try:
         text = await provider.transcribe(
             audio_bytes,
             filename=f"question.{ext}",
-            mime_type=payload.mime_type,
+            mime_type=mime_type,
             language=payload.language,
         )
+    except BadRequestError as exc:
+        # Groq rechazó el audio en sí (demasiado corto, ilegible): es un error
+        # del pedido, no una caída — un 503 acá sumaría a la alerta de 5xx.
+        _logger.info("VOICE-01: Groq rechazó el audio: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="El audio no se pudo procesar (¿demasiado corto?)",
+        ) from exc
     except Exception as exc:
         _logger.warning("VOICE-01: fallo al transcribir audio", exc_info=True)
         raise HTTPException(

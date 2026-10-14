@@ -57,6 +57,7 @@ async def retrieve_context(
     top_k: int = 5,
     min_similarity: float = 0.3,
     course_ids: list[int] | None = None,
+    visible_cmids: list[int] | None = None,
 ) -> List[RetrievedChunk]:
     """Devuelve los top_k chunks más similares a la pregunta, filtrados por curso.
 
@@ -71,6 +72,11 @@ async def retrieve_context(
         min_similarity: filtra resultados con similitud baja. 0.3 deja pasar
                         chunks "razonablemente" relacionados; subir a 0.5 si
                         querés solo hits muy buenos.
+        visible_cmids: actividades de Moodle que el usuario puede ver (VIS-01,
+                       ver app/shared/visibility.py). Solo se usan documentos
+                       cuyo `cmid` está en la lista; los que no tienen `cmid`
+                       quedan afuera. None = sin filtro (uso interno; los
+                       routers exigen la lista con enforce_visible_cmids).
 
     Returns:
         Lista de RetrievedChunk ordenada por similitud descendente. Vacía si
@@ -90,6 +96,9 @@ async def retrieve_context(
     ids_to_query = course_ids if course_ids else [course_id]
     ids_to_query = [i for i in ids_to_query if i > 0]
     if not ids_to_query:
+        return []
+
+    if visible_cmids is not None and not visible_cmids:
         return []
 
     # 1. Vectorizar la pregunta.
@@ -115,6 +124,8 @@ async def retrieve_context(
         .order_by("distance")
         .limit(top_k)
     )
+    if visible_cmids is not None:
+        stmt = stmt.where(Document.cmid.in_(visible_cmids))
 
     result = await db.execute(stmt)
     rows = result.all()

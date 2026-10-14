@@ -140,7 +140,7 @@ async def test_quiz_generation_leaves_spanish_material_alone(mock_llm):
     assert "IMPORTANT: write your entire answer" not in messages[-1]["content"]
 
 
-def test_summary_cache_key_changes_with_the_prompt_version():
+def test_summary_key_changes_with_the_prompt_version(monkeypatch):
     """Old Spanish summaries of English documents must not be served after the fix."""
     from datetime import datetime, timezone
     from types import SimpleNamespace
@@ -151,9 +151,10 @@ def test_summary_cache_key_changes_with_the_prompt_version():
         id="doc-1", file_hash="abc", updated_at=datetime.now(timezone.utc)
     )
 
-    key = summarizer._cache_key(document, "model-x")
+    key = summarizer._summary_key(document, "model-x")
+    monkeypatch.setattr(summarizer, "_PROMPT_VERSION", "p-next")
 
-    assert summarizer._PROMPT_VERSION in key
+    assert summarizer._summary_key(document, "model-x") != key
 
 
 async def test_thread_summary_uses_the_interface_language_for_very_short_posts(
