@@ -462,10 +462,12 @@ async def _persist(
     row: dict[str, Any], record: UsageRecord, summary: Optional[dict[str, Any]] = None
 ) -> None:
     from app.db.models import LlmUsage
-    from app.db.session import get_session_factory
+
+    # Pool propio, no el de los requests: ver get_ledger_session_factory (DEF-09).
+    from app.db.session import get_ledger_session_factory
 
     missing_price: Optional[tuple[str, str]] = None
-    async with get_session_factory()() as session:
+    async with get_ledger_session_factory()() as session:
         cost: Optional[Decimal] = Decimal(0)
         if not _consumed_nothing(record):
             price = None

@@ -210,6 +210,12 @@ class Settings(BaseSettings):
     # resuma por día (13 meses por default).
     usage_ledger_enabled: bool = True
     usage_ledger_detail_days: int = 396
+    # Pool de conexiones PROPIO del registro (DEF-09, ver app/db/session.py):
+    # el registro se escribe dentro del request, así que no puede esperar una
+    # conexión del mismo pool que el request ya tiene ocupado.
+    usage_ledger_pool_size: int = 2
+    usage_ledger_max_overflow: int = 3
+    usage_ledger_pool_timeout_sec: float = 5.0
     # DATA-04 (#524): en la opción C el consumo por persona lo guarda Moodle
     # (local_nexusai_usage). En el corte se apaga y llm_usage queda sin
     # user_id: conserva curso, rol e instalación, sin datos personales.

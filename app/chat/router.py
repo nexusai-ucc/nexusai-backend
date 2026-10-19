@@ -486,6 +486,12 @@ async def messages(
         llm_messages, payload.question, fallback=ui_language(request)
     )
 
+    # DEF-09: cerrar la transacción de lectura (retrieval/historial) antes del
+    # LLM. Si no, la conexión queda "idle in transaction" los segundos que tarda
+    # el modelo y, con varios chats en vuelo, el pool se agota. No escribe nada:
+    # lo pendiente ya se comiteó arriba, y lo de después toma otra conexión.
+    await db.commit()
+
     # ----- BACK-11: Llamada al LLM (con retry interno en LLMProvider) -----
     llm_start = time.perf_counter()
     try:
@@ -934,6 +940,10 @@ async def messages_stream(
                 llm_messages = with_language_directive(
                     llm_messages, payload.question, fallback=ui_language(request)
                 )
+
+                # DEF-09: no retener la conexión mientras el LLM escribe
+                # (ver /messages).
+                await db.commit()
 
                 # Stream del LLM.
                 full_text_parts: list[str] = []
