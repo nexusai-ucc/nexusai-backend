@@ -448,6 +448,28 @@ async def test_embed_many_preserves_order():
 
 
 @pytest.mark.asyncio
+async def test_embed_many_keeps_response_order_when_the_provider_omits_index():
+    """DEF-07: Gemini devuelve index=None; antes `sorted` rompía con TypeError."""
+    # Arrange.
+    provider = EmbeddingProvider()
+    response = MagicMock()
+    items = []
+    for value in (0.1, 0.2):
+        item = MagicMock()
+        item.index = None
+        item.embedding = [value] * 768
+        items.append(item)
+    response.data = items
+    provider.client.embeddings.create = AsyncMock(return_value=response)
+
+    # Act.
+    vectors = await provider.embed_many(["a", "b"])
+
+    # Assert.
+    assert [v[0] for v in vectors] == [pytest.approx(0.1), pytest.approx(0.2)]
+
+
+@pytest.mark.asyncio
 async def test_embed_many_rejects_empty_list():
     provider = EmbeddingProvider()
     with pytest.raises(ValueError, match="empty list"):
