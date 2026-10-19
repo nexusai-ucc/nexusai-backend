@@ -1077,9 +1077,12 @@ async def generate_quiz(
         if max_sim < QUIZ_TOPIC_MIN_SIMILARITY:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=(
-                    "No encontré material sobre ese tema en el curso. "
-                    "Intentá con un tema que esté cubierto en los archivos indexados."
+                detail=localized(
+                    resolve_language(request, topic),
+                    f"No encontré material sobre '{topic}' en los archivos del curso. "
+                    "Intentá con un tema que esté cubierto en los archivos indexados.",
+                    f"I couldn't find material about '{topic}' in the course files. "
+                    "Try a topic that is covered in the indexed files.",
                 ),
             )
 

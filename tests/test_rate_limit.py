@@ -71,7 +71,10 @@ def fake_redis_counter() -> FakeRedis:
 
 
 async def test_permite_hasta_el_limite_diario(fake_redis_counter: FakeRedis) -> None:
-    """Las primeras `limit` consultas del día pasan sin lanzar excepción."""
+    """Las primeras `limit` consultas del día pasan sin lanzar excepción.
+
+    Caso CP-CHAT-24 (VL n) de docs/calidad/CASOS_DE_PRUEBA.md.
+    """
     for _ in range(50):
         await check_rate_limit(
             user_id=1,
@@ -86,7 +89,10 @@ async def test_permite_hasta_el_limite_diario(fake_redis_counter: FakeRedis) -> 
 async def test_bloquea_al_superar_el_limite_diario(
     fake_redis_counter: FakeRedis,
 ) -> None:
-    """La consulta número 51 (con limit=50) debe devolver 429 con scope=daily."""
+    """La consulta número 51 (con limit=50) debe devolver 429 con scope=daily.
+
+    Caso CP-CHAT-25 (VL n+1) de docs/calidad/CASOS_DE_PRUEBA.md.
+    """
     for _ in range(50):
         await check_rate_limit(
             user_id=1,
@@ -226,6 +232,8 @@ async def test_falla_abierto_cuando_redis_no_responde() -> None:
     un control de seguridad crítico. Fail-open a propósito (ver comentario
     en rate_limit.py), mismo criterio que moderation.py y alerting.py para
     dependencias auxiliares no críticas.
+
+    Caso CP-CHAT-26 (CE) de docs/calidad/CASOS_DE_PRUEBA.md.
     """
     # No debe lanzar HTTPException ni ninguna otra excepción — simplemente
     # deja pasar el request como si no hubiera superado el límite.

@@ -20,11 +20,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 
 from app.auth.hmac import verify_hmac
 from app.db.session import get_db
+from app.documents.router import MAX_UPLOAD_BYTES, _decode_and_validate_file
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 
 # ============================================================
@@ -133,12 +134,14 @@ def _no_bg_task():
 
 
 async def test_upload_rejects_unsupported_mime_type(client):
+    """Caso CP-DOC-01 (TD R1) de docs/calidad/CASOS_DE_PRUEBA.md."""
     payload = {**_BASE_PAYLOAD, "mime_type": "image/png"}
     response = await client.post("/api/v1/documents", json=payload)
     assert response.status_code == 415
 
 
 async def test_upload_rejects_invalid_base64(client):
+    """Caso CP-DOC-08 (TD R7) de docs/calidad/CASOS_DE_PRUEBA.md."""
     payload = {**_BASE_PAYLOAD, "content_b64": "!!!esto-no-es-base64!!!"}
     response = await client.post("/api/v1/documents", json=payload)
     assert response.status_code == 400
@@ -151,7 +154,10 @@ async def test_upload_rejects_invalid_base64(client):
 
 
 async def test_upload_new_document_returns_202(client, mock_db):
-    """Documento nuevo: crea el record en DB y devuelve 202 con status=pending."""
+    """Documento nuevo: crea el record en DB y devuelve 202 con status=pending.
+
+    Caso CP-DOC-03 (TD R11) de docs/calidad/CASOS_DE_PRUEBA.md.
+    """
     # No existe documento con ese hash → execute devuelve None
     mock_db.execute.return_value = _exec_result(scalar=None)
 
@@ -278,7 +284,10 @@ async def test_upload_persist_db_commit_failure_still_returns_success(
 
 
 async def test_upload_existing_hash_returns_200(client, mock_db):
-    """Si el mismo archivo ya está indexado, devuelve 200 con el doc existente."""
+    """Si el mismo archivo ya está indexado, devuelve 200 con el doc existente.
+
+    Caso CP-DOC-02 (TD R2) de docs/calidad/CASOS_DE_PRUEBA.md.
+    """
     existing = _make_doc(status="indexed")
     mock_db.execute.return_value = _exec_result(scalar=existing)
 
@@ -680,3 +689,175 @@ async def test_list_documents_without_cmid_does_not_filter_by_it(client, mock_db
     await client.get("/api/v1/documents?course_id=1")
 
     assert "documents.cmid =" not in str(mock_db.execute.await_args.args[0])
+
+
+# ============================================================
+# Casos de prueba TPC-04 (#576 · HU-010 y HU-011)
+# ============================================================
+# Implementan la tabla de decisión de docs/calidad/CASOS_DE_PRUEBA.md §3
+# (reglas R1…R11) y los valores límite del tamaño. Cada test lleva el ID del
+# caso (CP-DOC-xx) y la regla que cubre; las reglas que ya tenían test arriba
+# no se duplican, el documento las enlaza.
+#
+# POST /api/v1/documents consulta la base dos veces, en este orden:
+#   1. ¿hay un documento `indexed` con el mismo curso, nombre y hash? (HU-011)
+#   2. ¿hay un documento activo con el mismo nombre? (colisión → 409)
+# `_queries` arma una respuesta por consulta para usar con `side_effect`.
+
+
+def _queries(existing=None, collision=None) -> list:
+    """Respuestas de las dos consultas del upload, en orden."""
+    return [_exec_result(scalar=existing), _exec_result(scalar=collision)]
+
+
+# ============================================================
+# Tabla de decisión: duplicados y colisiones (HU-011)
+# ============================================================
+
+
+async def test_cp_doc_04_duplicado_sin_actividad_adopta_la_nueva(client, mock_db):
+    """CP-DOC-04 (R3): el mismo archivo ya indexado sin actividad y el nuevo
+    trae `cmid` → se reutiliza (200) y el existente adopta la actividad."""
+    # Arrange.
+    existing = _make_doc(status="indexed", cmid=None)
+    mock_db.execute.side_effect = _queries(existing=existing)
+
+    # Act.
+    response = await client.post("/api/v1/documents", json={**_BASE_PAYLOAD, "cmid": 7})
+
+    # Assert.
+    assert response.status_code == 200
+    assert response.json()["cmid"] == 7
+    assert existing.cmid == 7
+    mock_db.commit.assert_awaited()
+    mock_db.add.assert_not_called()
+
+
+async def test_cp_doc_05_duplicado_de_la_misma_actividad_se_reutiliza(client, mock_db):
+    """CP-DOC-05 (R4): mismo archivo y misma actividad → 200 sin tocar nada."""
+    # Arrange.
+    existing = _make_doc(status="indexed", cmid=7)
+    mock_db.execute.side_effect = _queries(existing=existing)
+
+    # Act.
+    response = await client.post("/api/v1/documents", json={**_BASE_PAYLOAD, "cmid": 7})
+
+    # Assert.
+    assert response.status_code == 200
+    assert response.json()["id"] == str(existing.id)
+    mock_db.commit.assert_not_awaited()
+    mock_db.add.assert_not_called()
+
+
+async def test_cp_doc_06_mismo_archivo_en_otra_actividad_es_colision(client, mock_db):
+    """CP-DOC-06 (R5): el archivo ya pertenece a otra actividad → no se le
+    cambia la actividad (VIS-01) y la subida choca por nombre: 409."""
+    # Arrange.
+    existing = _make_doc(status="indexed", cmid=7)
+    mock_db.execute.side_effect = _queries(existing=existing, collision=existing)
+
+    # Act.
+    response = await client.post("/api/v1/documents", json={**_BASE_PAYLOAD, "cmid": 9})
+
+    # Assert.
+    assert response.status_code == 409
+    assert existing.cmid == 7
+    mock_db.add.assert_not_called()
+
+
+async def test_cp_doc_07_mismo_nombre_con_otro_contenido_es_colision(client, mock_db):
+    """CP-DOC-07 (R6): no hay duplicado exacto, pero hay un documento activo
+    con el mismo nombre → 409 y no se crea nada."""
+    # Arrange.
+    active = _make_doc(status="indexing", file_hash="otro-hash")
+    mock_db.execute.side_effect = _queries(existing=None, collision=active)
+
+    # Act.
+    response = await client.post("/api/v1/documents", json=_BASE_PAYLOAD)
+
+    # Assert.
+    assert response.status_code == 409
+    assert "apuntes.pdf" in response.json()["detail"]
+    mock_db.add.assert_not_called()
+
+
+# ============================================================
+# Tabla de decisión: validación del archivo (HU-010)
+# ============================================================
+
+
+async def test_cp_doc_09_contenido_que_no_coincide_con_el_mime(client, mock_db):
+    """CP-DOC-09 (R9): se declara PDF pero los primeros bytes no son `%PDF-`
+    → 400 antes de crear el documento."""
+    # Arrange.
+    mock_db.execute.side_effect = _queries()
+    fake_pdf = base64.b64encode(b"MZ esto es un ejecutable").decode()
+
+    # Act.
+    response = await client.post(
+        "/api/v1/documents", json={**_BASE_PAYLOAD, "content_b64": fake_pdf}
+    )
+
+    # Assert.
+    assert response.status_code == 400
+    assert "tipo declarado" in response.json()["detail"]
+    mock_db.add.assert_not_called()
+
+
+async def test_cp_doc_10_mime_sin_firma_no_verifica_magic_bytes(client, mock_db):
+    """CP-DOC-10 (R10): los formatos de texto no tienen firma, así que
+    cualquier contenido no vacío se acepta (202)."""
+    # Arrange.
+    mock_db.execute.side_effect = _queries()
+    payload = {
+        **_BASE_PAYLOAD,
+        "filename": "notas.md",
+        "mime_type": "text/markdown",
+        "content_b64": base64.b64encode("# Unidad 1\nPilas y colas".encode()).decode(),
+    }
+
+    # Act.
+    response = await client.post("/api/v1/documents", json=payload)
+
+    # Assert.
+    assert response.status_code == 202
+    mock_db.add.assert_called_once()
+
+
+# ============================================================
+# Valores límite del tamaño (20 MB)
+# ============================================================
+
+
+@pytest.mark.parametrize(
+    "size, accepted",
+    [
+        pytest.param(MAX_UPLOAD_BYTES - 1, True, id="CP-DOC-11 20 MB - 1 byte"),
+        pytest.param(MAX_UPLOAD_BYTES, True, id="CP-DOC-12 20 MB exactos"),
+        pytest.param(MAX_UPLOAD_BYTES + 1, False, id="CP-DOC-13 20 MB + 1 byte"),
+    ],
+)
+def test_limite_de_tamano(size, accepted):
+    """Criterio (R8): hasta 20 MB inclusive se acepta; un byte más da 413."""
+    # Arrange.
+    content = b"%PDF-" + b"0" * (size - 5)
+    content_b64 = base64.b64encode(content).decode()
+
+    # Act / Assert.
+    if accepted:
+        assert len(_decode_and_validate_file("application/pdf", content_b64)) == size
+    else:
+        with pytest.raises(HTTPException) as exc:
+            _decode_and_validate_file("application/pdf", content_b64)
+        assert exc.value.status_code == 413
+
+
+def test_cp_doc_14_archivo_vacio_a_nivel_unitario():
+    """CP-DOC-14 (R7, caja blanca): `_decode_and_validate_file` rechaza un
+    archivo vacío. Desde la API la rama no se alcanza (`content_b64` exige
+    min_length=1 y ningún base64 válido no vacío decodifica a 0 bytes): es
+    código defensivo para otros llamadores, y se cubre llamando la función."""
+    # Act / Assert.
+    with pytest.raises(HTTPException) as exc:
+        _decode_and_validate_file("application/pdf", "")
+    assert (exc.value.status_code, exc.value.detail) == (400, "File is empty")
