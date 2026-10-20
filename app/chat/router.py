@@ -144,6 +144,18 @@ def _history_for_llm(payload: ChatRequest) -> list[dict[str, str]]:
     return [{"role": m.role, "content": m.content} for m in payload.history or []][-10:]
 
 
+def _require_session(
+    session: Optional[ChatSession], user_message: Optional[Message]
+) -> tuple[ChatSession, Message]:
+    """En el chat con historial en el backend, la sesión y el mensaje del
+    usuario ya existen. Es una verificación explícita y no un assert: dentro
+    del stream, el except general se tragaría el AssertionError (SonarCloud
+    python:S5779)."""
+    if session is None or user_message is None:
+        raise RuntimeError("chat con historial en el backend sin sesión")
+    return session, user_message
+
+
 async def _stateless_extras(
     *,
     payload: ChatRequest,
@@ -922,11 +934,7 @@ async def messages_stream(
                 if stateless:
                     llm_messages.extend(_history_for_llm(payload))
                 else:
-                    # Verificación explícita: un assert acá lo tragaría el except del stream.
-                    if session is None or user_message is None:
-                        raise RuntimeError(
-                            "chat con historial en el backend sin sesión"
-                        )
+                    session, user_message = _require_session(session, user_message)
                     history_result = await db.execute(
                         select(Message)
                         .where(Message.session_id == session.id)
@@ -1080,9 +1088,7 @@ async def messages_stream(
                     )
                     return
 
-                # Verificación explícita: un assert acá lo tragaría el except del stream.
-                if session is None or user_message is None:
-                    raise RuntimeError("chat con historial en el backend sin sesión")
+                session, user_message = _require_session(session, user_message)
                 # Persistir el mensaje completo del asistente.
                 assistant_message = Message(
                     session_id=session.id,

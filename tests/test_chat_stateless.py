@@ -304,3 +304,13 @@ async def test_stream_releases_the_db_connection_before_streaming(
     assert response.status_code == 200
     assert commits_when_streaming == [1]
     mock_db.add.assert_not_called()
+
+
+def test_require_session_rejects_a_missing_session():
+    """Criterio (SonarCloud python:S5779): sin sesión, una excepción explícita
+    (no un assert, que el except del stream se tragaría)."""
+    from app.chat.router import _require_session
+
+    # Act / Assert.
+    with pytest.raises(RuntimeError, match="sin sesión"):
+        _require_session(None, None)
