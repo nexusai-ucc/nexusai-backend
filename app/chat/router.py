@@ -922,7 +922,11 @@ async def messages_stream(
                 if stateless:
                     llm_messages.extend(_history_for_llm(payload))
                 else:
-                    assert session is not None and user_message is not None
+                    # Verificación explícita: un assert acá lo tragaría el except del stream.
+                    if session is None or user_message is None:
+                        raise RuntimeError(
+                            "chat con historial en el backend sin sesión"
+                        )
                     history_result = await db.execute(
                         select(Message)
                         .where(Message.session_id == session.id)
@@ -1076,7 +1080,9 @@ async def messages_stream(
                     )
                     return
 
-                assert session is not None and user_message is not None
+                # Verificación explícita: un assert acá lo tragaría el except del stream.
+                if session is None or user_message is None:
+                    raise RuntimeError("chat con historial en el backend sin sesión")
                 # Persistir el mensaje completo del asistente.
                 assistant_message = Message(
                     session_id=session.id,

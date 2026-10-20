@@ -861,3 +861,37 @@ def test_cp_doc_14_archivo_vacio_a_nivel_unitario():
     with pytest.raises(HTTPException) as exc:
         _decode_and_validate_file("application/pdf", "")
     assert (exc.value.status_code, exc.value.detail) == (400, "File is empty")
+
+
+# ============================================================
+# Tareas de indexación en segundo plano (SonarCloud python:S7502, TPC-10)
+# ============================================================
+
+
+async def test_upload_keeps_the_indexing_task_referenced_until_it_ends(client, mock_db):
+    """Criterio: la indexación lanzada por el upload queda retenida mientras
+    corre (asyncio solo guarda una referencia débil y el recolector de basura
+    podía cortarla a la mitad) y se suelta al terminar."""
+    import asyncio
+
+    from app.documents import router as documents_router
+
+    # Arrange: una indexación que no termina hasta que la soltamos.
+    release = asyncio.Event()
+
+    async def slow_index(**_kwargs):
+        await release.wait()
+
+    mock_db.execute.return_value = _exec_result(scalar=None)
+
+    with patch("app.documents.router._index_document_task", slow_index):
+        # Act.
+        response = await client.post("/api/v1/documents", json=_BASE_PAYLOAD)
+        retained_while_running = len(documents_router._background_tasks)
+        release.set()
+        await asyncio.gather(*documents_router._background_tasks)
+
+    # Assert.
+    assert response.status_code == 202
+    assert retained_while_running == 1
+    assert documents_router._background_tasks == set()

@@ -34,7 +34,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import random
+import secrets
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Any, List, Optional
@@ -88,6 +88,9 @@ _VALID_QUESTION_TYPES = {
     "fill_blank",
 }
 _VALID_DIFFICULTIES = {"easy", "medium", "hard"}
+
+# Mezcla de opciones con el generador del sistema (SonarCloud python:S2245).
+_RNG = secrets.SystemRandom()
 
 router = APIRouter()
 
@@ -744,7 +747,7 @@ async def _run_quiz_generation(
             and q.correct_index >= 0
         ):
             original_correct = q.options[q.correct_index]
-            random.shuffle(q.options)
+            _RNG.shuffle(q.options)
             q.correct_index = q.options.index(original_correct)
 
     # Enriquecer preguntas con el document_id del archivo fuente.

@@ -227,10 +227,15 @@ async def test_summary_key_changes_with_model_and_prompt_version(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_summary_key_is_stable_for_the_same_document():
+    # Arrange.
     document = _fake_document()
-    assert summarizer._summary_key(document, "m") == summarizer._summary_key(
-        document, "m"
-    )
+
+    # Act: dos cálculos independientes.
+    first = summarizer._summary_key(document, "m")
+    second = summarizer._summary_key(document, "m")
+
+    # Assert.
+    assert first == second
 
 
 # ============================================================
@@ -267,7 +272,8 @@ async def test_store_save_never_raises_when_the_database_fails():
 
 
 def test_store_make_key_is_stable_and_depends_on_every_part():
-    assert _real_make_key("a", "b") == _real_make_key("a", "b")
+    first, second = _real_make_key("a", "b"), _real_make_key("a", "b")
+    assert first == second
     assert _real_make_key("a", "b") != _real_make_key("a", "c")
     assert _real_make_key("ab", "c") != _real_make_key("a", "bc")
 

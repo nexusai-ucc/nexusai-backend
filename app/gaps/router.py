@@ -56,11 +56,15 @@ SEMANTIC_GAP_SIMILARITY_THRESHOLD = 0.75
 _MAX_ROWS_TO_CLUSTER = 2000
 
 
+_ZERO_NORM = 1e-12
+
+
 def _cosine_similarity(a: List[float], b: List[float]) -> float:
     dot = sum(x * y for x, y in zip(a, b))
     norm_a = math.sqrt(sum(x * x for x in a))
     norm_b = math.sqrt(sum(y * y for y in b))
-    if norm_a == 0.0 or norm_b == 0.0:
+    # Las normas son >= 0: un vector nulo es el que tiene norma (casi) cero.
+    if norm_a < _ZERO_NORM or norm_b < _ZERO_NORM:
         return 0.0
     return dot / (norm_a * norm_b)
 
