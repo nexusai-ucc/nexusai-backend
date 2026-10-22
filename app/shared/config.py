@@ -6,7 +6,7 @@ from functools import lru_cache
 
 class Settings(BaseSettings):
     env: str = "development"
-    app_version: str = "0.1.0"
+    app_version: str = "0.2.0"
 
     # LLM
     llm_api_key: str
