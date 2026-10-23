@@ -1,0 +1,78 @@
+# NexusAI backend — standalone self-host using the prebuilt image
+#
+# For anyone who wants to run the backend WITHOUT cloning any repository or
+# building the image themselves (e.g. a Marketplace reviewer, or an
+# institution self-hosting for real). Needs only this file + a `.env` next
+# to it (copy .env.example, fill in the REPLACE_ME values).
+#
+# Usage:
+#   cp .env.example .env
+#   docker compose -f docker-compose.selfhost.yml up -d
+#   curl http://localhost:8001/health
+#
+# The image is built and published by the nexusai-backend repo's own
+# docker-publish.yml, on every push to ITS main
+# (https://github.com/nexusai-ucc/nexusai-backend) — it's the exact same
+# image the project's own staging/production deployments run.
+
+name: nexusai-selfhost
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER missing in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD missing in .env}
+      POSTGRES_DB: nexusai
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nexusai}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [nexusai-selfhost-net]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks: [nexusai-selfhost-net]
+
+  api:
+    image: ghcr.io/nexusai-ucc/nexusai-backend:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      # Point at the services above, not localhost.
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/nexusai
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "${API_PORT:-8001}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks: [nexusai-selfhost-net]
+
+networks:
+  nexusai-selfhost-net:
+
+volumes:
+  postgres_data:
+  redis_data:
