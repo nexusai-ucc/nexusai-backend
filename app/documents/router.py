@@ -413,9 +413,7 @@ async def upload_document(
             try:
                 (UPLOADS_DIR / stale.storage_path).unlink(missing_ok=True)
             except OSError as exc:
-                logger.warning(
-                    "Could not delete file %s: %s", stale.storage_path, exc
-                )
+                logger.warning("Could not delete file %s: %s", stale.storage_path, exc)
         await db.delete(stale)
         await db.commit()
 
