@@ -806,6 +806,41 @@ async def test_resubir_el_mismo_archivo_que_quedo_en_error_lo_reemplaza(
     mock_db.add.assert_called_once()
 
 
+async def test_resubir_tras_error_borra_el_archivo_viejo_del_disco(
+    client, mock_db, tmp_path
+):
+    """El archivo guardado del intento fallido se borra junto con el registro."""
+    # Arrange.
+    viejo = tmp_path / "viejo.pdf"
+    viejo.write_bytes(_PDF_BYTES)
+    stale = _make_doc(status="error", storage_path="viejo.pdf")
+    mock_db.execute.side_effect = _queries(stale=stale)
+
+    # Act.
+    with patch("app.documents.router.UPLOADS_DIR", tmp_path):
+        response = await client.post("/api/v1/documents", json=_BASE_PAYLOAD)
+
+    # Assert.
+    assert response.status_code == 202
+    assert not viejo.exists()
+    mock_db.delete.assert_awaited_once_with(stale)
+
+
+async def test_resubir_tras_error_sigue_aunque_falle_el_disco(client, mock_db):
+    """Si no se puede borrar el archivo viejo, se avisa en el log y la subida sigue."""
+    # Arrange.
+    stale = _make_doc(status="error", storage_path="viejo.pdf")
+    mock_db.execute.side_effect = _queries(stale=stale)
+
+    # Act.
+    with patch("pathlib.Path.unlink", side_effect=OSError("disco")):
+        response = await client.post("/api/v1/documents", json=_BASE_PAYLOAD)
+
+    # Assert.
+    assert response.status_code == 202
+    mock_db.delete.assert_awaited_once_with(stale)
+
+
 async def test_subir_sin_intento_fallido_no_borra_nada(client, mock_db):
     """Sin un documento en error del mismo archivo, no se borra nada."""
     # Arrange.
