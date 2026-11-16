@@ -395,6 +395,30 @@ async def upload_document(
 
     file_bytes = _decode_and_validate_file(payload.mime_type, payload.content_b64)
 
+    # Un intento fallido del mismo archivo (mismo curso, nombre y hash) sigue
+    # ocupando el índice único ix_documents_course_filename_hash, así que el
+    # INSERT de abajo daría IntegrityError (500). Se borra antes, igual que si
+    # el docente lo eliminara a mano; sus chunks caen por ON DELETE CASCADE.
+    stale_result = await db.execute(
+        select(Document).where(
+            Document.course_id == payload.course_id,
+            Document.filename == payload.filename,
+            Document.file_hash == file_hash,
+            Document.status == "error",
+        )
+    )
+    stale = stale_result.scalar_one_or_none()
+    if stale is not None:
+        if stale.storage_path:
+            try:
+                (UPLOADS_DIR / stale.storage_path).unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "Could not delete file %s: %s", stale.storage_path, exc
+                )
+        await db.delete(stale)
+        await db.commit()
+
     document = Document(
         course_id=payload.course_id,
         uploader_id=payload.uploader_id,

@@ -699,15 +699,20 @@ async def test_list_documents_without_cmid_does_not_filter_by_it(client, mock_db
 # caso (CP-DOC-xx) y la regla que cubre; las reglas que ya tenían test arriba
 # no se duplican, el documento las enlaza.
 #
-# POST /api/v1/documents consulta la base dos veces, en este orden:
+# POST /api/v1/documents consulta la base hasta tres veces, en este orden:
 #   1. ¿hay un documento `indexed` con el mismo curso, nombre y hash? (HU-011)
 #   2. ¿hay un documento activo con el mismo nombre? (colisión → 409)
+#   3. ¿hay un intento fallido (`error`) del mismo archivo? (se borra antes)
 # `_queries` arma una respuesta por consulta para usar con `side_effect`.
 
 
-def _queries(existing=None, collision=None) -> list:
-    """Respuestas de las dos consultas del upload, en orden."""
-    return [_exec_result(scalar=existing), _exec_result(scalar=collision)]
+def _queries(existing=None, collision=None, stale=None) -> list:
+    """Respuestas de las consultas del upload, en orden."""
+    return [
+        _exec_result(scalar=existing),
+        _exec_result(scalar=collision),
+        _exec_result(scalar=stale),
+    ]
 
 
 # ============================================================
@@ -779,6 +784,39 @@ async def test_cp_doc_07_mismo_nombre_con_otro_contenido_es_colision(client, moc
     assert response.status_code == 409
     assert "apuntes.pdf" in response.json()["detail"]
     mock_db.add.assert_not_called()
+
+
+async def test_resubir_el_mismo_archivo_que_quedo_en_error_lo_reemplaza(
+    client, mock_db
+):
+    """Un intento fallido del mismo archivo (curso, nombre y hash) ocupa el
+    índice único: antes daba IntegrityError → 500. Ahora se borra el viejo y
+    se crea uno nuevo (202)."""
+    # Arrange.
+    stale = _make_doc(status="error", error_message="Indexación interrumpida")
+    mock_db.execute.side_effect = _queries(stale=stale)
+
+    # Act.
+    response = await client.post("/api/v1/documents", json=_BASE_PAYLOAD)
+
+    # Assert.
+    assert response.status_code == 202
+    assert response.json()["id"] != str(stale.id)
+    mock_db.delete.assert_awaited_once_with(stale)
+    mock_db.add.assert_called_once()
+
+
+async def test_subir_sin_intento_fallido_no_borra_nada(client, mock_db):
+    """Sin un documento en error del mismo archivo, no se borra nada."""
+    # Arrange.
+    mock_db.execute.side_effect = _queries()
+
+    # Act.
+    response = await client.post("/api/v1/documents", json=_BASE_PAYLOAD)
+
+    # Assert.
+    assert response.status_code == 202
+    mock_db.delete.assert_not_awaited()
 
 
 # ============================================================
