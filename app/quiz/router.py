@@ -1252,7 +1252,9 @@ async def evaluate_open_answer(
     # respuesta. Ver app/shared/moderation.py. -----
     moderation = await moderate_text(
         payload.user_answer,
-        llm=llm,
+        # La moderación no depende nunca de un modelo que eligió el usuario
+        # (BYOK): siempre con la cadena de la facultad.
+        llm=llm.institutional(),
         language=resolve_language(request, payload.user_answer),
     )
     if not moderation.allowed:

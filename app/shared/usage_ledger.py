@@ -86,6 +86,9 @@ class UsageRecord:
     provider: Optional[str] = None
     model: Optional[str] = None
     fallback: bool = False
+    # True si la llamada usó la key propia del usuario (BYOK): la paga el
+    # usuario, así que su costo para la facultad es 0.
+    byok: bool = False
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cached_prompt_tokens: int = 0
@@ -269,6 +272,7 @@ def call_summary(record: UsageRecord, ctx: UsageContext) -> dict[str, Any]:
         "provider": record.provider,
         "model": record.model,
         "fallback": record.fallback,
+        "byok": record.byok,
         "status": record.status,
         "prompt_tokens": record.prompt_tokens,
         "completion_tokens": record.completion_tokens,
@@ -469,7 +473,9 @@ async def _persist(
     missing_price: Optional[tuple[str, str]] = None
     async with get_ledger_session_factory()() as session:
         cost: Optional[Decimal] = Decimal(0)
-        if not _consumed_nothing(record):
+        # BYOK: lo paga el usuario con su cuenta — costo 0 para la facultad y
+        # sin alerta de "modelo sin precio" por un modelo que eligió él.
+        if not _consumed_nothing(record) and not record.byok:
             price = None
             if record.provider and record.model:
                 price = await _lookup_price(session, record.provider, record.model)

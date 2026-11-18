@@ -19,13 +19,18 @@ Middleware (BACK-14):
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.db.session import dispose_engine, get_session_factory
 from app.infrastructure.redis_client import close_redis
+from app.providers.user_llm import UserLLMError, find_user_llm_error
 from app.shared.config import get_settings
+from app.shared.language import ui_language
 from app.shared.middleware import RequestIDMiddleware
 
 settings = get_settings()
@@ -125,6 +130,7 @@ from app.migration.router import router as migration_router  # noqa: E402
 from app.privacy.router import router as privacy_router  # noqa: E402
 from app.quiz.router import router as quiz_router  # noqa: E402
 from app.search.router import router as search_router  # noqa: E402
+from app.user_llm.router import router as user_llm_router  # noqa: E402
 from app.voice.router import router as voice_router  # noqa: E402
 
 app.include_router(analytics_router, prefix="/api/v1/analytics", tags=["analytics"])
@@ -140,6 +146,42 @@ app.include_router(forums_router, prefix="/api/v1/forums", tags=["forums"])
 app.include_router(privacy_router, prefix="/api/v1/privacy", tags=["privacy"])
 app.include_router(voice_router, prefix="/api/v1/voice", tags=["voice"])
 app.include_router(migration_router, prefix="/api/v1/migration", tags=["migration"])
+app.include_router(user_llm_router, prefix="/api/v1/user-llm", tags=["user-llm"])
+
+
+# ============================================================
+# Key propia del usuario (BYOK): errores con mensaje propio
+# ============================================================
+
+
+async def _user_llm_failure_response(
+    request: Request, error: UserLLMError
+) -> JSONResponse:
+    """424 con el motivo y un mensaje que nombra al proveedor del usuario.
+
+    `detail` es un objeto plano, como el del rate limit propio: el widget lo
+    reconoce por `error == "user_llm_failed"` (react/src/components/errors.js).
+    """
+    return JSONResponse(
+        status_code=status.HTTP_424_FAILED_DEPENDENCY,
+        content={"detail": error.detail(ui_language(request))},
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _http_exception_with_user_llm(request: Request, exc: StarletteHTTPException):
+    """Los routers envuelven cualquier falla del LLM en un 503 genérico. Si la
+    causa fue la key del usuario, se responde con su error en lugar del 503."""
+    error = find_user_llm_error(exc)
+    if error is not None and exc.status_code >= 500:
+        return await _user_llm_failure_response(request, error)
+    return await http_exception_handler(request, exc)
+
+
+@app.exception_handler(UserLLMError)
+async def _user_llm_error(request: Request, exc: UserLLMError):
+    """Un UserLLMError que ningún router atrapó (p. ej. /user-llm/test)."""
+    return await _user_llm_failure_response(request, exc)
 
 
 # ============================================================

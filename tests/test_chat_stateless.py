@@ -76,7 +76,12 @@ def mock_embeddings():
 
 @pytest.fixture
 def mock_llm():
-    return AsyncMock(spec=LLMProvider)
+    llm = AsyncMock(spec=LLMProvider)
+    # Sin key propia del usuario (BYOK): la cadena de la facultad de siempre.
+    llm.has_user_llm = False
+    llm.is_user_only = False
+    llm.institutional = MagicMock(return_value=llm)
+    return llm
 
 
 @pytest.fixture
@@ -239,6 +244,52 @@ async def test_stateless_stream_puts_everything_in_done(
     # Nada guardado (el commit que libera la conexión antes del LLM, DEF-09,
     # no escribe nada porque no hay add).
     mock_db.add.assert_not_called()
+
+
+async def test_stream_with_a_failing_user_key_charges_nothing_and_flags_the_error(
+    client, mock_db, mock_llm, mock_redis
+):
+    """BYOK: la facultad y la key del usuario fallaron al abrir el stream. No
+    se generó nada, así que no se descuenta nada del límite, y el error trae el
+    código con el que el widget ofrece ir a "Mi API key"."""
+    from app.providers.user_llm import UserLLMError
+
+    mock_llm.chat_completion.return_value = _NOT_FLAGGED
+
+    async def failing_stream(_messages, **_kwargs):
+        raise UserLLMError("rejected", "openai", "gpt-x")
+        yield  # pragma: no cover — lo vuelve un generador async
+
+    mock_llm.chat_completion_stream = failing_stream
+
+    @asynccontextmanager
+    async def session_factory():
+        yield mock_db
+
+    with (
+        patch("app.chat.router.retrieve_context", new=AsyncMock(return_value=[])),
+        patch("app.chat.router.get_session_factory", return_value=session_factory),
+    ):
+        response = await client.post("/api/v1/chat/stream", json=_PAYLOAD)
+
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    error = events[-1]
+    assert (error["type"], error["code"], error["reason"]) == (
+        "error",
+        "user_llm_failed",
+        "rejected",
+    )
+    assert error["detail"].startswith("OpenAI rechazó tu API key")
+    # Lo reservado al entrar se devolvió entero en las dos ventanas.
+    moves: dict[str, int] = {}
+    for call in mock_redis.pipeline.return_value.incrby.call_args_list:
+        key, amount = call.args
+        moves[key] = moves.get(key, 0) + amount
+    assert moves and all(total == 0 for total in moves.values())
 
 
 # ─────────────────────────────────────────────────────────────

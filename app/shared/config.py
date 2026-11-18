@@ -47,6 +47,12 @@ class Settings(BaseSettings):
     # a antes de INFRA-03 (salta directo del primario al secundario).
     llm_intermediate_models: Optional[str] = None
 
+    # LLM — key propia del usuario (BYOK) como último eslabón de la cadena.
+    # El plugin la manda en el cuerpo firmado de cada pedido que usa el LLM
+    # (ver app/providers/user_llm.py). En False se ignora y la cadena queda
+    # como antes; el switch del sitio y el permiso por curso viven en Moodle.
+    user_llm_enabled: bool = True
+
     # LLM — credenciales dedicadas para el LLM-as-judge de scripts/eval_rag.py.
     # Opcionales: si no están seteadas, el judge cae a llm_fallback_api_key/
     # llm_fallback_base_url (ver eval_rag.py::get_judge_provider). Ese fallback

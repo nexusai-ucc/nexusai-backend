@@ -542,7 +542,9 @@ async def suggest_reply(
     # viniera de `payload.question`. -----
     moderation = await moderate_text(
         f"{payload.question}\n\n{thread_text}",
-        llm=llm,
+        # La moderación no depende nunca de un modelo que eligió el usuario
+        # (BYOK): el hilo con los posts de otros no viaja a su proveedor.
+        llm=llm.institutional(),
         language=resolve_language(request, payload.question),
     )
     if not moderation.allowed:

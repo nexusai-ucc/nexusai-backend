@@ -63,6 +63,7 @@ def _fake_llm(
     llm = MagicMock()
     llm.model = model
     result = MagicMock()
+    result.byok = False  # sin key propia del usuario (BYOK)
     result.text = text
     llm.chat_completion = AsyncMock(return_value=result)
     return llm
@@ -326,6 +327,7 @@ async def test_pre_exam_summary_runs_document_summaries_concurrently():
         await asyncio.sleep(0.01)
         in_flight -= 1
         result = MagicMock()
+        result.byok = False  # sin key propia del usuario (BYOK)
         result.text = "resumen"
         return result
 
@@ -366,6 +368,7 @@ async def test_pre_exam_summary_respects_concurrency_limit(monkeypatch):
         await asyncio.sleep(0.01)
         in_flight -= 1
         result = MagicMock()
+        result.byok = False  # sin key propia del usuario (BYOK)
         result.text = "resumen"
         return result
 
@@ -394,6 +397,7 @@ async def test_pre_exam_summary_skips_document_whose_llm_call_fails():
         if calls["n"] == 2:
             raise RuntimeError("LLM caído para este documento")
         result = MagicMock()
+        result.byok = False  # sin key propia del usuario (BYOK)
         result.text = "resumen"
         return result
 
@@ -491,6 +495,7 @@ async def test_pre_exam_summary_is_not_stored_when_a_document_failed(store):
         if calls["n"] == 2:
             raise RuntimeError("LLM caído")
         result = MagicMock()
+        result.byok = False  # sin key propia del usuario (BYOK)
         result.text = "resumen"
         result.prompt_tokens = 10
         result.completion_tokens = 5
@@ -520,3 +525,20 @@ async def test_pre_exam_key_depends_on_the_document_set_and_versions(monkeypatch
     assert summarizer._pre_exam_key(8, keys, "m") != base  # otro curso
     monkeypatch.setattr(summarizer, "_SYNTHESIS_PROMPT_VERSION", "s99")
     assert summarizer._pre_exam_key(7, keys, "m") != base
+
+
+@pytest.mark.asyncio
+async def test_summary_written_by_the_user_key_is_not_stored_for_the_course(store):
+    """BYOK: un resumen que escribió la key propia de un alumno no queda en la
+    caché del curso (los demás no reciben lo que generó el modelo que él eligió)."""
+    document = _fake_document()
+    db = _fake_db(document, [_fake_chunk("contenido del apunte", 0)])
+    llm = _fake_llm()
+    llm.chat_completion.return_value.byok = True
+
+    result = await summarize_document(
+        document_id=document.id, course_id=7, db=db, llm=llm
+    )
+
+    assert result["summary"] == "resumen generado"
+    assert store.saved == []

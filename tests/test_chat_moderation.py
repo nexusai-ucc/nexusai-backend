@@ -75,7 +75,12 @@ def mock_embeddings():
 
 @pytest.fixture
 def mock_llm():
-    return AsyncMock(spec=LLMProvider)
+    llm = AsyncMock(spec=LLMProvider)
+    # Sin key propia del usuario (BYOK): la cadena de la facultad de siempre.
+    llm.has_user_llm = False
+    llm.is_user_only = False
+    llm.institutional = MagicMock(return_value=llm)
+    return llm
 
 
 @pytest.fixture
