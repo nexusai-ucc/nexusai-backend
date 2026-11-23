@@ -34,8 +34,13 @@ def _contract() -> dict:
     return json.loads(CONTRACT.read_text(encoding="utf-8"))
 
 
-def _vectors() -> list[dict]:
-    return _contract()["vectors"] if CONTRACT.exists() else []
+def _vectors() -> list:
+    # Cada vector con su nombre como id. Sin contracts/ (repo derivado del
+    # backend) la lista queda vacía y el skipif del módulo salta los tests:
+    # un `ids=lambda v: v["name"]` rompería la colección con la lista vacía.
+    if not CONTRACT.exists():
+        return []
+    return [pytest.param(v, id=v["name"]) for v in _contract()["vectors"]]
 
 
 @pytest.fixture
@@ -52,7 +57,7 @@ def client(fake_redis, monkeypatch):
     return TestClient(app)
 
 
-@pytest.mark.parametrize("vector", _vectors(), ids=lambda v: v["name"])
+@pytest.mark.parametrize("vector", _vectors())
 def test_backend_accepts_the_contract_signature(client, monkeypatch, vector):
     """Criterio: una request firmada como dice el contrato pasa la verificación real."""
     # Arrange: el reloj del backend en el instante del vector (ventana anti-replay).
@@ -74,7 +79,7 @@ def test_backend_accepts_the_contract_signature(client, monkeypatch, vector):
     assert response.status_code == 200, response.text
 
 
-@pytest.mark.parametrize("vector", _vectors(), ids=lambda v: v["name"])
+@pytest.mark.parametrize("vector", _vectors())
 def test_backend_rejects_the_signature_of_another_body(client, monkeypatch, vector):
     """Criterio: la misma firma con un byte distinto en el body se rechaza (integridad)."""
     # Arrange.
