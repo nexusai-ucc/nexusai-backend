@@ -6,7 +6,7 @@ from functools import lru_cache
 
 class Settings(BaseSettings):
     env: str = "development"
-    app_version: str = "0.1.0"
+    app_version: str = "0.2.0"
 
     # LLM
     llm_api_key: str
@@ -46,6 +46,12 @@ class Settings(BaseSettings):
     # ANTES de pasar al proveedor secundario. Vacío = comportamiento idéntico
     # a antes de INFRA-03 (salta directo del primario al secundario).
     llm_intermediate_models: Optional[str] = None
+
+    # LLM — key propia del usuario (BYOK) como último eslabón de la cadena.
+    # El plugin la manda en el cuerpo firmado de cada pedido que usa el LLM
+    # (ver app/providers/user_llm.py). En False se ignora y la cadena queda
+    # como antes; el switch del sitio y el permiso por curso viven en Moodle.
+    user_llm_enabled: bool = True
 
     # LLM — credenciales dedicadas para el LLM-as-judge de scripts/eval_rag.py.
     # Opcionales: si no están seteadas, el judge cae a llm_fallback_api_key/
@@ -210,6 +216,12 @@ class Settings(BaseSettings):
     # resuma por día (13 meses por default).
     usage_ledger_enabled: bool = True
     usage_ledger_detail_days: int = 396
+    # Pool de conexiones PROPIO del registro (DEF-09, ver app/db/session.py):
+    # el registro se escribe dentro del request, así que no puede esperar una
+    # conexión del mismo pool que el request ya tiene ocupado.
+    usage_ledger_pool_size: int = 2
+    usage_ledger_max_overflow: int = 3
+    usage_ledger_pool_timeout_sec: float = 5.0
     # DATA-04 (#524): en la opción C el consumo por persona lo guarda Moodle
     # (local_nexusai_usage). En el corte se apaga y llm_usage queda sin
     # user_id: conserva curso, rol e instalación, sin datos personales.

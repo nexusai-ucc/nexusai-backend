@@ -116,6 +116,8 @@ class _Generated:
     provider: Optional[str]
     prompt_tokens: int
     completion_tokens: int
+    # Lo escribió la key propia del usuario (BYOK): no se guarda para el curso.
+    byok: bool = False
 
 
 async def _record_hit(llm: LLMProvider, stored: summary_store.StoredSummary) -> None:
@@ -237,12 +239,18 @@ async def _generate_summary(
         provider=result.provider or None,
         prompt_tokens=result.prompt_tokens,
         completion_tokens=result.completion_tokens,
+        byok=result.byok,
     )
 
 
 async def _save_document_summary(
     db: AsyncSession, document: Document, key: str, generated: _Generated
 ) -> None:
+    # Lo guardado lo reciben todos los alumnos del curso, bajo la clave del
+    # modelo de la facultad: un resumen que escribió la key de un alumno (el
+    # modelo que él eligió, con su cuenta) se le devuelve solo a él.
+    if generated.byok:
+        return
     await summary_store.save(
         db,
         cache_key=key,
@@ -444,10 +452,12 @@ async def summarize_pre_exam(
                 return index, None
 
     all_generated = True
+    any_byok = False
     for index, generated in await asyncio.gather(*(_one(i) for i in missing)):
         if generated is None:
             all_generated = False
             continue
+        any_byok = any_byok or generated.byok
         resolved[index] = generated.payload
         doc_tokens += generated.prompt_tokens + generated.completion_tokens
         # Fase C — guardado, EN SERIE (misma sesión).
@@ -490,7 +500,8 @@ async def summarize_pre_exam(
 
     # Solo se guarda si entraron todos los documentos: un repaso armado con
     # menos porque uno falló no tiene que quedar como "el resumen del curso".
-    if all_generated:
+    # Tampoco si alguna parte la escribió la key propia de un alumno (BYOK).
+    if all_generated and not any_byok and not synthesis.byok:
         await summary_store.save(
             db,
             cache_key=pre_exam_key,

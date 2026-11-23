@@ -75,6 +75,8 @@ class ChatMetrics(BaseModel):
     model: str = ""
     provider: str = ""
     fallback: bool = False
+    # Respondió la key propia del usuario (BYOK); el widget lo marca en la respuesta.
+    byok: bool = False
     chunks_retrieved: int = 0
     has_relevant_context: bool = False
     grounded: bool = False
