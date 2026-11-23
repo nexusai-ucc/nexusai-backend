@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
@@ -22,6 +22,7 @@ from pydantic import ValidationError
 
 from app.auth.hmac import verify_hmac
 from app.db.session import get_db
+from app.documents.retriever import RetrievedChunk
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
 from app.providers.llm import LLMProvider, get_llm_provider
 from app.quiz.router import ExamGenerateRequest, QuizRequest, _build_quiz_prompt
@@ -189,6 +190,7 @@ async def client(mock_db, mock_embeddings, mock_llm):
 
 
 async def test_generate_flashcards_returns_200_with_expected_shape(client):
+    """Caso CP-QUIZ-23 (TD Q6) de docs/calidad/CASOS_DE_PRUEBA.md."""
     payload = {
         "course_id": 1,
         "user_id": 1,
@@ -709,6 +711,7 @@ async def test_generate_exam_404_message_follows_the_interface_language(
 async def test_generate_quiz_404_message_follows_the_interface_language(
     client, mock_db
 ):
+    """Caso CP-QUIZ-24 (TD Q7) de docs/calidad/CASOS_DE_PRUEBA.md."""
     mock_db.execute.return_value.all.return_value = []
     payload = {"course_id": 1, "user_id": 9, "visible_cmids": [101]}
     url = "/api/v1/quiz/generate"
@@ -1344,3 +1347,234 @@ async def test_review_suggestions_with_provided_errors(client, mock_db, mock_llm
     assert body["total_errors"] == 2
     assert body["suggestions"][0]["error_count"] == 2
     mock_db.execute.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────
+# Casos de prueba TPC-04 (#576 · HU-031): tabla de decisión del quiz con tema
+# ─────────────────────────────────────────────────────────────
+# Implementan docs/calidad/CASOS_DE_PRUEBA.md §4.3 (reglas Q1…Q7). Con tema,
+# `generate` decide en dos pasos: (1) la similitud máxima del retrieval contra
+# QUIZ_TOPIC_MIN_SIMILARITY (0,5) y (2) un chequeo de relevancia con el LLM
+# (YES/NO) que, si falla, deja pasar (fail-open).
+
+_TOPIC_PAYLOAD = {
+    "course_id": 1,
+    "user_id": 1,
+    "num_questions": 1,
+    "question_type": "flashcard",
+    "topic": "teorema de Bayes",
+    "visible_cmids": [101],
+}
+
+
+def _chunk(similarity: float) -> RetrievedChunk:
+    # similarity = 1 - distance / 2  →  distance = 2 * (1 - similarity)
+    return RetrievedChunk(
+        content="El teorema de Bayes relaciona probabilidades condicionales.",
+        document_filename="apunte1.pdf",
+        chunk_index=0,
+        distance=2 * (1 - similarity),
+    )
+
+
+def _generation(mock_llm) -> MagicMock:
+    """La respuesta de generación que el fixture `mock_llm` ya trae."""
+    return mock_llm.chat_completion.return_value
+
+
+@pytest.mark.parametrize(
+    "similarity, status_code",
+    [
+        pytest.param(0.49, 422, id="CP-QUIZ-13 Q1 similitud 0,49"),
+        pytest.param(0.50, 200, id="CP-QUIZ-14 Q3 similitud 0,50"),
+    ],
+)
+async def test_quiz_con_tema_umbral_de_similitud(
+    client, mock_llm, similarity, status_code
+):
+    """Criterio (VL sobre el umbral): por debajo de 0,5 el tema se rechaza sin
+    gastar la llamada de relevancia; en 0,5 exacto pasa al chequeo del LLM."""
+    # Arrange.
+    mock_llm.chat_completion.side_effect = [
+        MagicMock(text="YES"),
+        _generation(mock_llm),
+    ]
+
+    # Act.
+    with patch(
+        "app.quiz.router.retrieve_context",
+        AsyncMock(return_value=[_chunk(similarity)]),
+    ):
+        response = await client.post("/api/v1/quiz/generate", json=_TOPIC_PAYLOAD)
+
+    # Assert.
+    assert response.status_code == status_code
+    expected_llm_calls = 0 if status_code == 422 else 2
+    assert mock_llm.chat_completion.await_count == expected_llm_calls
+
+
+async def test_cp_quiz_15_q2_el_llm_dice_que_el_tema_no_esta(client, mock_llm):
+    """CP-QUIZ-15 (Q2): la similitud pasa pero el LLM responde NO → 422 con un
+    mensaje que nombra el tema, y no se genera ningún quiz."""
+    # Arrange.
+    mock_llm.chat_completion.side_effect = [MagicMock(text="NO")]
+
+    # Act.
+    with patch(
+        "app.quiz.router.retrieve_context", AsyncMock(return_value=[_chunk(0.8)])
+    ):
+        response = await client.post("/api/v1/quiz/generate", json=_TOPIC_PAYLOAD)
+
+    # Assert.
+    assert response.status_code == 422
+    assert "teorema de Bayes" in response.json()["detail"]
+    assert mock_llm.chat_completion.await_count == 1
+
+
+async def test_cp_quiz_16_q4_si_el_chequeo_de_relevancia_falla_se_genera_igual(
+    client, mock_llm
+):
+    """CP-QUIZ-16 (Q4): si la llamada de relevancia falla, se sigue con la
+    generación (fail-open): una caída momentánea no bloquea el quiz."""
+    # Arrange.
+    mock_llm.chat_completion.side_effect = [
+        RuntimeError("proveedor caído"),
+        _generation(mock_llm),
+    ]
+
+    # Act.
+    with patch(
+        "app.quiz.router.retrieve_context", AsyncMock(return_value=[_chunk(0.8)])
+    ):
+        response = await client.post("/api/v1/quiz/generate", json=_TOPIC_PAYLOAD)
+
+    # Assert.
+    assert response.status_code == 200
+    assert len(response.json()["questions"]) == 1
+
+
+async def test_cp_quiz_17_q5_si_el_retrieval_falla_responde_503(client, mock_llm):
+    """CP-QUIZ-17 (Q5): si no se puede buscar el tema (embeddings o base caídos)
+    → 503 con un mensaje para reintentar, no un quiz sin material."""
+    # Act.
+    with patch(
+        "app.quiz.router.retrieve_context",
+        AsyncMock(side_effect=RuntimeError("embeddings caídos")),
+    ):
+        response = await client.post("/api/v1/quiz/generate", json=_TOPIC_PAYLOAD)
+
+    # Assert.
+    assert response.status_code == 503
+    mock_llm.chat_completion.assert_not_awaited()
+
+
+async def test_cp_quiz_18_tema_en_blanco_equivale_a_sin_tema(client, mock_llm):
+    """CP-QUIZ-18 (CE): un tema de solo espacios se trata como "sin tema"
+    (todo el material): no se busca el tema ni se consulta la relevancia."""
+    # Arrange.
+    retrieve = AsyncMock()
+
+    # Act.
+    with patch("app.quiz.router.retrieve_context", retrieve):
+        response = await client.post(
+            "/api/v1/quiz/generate", json={**_TOPIC_PAYLOAD, "topic": "   "}
+        )
+
+    # Assert.
+    assert response.status_code == 200
+    retrieve.assert_not_awaited()
+    assert mock_llm.chat_completion.await_count == 1
+
+
+async def test_cp_quiz_19_tema_sin_material_responde_en_el_idioma_de_la_interfaz(
+    client,
+):
+    """CP-QUIZ-19 (Q1 en inglés, DEF-08): el rechazo por similitud baja sigue
+    el idioma de la interfaz, igual que el rechazo del LLM y el 404."""
+    # Act.
+    with patch(
+        "app.quiz.router.retrieve_context", AsyncMock(return_value=[_chunk(0.3)])
+    ):
+        english = await client.post(
+            "/api/v1/quiz/generate",
+            json={**_TOPIC_PAYLOAD, "topic": "Bayes theorem"},
+            headers={"Accept-Language": "en-US"},
+        )
+        default = await client.post("/api/v1/quiz/generate", json=_TOPIC_PAYLOAD)
+
+    # Assert.
+    assert english.status_code == default.status_code == 422
+    assert "couldn't find material" in english.json()["detail"]
+    assert "No encontré material" in default.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "persist, persisted",
+    [
+        pytest.param(True, True, id="CP-QUIZ-20 flashcards las guarda el backend"),
+        pytest.param(False, False, id="CP-QUIZ-21 flashcards las guarda Moodle"),
+    ],
+)
+async def test_flashcards_se_guardan_solo_si_lo_pide_el_plugin(
+    client, persist, persisted
+):
+    """Criterio (CE sobre `persist_flashcards`, DATA-04): en los dos modos las
+    flashcards vuelven con `content_hash`; el backend las guarda solo si el
+    plugin no las va a guardar en Moodle."""
+    # Arrange.
+    persist_mock = AsyncMock()
+    payload = {
+        "course_id": 1,
+        "user_id": 1,
+        "num_questions": 1,
+        "question_type": "flashcard",
+        "visible_cmids": [101],
+        "persist_flashcards": persist,
+    }
+
+    # Act.
+    with patch("app.quiz.router._persist_flashcards", persist_mock):
+        response = await client.post("/api/v1/quiz/generate", json=payload)
+
+    # Assert.
+    assert response.status_code == 200
+    assert response.json()["questions"][0]["content_hash"]
+    assert persist_mock.await_count == (1 if persisted else 0)
+
+
+async def test_cp_quiz_22_quiz_de_opcion_multiple_no_se_persiste(client, mock_llm):
+    """CP-QUIZ-22 (CE: tipo distinto de flashcard): un quiz de opción múltiple
+    vuelve con sus 4 opciones mezcladas y `correct_index` apuntando a la
+    correcta después de mezclar, sin `content_hash` ni guardado (la repetición
+    espaciada es solo de flashcards)."""
+    # Arrange.
+    mock_llm.chat_completion.return_value = MagicMock(
+        text=json.dumps(
+            {
+                "questions": [
+                    {
+                        "question_type": "multiple_choice",
+                        "question": "¿Qué relaciona el teorema de Bayes?",
+                        "options": ["P(A|B) y P(B|A)", "Medias", "Varianzas", "Modas"],
+                        "correct_index": 0,
+                        "explanation": "Relaciona las dos probabilidades condicionales.",
+                        "source_filename": "apunte1.pdf",
+                    }
+                ]
+            }
+        )
+    )
+    persist_mock = AsyncMock()
+    payload = {"course_id": 1, "user_id": 1, "num_questions": 1, "visible_cmids": [101]}
+
+    # Act.
+    with patch("app.quiz.router._persist_flashcards", persist_mock):
+        response = await client.post("/api/v1/quiz/generate", json=payload)
+
+    # Assert.
+    assert response.status_code == 200
+    question = response.json()["questions"][0]
+    assert len(question["options"]) == 4
+    assert question["options"][question["correct_index"]] == "P(A|B) y P(B|A)"
+    assert question["content_hash"] is None
+    persist_mock.assert_not_awaited()

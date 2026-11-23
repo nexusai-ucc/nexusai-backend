@@ -76,7 +76,12 @@ def mock_embeddings():
 
 @pytest.fixture
 def mock_llm():
-    return AsyncMock(spec=LLMProvider)
+    llm = AsyncMock(spec=LLMProvider)
+    # Sin key propia del usuario (BYOK): la cadena de la facultad de siempre.
+    llm.has_user_llm = False
+    llm.is_user_only = False
+    llm.institutional = MagicMock(return_value=llm)
+    return llm
 
 
 @pytest.fixture
@@ -139,9 +144,9 @@ async def test_stateless_messages_saves_nothing_and_returns_what_moodle_stores(
         "resets_in_sec": body["budget"]["hourly"]["resets_in_sec"],
     }
     assert body["budget"]["daily"]["limit"] == 20000
-    # Nada guardado en la base del backend.
+    # Nada guardado en la base del backend. (El único commit es el que libera
+    # la conexión antes del LLM, DEF-09: no escribe nada porque no hay add.)
     mock_db.add.assert_not_called()
-    mock_db.commit.assert_not_called()
 
 
 async def test_stateless_messages_sends_moodle_history_to_the_llm(client, mock_llm):
@@ -236,5 +241,127 @@ async def test_stateless_stream_puts_everything_in_done(
     assert done["gap"]["embedding"] == [0.25] * 4
     assert done["budget"]["daily"]["limit"] == 20000
     assert isinstance(done["usage"], list)
+    # Nada guardado (el commit que libera la conexión antes del LLM, DEF-09,
+    # no escribe nada porque no hay add).
     mock_db.add.assert_not_called()
-    mock_db.commit.assert_not_called()
+
+
+async def test_stream_with_a_failing_user_key_charges_nothing_and_flags_the_error(
+    client, mock_db, mock_llm, mock_redis
+):
+    """BYOK: la facultad y la key del usuario fallaron al abrir el stream. No
+    se generó nada, así que no se descuenta nada del límite, y el error trae el
+    código con el que el widget ofrece ir a "Mi API key"."""
+    from app.providers.user_llm import UserLLMError
+
+    mock_llm.chat_completion.return_value = _NOT_FLAGGED
+
+    async def failing_stream(_messages, **_kwargs):
+        raise UserLLMError("rejected", "openai", "gpt-x")
+        yield  # pragma: no cover — lo vuelve un generador async
+
+    mock_llm.chat_completion_stream = failing_stream
+
+    @asynccontextmanager
+    async def session_factory():
+        yield mock_db
+
+    with (
+        patch("app.chat.router.retrieve_context", new=AsyncMock(return_value=[])),
+        patch("app.chat.router.get_session_factory", return_value=session_factory),
+    ):
+        response = await client.post("/api/v1/chat/stream", json=_PAYLOAD)
+
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    error = events[-1]
+    assert (error["type"], error["code"], error["reason"]) == (
+        "error",
+        "user_llm_failed",
+        "rejected",
+    )
+    assert error["detail"].startswith("OpenAI rechazó tu API key")
+    # Lo reservado al entrar se devolvió entero en las dos ventanas.
+    moves: dict[str, int] = {}
+    for call in mock_redis.pipeline.return_value.incrby.call_args_list:
+        key, amount = call.args
+        moves[key] = moves.get(key, 0) + amount
+    assert moves and all(total == 0 for total in moves.values())
+
+
+# ─────────────────────────────────────────────────────────────
+# DEF-09: no retener la conexión a la base mientras responde el LLM
+# ─────────────────────────────────────────────────────────────
+# Con la transacción del retrieval abierta durante el LLM, cada chat en vuelo
+# ocupa una conexión del pool por varios segundos; bajo carga el pool se
+# llena y los requests se quedan esperando. El chat tiene que cerrar la
+# transacción (commit, que libera la conexión) ANTES de llamar al LLM.
+
+
+async def test_messages_releases_the_db_connection_before_calling_the_llm(
+    client, mock_db, mock_llm
+):
+    """Criterio: cuando se pide la respuesta al LLM, la transacción ya se cerró."""
+    # Arrange: el doble del LLM anota si la sesión ya había hecho commit.
+    seen = []
+
+    async def answer(messages, **_kwargs):
+        seen.append(mock_db.commit.await_count)
+        return _NOT_FLAGGED if len(seen) == 1 else _answer()
+
+    mock_llm.chat_completion.side_effect = answer
+
+    # Act.
+    with patch("app.chat.router.retrieve_context", new=AsyncMock(return_value=[])):
+        response = await client.post("/api/v1/chat/messages", json=_PAYLOAD)
+
+    # Assert: la llamada de la respuesta (la segunda; la primera es la
+    # moderación) ocurre con la conexión ya liberada.
+    assert response.status_code == 200
+    assert seen[-1] >= 1
+    mock_db.add.assert_not_called()
+
+
+async def test_stream_releases_the_db_connection_before_streaming(
+    client, mock_db, mock_llm
+):
+    """Criterio: el stream tampoco retiene la conexión mientras el LLM escribe."""
+    # Arrange.
+    mock_llm.chat_completion.return_value = _NOT_FLAGGED
+    commits_when_streaming = []
+
+    async def fake_stream(_messages, **_kwargs):
+        commits_when_streaming.append(mock_db.commit.await_count)
+        yield StreamToken(text="Hola")
+        yield StreamUsage(prompt_tokens=5, completion_tokens=1, total_tokens=6)
+
+    mock_llm.chat_completion_stream = fake_stream
+
+    @asynccontextmanager
+    async def session_factory():
+        yield mock_db
+
+    # Act.
+    with (
+        patch("app.chat.router.retrieve_context", new=AsyncMock(return_value=[])),
+        patch("app.chat.router.get_session_factory", return_value=session_factory),
+    ):
+        response = await client.post("/api/v1/chat/stream", json=_PAYLOAD)
+
+    # Assert.
+    assert response.status_code == 200
+    assert commits_when_streaming == [1]
+    mock_db.add.assert_not_called()
+
+
+def test_require_session_rejects_a_missing_session():
+    """Criterio (SonarCloud python:S5779): sin sesión, una excepción explícita
+    (no un assert, que el except del stream se tragaría)."""
+    from app.chat.router import _require_session
+
+    # Act / Assert.
+    with pytest.raises(RuntimeError, match="sin sesión"):
+        _require_session(None, None)

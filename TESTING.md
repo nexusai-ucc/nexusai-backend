@@ -150,10 +150,10 @@ instalado y configurado con la URL y credenciales del backend.
 |-----------|-----|--------------|---------|
 | Indexación PDF ≤ 10 páginas | < 30 s | | |
 | Indexación PDF ≤ 50 páginas | < 120 s | | |
-| Query RAG (corpus ≤ 20 docs) — tiempo hasta primera respuesta | < 8 s | | |
-| Dedup CONT-04 — segunda subida del mismo archivo | < 1 s | | |
+| Query RAG (corpus ≤ 20 docs) — tiempo hasta primera respuesta | < 8 s | p95 **4,39 s** en staging con `gpt-4o-mini` (35 chats); p95 2,45 s con 10 VUs durante 10 min y 2,52 s con 100 VUs, con el LLM simulado a 1,5 s ([corrida](https://github.com/nexusai-ucc/nexusAI/actions/runs/39330079364), TPC-09) | OK |
+| Dedup CONT-04 — segunda subida del mismo archivo | < 1 s | p95 **0,03 s** (20 re-subidas, [corrida](https://github.com/nexusai-ucc/nexusAI/actions/runs/39330079364)) | OK |
 | Carga inicial del widget NexusAI en Moodle | < 3 s | | |
-| Respuesta en estado de cold start (primera query del día) | < 15 s | | |
+| Respuesta en estado de cold start (primera query del día) | < 15 s | **11,61 s**: primera pregunta después de un deploy a staging (una muestra, [smoke de TPC-08](https://github.com/nexusai-ucc/nexusAI/actions/runs/39322298675)) | OK |
 
 ### Cómo medir
 

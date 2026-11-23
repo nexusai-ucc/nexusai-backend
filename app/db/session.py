@@ -42,6 +42,8 @@ class Base(DeclarativeBase):
 # Singletons. Lazy: se crean en el primer get_engine().
 _engine: Optional[AsyncEngine] = None
 _session_factory: Optional[async_sessionmaker[AsyncSession]] = None
+_ledger_engine: Optional[AsyncEngine] = None
+_ledger_session_factory: Optional[async_sessionmaker[AsyncSession]] = None
 
 
 def _build_async_url(database_url: str) -> str:
@@ -109,6 +111,38 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
     return _session_factory
 
 
+def get_ledger_session_factory() -> async_sessionmaker[AsyncSession]:
+    """Factory de sessions del registro de consumo, con su propio pool chico.
+
+    DEF-09: el registro (app/shared/usage_ledger.py) se escribe DENTRO del
+    request que llamó al proveedor, mientras ese request todavía tiene su
+    conexión. Con un solo pool, bajo carga cada request retenía una conexión
+    y esperaba otra que nadie soltaba (retener y esperar): 30 s de timeout
+    por llamada y el registro perdido. Con un pool aparte el registro nunca
+    compite con los requests, y si se satura espera a lo sumo
+    USAGE_LEDGER_POOL_TIMEOUT_SEC.
+    """
+    global _ledger_engine, _ledger_session_factory
+
+    if _ledger_session_factory is None:
+        settings = get_settings()
+        _ledger_engine = create_async_engine(
+            _build_async_url(settings.database_url),
+            pool_pre_ping=True,
+            pool_size=settings.usage_ledger_pool_size,
+            max_overflow=settings.usage_ledger_max_overflow,
+            pool_timeout=settings.usage_ledger_pool_timeout_sec,
+        )
+        _ledger_session_factory = async_sessionmaker(
+            bind=_ledger_engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+            autoflush=False,
+        )
+
+    return _ledger_session_factory
+
+
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """
     FastAPI Dependency. Abre una session, la cede al endpoint, y la cierra
@@ -140,9 +174,13 @@ async def dispose_engine() -> None:
     Cierra el engine y libera todas las conexiones del pool.
     Llamado desde el lifespan shutdown de FastAPI (ver app/main.py).
     """
-    global _engine, _session_factory
+    global _engine, _session_factory, _ledger_engine, _ledger_session_factory
 
     if _engine is not None:
         await _engine.dispose()
         _engine = None
         _session_factory = None
+    if _ledger_engine is not None:
+        await _ledger_engine.dispose()
+        _ledger_engine = None
+        _ledger_session_factory = None
