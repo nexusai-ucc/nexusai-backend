@@ -17,6 +17,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
@@ -588,6 +589,10 @@ class LlmUsage(Base):
     provider: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     model: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     fallback: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # True si respondió la key propia del usuario (BYOK): costo 0 para la facultad.
+    byok: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
     # ok | error | quota | blocked
     status: Mapped[str] = mapped_column(String(20), nullable=False)
     prompt_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

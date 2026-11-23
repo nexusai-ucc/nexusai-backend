@@ -171,8 +171,13 @@ class EmbeddingProvider:
             texts,
         )
 
-        # Re-ordenamos explícitamente por index (el SDK lo garantiza, pero por las dudas).
-        sorted_data = sorted(response.data, key=lambda d: d.index)
+        # Re-ordenamos por index cuando el proveedor lo informa. Gemini (API
+        # compatible con OpenAI) devuelve index=None: ahí vale el orden de la
+        # respuesta, que es el del input (DEF-07, detectado por TPC-07).
+        if all(d.index is not None for d in response.data):
+            sorted_data = sorted(response.data, key=lambda d: d.index)
+        else:
+            sorted_data = list(response.data)
         vectors = [d.embedding for d in sorted_data]
 
         for i, vec in enumerate(vectors):

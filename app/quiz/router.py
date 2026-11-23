@@ -34,7 +34,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import random
+import secrets
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Any, List, Optional
@@ -88,6 +88,9 @@ _VALID_QUESTION_TYPES = {
     "fill_blank",
 }
 _VALID_DIFFICULTIES = {"easy", "medium", "hard"}
+
+# Mezcla de opciones con el generador del sistema (SonarCloud python:S2245).
+_RNG = secrets.SystemRandom()
 
 router = APIRouter()
 
@@ -744,7 +747,7 @@ async def _run_quiz_generation(
             and q.correct_index >= 0
         ):
             original_correct = q.options[q.correct_index]
-            random.shuffle(q.options)
+            _RNG.shuffle(q.options)
             q.correct_index = q.options.index(original_correct)
 
     # Enriquecer preguntas con el document_id del archivo fuente.
@@ -1077,9 +1080,12 @@ async def generate_quiz(
         if max_sim < QUIZ_TOPIC_MIN_SIMILARITY:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=(
-                    "No encontré material sobre ese tema en el curso. "
-                    "Intentá con un tema que esté cubierto en los archivos indexados."
+                detail=localized(
+                    resolve_language(request, topic),
+                    f"No encontré material sobre '{topic}' en los archivos del curso. "
+                    "Intentá con un tema que esté cubierto en los archivos indexados.",
+                    f"I couldn't find material about '{topic}' in the course files. "
+                    "Try a topic that is covered in the indexed files.",
                 ),
             )
 
@@ -1246,7 +1252,9 @@ async def evaluate_open_answer(
     # respuesta. Ver app/shared/moderation.py. -----
     moderation = await moderate_text(
         payload.user_answer,
-        llm=llm,
+        # La moderación no depende nunca de un modelo que eligió el usuario
+        # (BYOK): siempre con la cadena de la facultad.
+        llm=llm.institutional(),
         language=resolve_language(request, payload.user_answer),
     )
     if not moderation.allowed:

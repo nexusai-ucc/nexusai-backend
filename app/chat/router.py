@@ -52,7 +52,14 @@ from app.gaps.recorder import (
 )
 from app.infrastructure.redis_client import get_redis
 from app.providers.embeddings import EmbeddingProvider, get_embedding_provider
-from app.providers.llm import LLMProvider, StreamToken, StreamUsage, get_llm_provider
+from app.providers.llm import (
+    LLMProvider,
+    StreamLink,
+    StreamToken,
+    StreamUsage,
+    get_llm_provider,
+)
+from app.providers.user_llm import UserLLMError, find_user_llm_error
 from app.shared.config import get_settings
 from app.shared.language import resolve_language, ui_language, with_language_directive
 from app.shared.error_monitoring import (
@@ -139,9 +146,105 @@ def _token_budget_limits(settings, payload: ChatRequest) -> tuple[int, int]:
     return payload.token_limit_hourly or hourly, payload.token_limit_daily or daily
 
 
+def _is_budget_exceeded(exc: HTTPException) -> bool:
+    detail = exc.detail
+    return isinstance(detail, dict) and detail.get("error") == "token_budget_exceeded"
+
+
+async def _reserve_chat_budget(
+    *,
+    request: Request,
+    payload: ChatRequest,
+    redis: redis_async.Redis,
+    llm: LLMProvider,
+) -> tuple[int, int, LLMProvider]:
+    """Reserva el presupuesto de tokens del chat (por hora y por día).
+
+    Devuelve (reserva horaria, reserva diaria, provider a usar). Si el usuario
+    ya llegó a su límite y cargó su propia API key (BYOK), en vez de cortar
+    con 429 sigue con un provider que usa solo su key, sin reservar nada: esos
+    tokens los paga él y no cuentan contra su límite. Sin key, el 429 de
+    siempre.
+    """
+    settings = get_settings()
+    hourly_limit, daily_limit = _token_budget_limits(settings, payload)
+    estimate = estimate_tokens(payload.question)
+    language = resolve_language(request, payload.question)
+    reserved_hourly = 0
+    try:
+        reserved_hourly = await reserve_token_budget(
+            user_id=payload.user_id,
+            is_teacher=payload.is_teacher,
+            redis=redis,
+            limit=hourly_limit,
+            window_sec=3600,
+            scope="hourly",
+            estimated_tokens=estimate,
+            language=language,
+        )
+        reserved_daily = await reserve_token_budget(
+            user_id=payload.user_id,
+            is_teacher=payload.is_teacher,
+            redis=redis,
+            limit=daily_limit,
+            window_sec=86400,
+            scope="daily",
+            estimated_tokens=estimate,
+            language=language,
+        )
+    except HTTPException as exc:
+        if not (llm.has_user_llm and _is_budget_exceeded(exc)):
+            raise
+        if reserved_hourly:
+            # Pasó la ventana horaria pero no la diaria: devolver lo reservado.
+            await finalize_token_usage(
+                user_id=payload.user_id,
+                is_teacher=payload.is_teacher,
+                redis=redis,
+                window_sec=3600,
+                reserved_tokens=reserved_hourly,
+                actual_tokens=0,
+            )
+        return 0, 0, llm.user_only()
+    return reserved_hourly, reserved_daily, llm
+
+
+async def _alert_llm_failure(
+    redis: redis_async.Redis, endpoint: str, exc: BaseException
+) -> Optional[UserLLMError]:
+    """Dispara las alertas de la facultad por una falla del LLM.
+
+    Si la falla final fue la key del usuario (BYOK), la alerta se dispara con
+    la falla de la facultad que llevó hasta su key (cuota agotada, caída), y
+    no se dispara nada si solo se usó su key (presupuesto agotado): que su
+    key esté rechazada o sin saldo es problema suyo, no de la facultad.
+    Devuelve el error de la key del usuario, o None.
+    """
+    user_error = find_user_llm_error(exc)
+    if user_error is None:
+        await record_llm_failure_and_maybe_alert(redis, endpoint=endpoint, error=exc)
+    elif user_error.institutional_error is not None:
+        await record_llm_failure_and_maybe_alert(
+            redis, endpoint=endpoint, error=user_error.institutional_error
+        )
+    return user_error
+
+
 def _history_for_llm(payload: ChatRequest) -> list[dict[str, str]]:
     """Mensajes previos que mandó Moodle, en el formato del LLM (DATA-04)."""
     return [{"role": m.role, "content": m.content} for m in payload.history or []][-10:]
+
+
+def _require_session(
+    session: Optional[ChatSession], user_message: Optional[Message]
+) -> tuple[ChatSession, Message]:
+    """En el chat con historial en el backend, la sesión y el mensaje del
+    usuario ya existen. Es una verificación explícita y no un assert: dentro
+    del stream, el except general se tragaría el AssertionError (SonarCloud
+    python:S5779)."""
+    if session is None or user_message is None:
+        raise RuntimeError("chat con historial en el backend sin sesión")
+    return session, user_message
 
 
 async def _stateless_extras(
@@ -161,6 +264,7 @@ async def _stateless_extras(
     model: str,
     provider: str,
     fallback: bool,
+    byok: bool = False,
 ) -> dict:
     """Lo que Moodle guarda de una respuesta en el flujo nuevo (DATA-04).
 
@@ -184,6 +288,7 @@ async def _stateless_extras(
         model=model,
         provider=provider,
         fallback=fallback,
+        byok=byok,
         chunks_retrieved=chunks_count,
         has_relevant_context=has_relevant_context,
         grounded=not gap_flag if not is_multicourse else has_relevant_context,
@@ -320,34 +425,17 @@ async def messages(
     # del alumno (lo único conocido en este punto, antes del RAG); el resto
     # del costo real (contexto RAG + historial + completion) se ajusta más
     # abajo con finalize_token_usage una vez conocido. -----
-    token_hourly_limit, token_daily_limit = _token_budget_limits(settings, payload)
-    question_tokens_estimate = estimate_tokens(payload.question)
-    reserved_hourly = await reserve_token_budget(
-        user_id=payload.user_id,
-        is_teacher=payload.is_teacher,
-        redis=redis,
-        limit=token_hourly_limit,
-        window_sec=3600,
-        scope="hourly",
-        estimated_tokens=question_tokens_estimate,
-        language=resolve_language(request, payload.question),
-    )
-    reserved_daily = await reserve_token_budget(
-        user_id=payload.user_id,
-        is_teacher=payload.is_teacher,
-        redis=redis,
-        limit=token_daily_limit,
-        window_sec=86400,
-        scope="daily",
-        estimated_tokens=question_tokens_estimate,
-        language=resolve_language(request, payload.question),
+    # BYOK: si ya llegó a su límite y tiene su propia key, sigue con ella.
+    reserved_hourly, reserved_daily, llm = await _reserve_chat_budget(
+        request=request, payload=payload, redis=redis, llm=llm
     )
 
     # ----- Moderación de contenido — antes de cualquier escritura o gasto de
     # tokens (retrieval/LLM). Ver app/shared/moderation.py. -----
     moderation = await moderate_text(
         payload.question,
-        llm=llm,
+        # La moderación no depende nunca de un modelo que eligió el usuario.
+        llm=llm.institutional(),
         language=resolve_language(request, payload.question),
     )
     if moderation.tokens_used:
@@ -486,6 +574,12 @@ async def messages(
         llm_messages, payload.question, fallback=ui_language(request)
     )
 
+    # DEF-09: cerrar la transacción de lectura (retrieval/historial) antes del
+    # LLM. Si no, la conexión queda "idle in transaction" los segundos que tarda
+    # el modelo y, con varios chats en vuelo, el pool se agota. No escribe nada:
+    # lo pendiente ya se comiteó arriba, y lo de después toma otra conexión.
+    await db.commit()
+
     # ----- BACK-11: Llamada al LLM (con retry interno en LLMProvider) -----
     llm_start = time.perf_counter()
     try:
@@ -495,7 +589,7 @@ async def messages(
             "LLM call failed",
             extra={"error": str(exc), "type": type(exc).__name__},
         )
-        await record_llm_failure_and_maybe_alert(redis, endpoint="messages", error=exc)
+        await _alert_llm_failure(redis, "messages", exc)
         # Liberar la reserva de arriba — la request falló, no tiene sentido
         # dejarle cobrada la estimación de una respuesta que nunca se generó.
         await finalize_token_usage(
@@ -532,7 +626,8 @@ async def messages(
         redis=redis,
         window_sec=3600,
         reserved_tokens=reserved_hourly,
-        actual_tokens=result.total_tokens,
+        # BYOK: lo pagó el usuario con su key, no cuenta contra su límite.
+        actual_tokens=0 if result.byok else result.total_tokens,
     )
     await finalize_token_usage(
         user_id=payload.user_id,
@@ -540,7 +635,7 @@ async def messages(
         redis=redis,
         window_sec=86400,
         reserved_tokens=reserved_daily,
-        actual_tokens=result.total_tokens,
+        actual_tokens=0 if result.byok else result.total_tokens,
     )
 
     if stateless:
@@ -565,6 +660,7 @@ async def messages(
             model=result.model,
             provider=result.provider,
             fallback=result.fallback,
+            byok=result.byok,
         )
         logger.info(
             json.dumps(
@@ -727,34 +823,17 @@ async def messages_stream(
     # ----- Presupuesto de tokens por rol (ver app/shared/token_budget.py).
     # Reserva atómica igual que en /messages — ver el comentario en ese
     # endpoint para el razonamiento completo. -----
-    token_hourly_limit, token_daily_limit = _token_budget_limits(settings, payload)
-    question_tokens_estimate = estimate_tokens(payload.question)
-    reserved_hourly = await reserve_token_budget(
-        user_id=payload.user_id,
-        is_teacher=payload.is_teacher,
-        redis=redis,
-        limit=token_hourly_limit,
-        window_sec=3600,
-        scope="hourly",
-        estimated_tokens=question_tokens_estimate,
-        language=resolve_language(request, payload.question),
-    )
-    reserved_daily = await reserve_token_budget(
-        user_id=payload.user_id,
-        is_teacher=payload.is_teacher,
-        redis=redis,
-        limit=token_daily_limit,
-        window_sec=86400,
-        scope="daily",
-        estimated_tokens=question_tokens_estimate,
-        language=resolve_language(request, payload.question),
+    # BYOK: si ya llegó a su límite y tiene su propia key, sigue con ella.
+    reserved_hourly, reserved_daily, llm = await _reserve_chat_budget(
+        request=request, payload=payload, redis=redis, llm=llm
     )
 
     # ----- Moderación de contenido — antes de abrir el stream (que ya
     # implica costo de RAG/LLM). Ver app/shared/moderation.py. -----
     moderation = await moderate_text(
         payload.question,
-        llm=llm,
+        # La moderación no depende nunca de un modelo que eligió el usuario.
+        llm=llm.institutional(),
         language=resolve_language(request, payload.question),
     )
     if moderation.tokens_used:
@@ -916,7 +995,7 @@ async def messages_stream(
                 if stateless:
                     llm_messages.extend(_history_for_llm(payload))
                 else:
-                    assert session is not None and user_message is not None
+                    session, user_message = _require_session(session, user_message)
                     history_result = await db.execute(
                         select(Message)
                         .where(Message.session_id == session.id)
@@ -935,13 +1014,23 @@ async def messages_stream(
                     llm_messages, payload.question, fallback=ui_language(request)
                 )
 
+                # DEF-09: no retener la conexión mientras el LLM escribe
+                # (ver /messages).
+                await db.commit()
+
                 # Stream del LLM.
                 full_text_parts: list[str] = []
                 usage_seen: StreamUsage | None = None
+                stream_link: list[StreamLink] = []
+                # La key del usuario falló (y antes la facultad): no se generó
+                # nada que cobrarle.
+                user_key_failed = False
                 llm_start = time.perf_counter()
 
                 try:
-                    async for chunk in llm.chat_completion_stream(llm_messages):
+                    async for chunk in llm.chat_completion_stream(
+                        llm_messages, on_open=stream_link.append
+                    ):
                         if isinstance(chunk, StreamToken):
                             full_text_parts.append(chunk.text)
                             yield (
@@ -957,6 +1046,9 @@ async def messages_stream(
                             )
                         elif isinstance(chunk, StreamUsage):
                             usage_seen = chunk
+                except UserLLMError:
+                    user_key_failed = True
+                    raise
                 finally:
                     # Se ejecuta SIEMPRE, incluso si el cliente corta la
                     # conexión a mitad de stream (pestaña cerrada, cambio de
@@ -983,6 +1075,15 @@ async def messages_stream(
                         stream_total_tokens = estimate_tokens_for_messages(
                             llm_messages
                         ) + estimate_tokens("".join(full_text_parts))
+                    # BYOK: lo pagó el usuario con su key, no cuenta contra
+                    # su límite; y si su key falló al final de la cadena, no
+                    # hubo respuesta que cobrar.
+                    if (
+                        (stream_link and stream_link[0].byok)
+                        or llm.is_user_only
+                        or user_key_failed
+                    ):
+                        stream_total_tokens = 0
                     await finalize_token_usage(
                         user_id=payload.user_id,
                         is_teacher=payload.is_teacher,
@@ -1022,9 +1123,14 @@ async def messages_stream(
                         if usage_seen
                         else 0,
                         total_tokens=usage_seen.total_tokens if usage_seen else 0,
-                        model=usage_seen.model if usage_seen else "",
-                        provider=usage_seen.provider if usage_seen else "",
+                        model=usage_seen.model
+                        if usage_seen
+                        else (stream_link[0].model if stream_link else ""),
+                        provider=usage_seen.provider
+                        if usage_seen
+                        else (stream_link[0].provider if stream_link else ""),
                         fallback=usage_seen.fallback if usage_seen else False,
+                        byok=bool(stream_link and stream_link[0].byok),
                     )
                     yield (
                         "data: "
@@ -1066,7 +1172,7 @@ async def messages_stream(
                     )
                     return
 
-                assert session is not None and user_message is not None
+                session, user_message = _require_session(session, user_message)
                 # Persistir el mensaje completo del asistente.
                 assistant_message = Message(
                     session_id=session.id,
@@ -1189,19 +1295,20 @@ async def messages_stream(
                 # probable acá (retrieval ya tiene su propio try/except arriba),
                 # y contar de más algo que no era LLM es un falso positivo
                 # aceptable para un piloto.
-                await record_llm_failure_and_maybe_alert(
-                    redis, endpoint="stream", error=exc
-                )
-                yield (
-                    "data: "
-                    + json.dumps(
-                        {
-                            "type": "error",
-                            "detail": "El asistente no está disponible temporalmente",
-                        }
+                user_error = await _alert_llm_failure(redis, "stream", exc)
+                error_event: dict = {
+                    "type": "error",
+                    "detail": user_error.message(
+                        resolve_language(request, payload.question)
                     )
-                    + "\n\n"
-                )
+                    if user_error is not None
+                    else "El asistente no está disponible temporalmente",
+                }
+                if user_error is not None:
+                    # El widget muestra el botón "Ir a Mi API key" con esto.
+                    error_event["code"] = "user_llm_failed"
+                    error_event["reason"] = user_error.reason
+                yield ("data: " + json.dumps(error_event, ensure_ascii=False) + "\n\n")
 
     return StreamingResponse(
         event_stream(),

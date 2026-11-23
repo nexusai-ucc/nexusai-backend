@@ -31,7 +31,7 @@ import hashlib
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 from uuid import UUID
 
 from fastapi import (
@@ -72,6 +72,20 @@ router = APIRouter()
 # ============================================================
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
+
+# Tareas de indexación en curso. asyncio solo guarda una referencia débil a
+# las tareas: sin esta, el recolector de basura puede cortar una indexación a
+# la mitad (SonarCloud python:S7502). Cada tarea se saca sola al terminar.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn(coro: Any) -> asyncio.Task:
+    """Lanza una tarea en segundo plano y la retiene hasta que termine."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
 
 # Magic bytes por mime type. None = sin verificación (ej. text/plain).
 # PPTX y XLSX son ZIP igual que DOCX, así que comparten la firma "PK".
@@ -381,6 +395,28 @@ async def upload_document(
 
     file_bytes = _decode_and_validate_file(payload.mime_type, payload.content_b64)
 
+    # Un intento fallido del mismo archivo (mismo curso, nombre y hash) sigue
+    # ocupando el índice único ix_documents_course_filename_hash, así que el
+    # INSERT de abajo daría IntegrityError (500). Se borra antes, igual que si
+    # el docente lo eliminara a mano; sus chunks caen por ON DELETE CASCADE.
+    stale_result = await db.execute(
+        select(Document).where(
+            Document.course_id == payload.course_id,
+            Document.filename == payload.filename,
+            Document.file_hash == file_hash,
+            Document.status == "error",
+        )
+    )
+    stale = stale_result.scalar_one_or_none()
+    if stale is not None:
+        if stale.storage_path:
+            try:
+                (UPLOADS_DIR / stale.storage_path).unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("Could not delete file %s: %s", stale.storage_path, exc)
+        await db.delete(stale)
+        await db.commit()
+
     document = Document(
         course_id=payload.course_id,
         uploader_id=payload.uploader_id,
@@ -402,7 +438,7 @@ async def upload_document(
     await db.refresh(document)
     doc_data = DocumentOut.from_orm(document)
 
-    asyncio.create_task(
+    _spawn(
         _index_document_task(
             document_id=document.id,
             file_bytes=file_bytes,
@@ -479,7 +515,7 @@ async def replace_document(
     await db.refresh(document)
     doc_data = DocumentOut.from_orm(document)
 
-    asyncio.create_task(
+    _spawn(
         _index_document_task(
             document_id=document.id,
             file_bytes=file_bytes,
@@ -487,11 +523,12 @@ async def replace_document(
         )
     )
 
+    # Sin los nombres de archivo: vienen del usuario y no se loguean sin
+    # sanitizar (SonarCloud pythonsecurity:S5145). Quedan en la base.
     logger.info(
-        "Document %s replaced: %r -> %r",
+        "Document %s replaced (filename changed: %s)",
         document.id,
-        old_filename,
-        payload.filename,
+        old_filename != payload.filename,
     )
 
     return doc_data
@@ -562,7 +599,7 @@ async def reindex_document(
     await db.refresh(document)
     doc_data = DocumentOut.from_orm(document)
 
-    asyncio.create_task(
+    _spawn(
         _index_document_task(
             document_id=document.id,
             file_bytes=file_bytes,

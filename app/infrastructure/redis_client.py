@@ -40,18 +40,23 @@ async def get_redis() -> redis_async.Redis:
 
     if _redis_client is None:
         settings = get_settings()
-        _redis_client = redis_async.from_url(
+        # Pool que ESPERA una conexión libre en vez de fallar. El pool común de
+        # redis-py tira ConnectionError("Too many connections") apenas se agota:
+        # con 60 chats a la vez (demo de la defensa) daba 500 en ~2,5 % de los
+        # pedidos. Cada worker uvicorn tiene su propio pool (total N * 50).
+        pool = redis_async.BlockingConnectionPool.from_url(
             settings.redis_url,
             encoding="utf-8",
             decode_responses=True,
-            # Pool razonable para 1 worker uvicorn. En prod con N workers, cada
-            # worker tiene su propio pool — el total de conexiones será N * 10.
-            max_connections=10,
+            max_connections=50,
+            # Si no se libera ninguna conexión en 5 s, recién ahí falla.
+            timeout=5,
             # Timeouts agresivos: si Redis no responde rápido, fallamos rápido.
             # No queremos requests del API colgadas por una caída de Redis.
             socket_timeout=2,
             socket_connect_timeout=2,
         )
+        _redis_client = redis_async.Redis(connection_pool=pool)
 
     return _redis_client
 
@@ -64,5 +69,6 @@ async def close_redis() -> None:
     global _redis_client
 
     if _redis_client is not None:
-        await _redis_client.aclose()
+        # El pool se pasó explícito: hay que pedir que se cierre también.
+        await _redis_client.aclose(close_connection_pool=True)
         _redis_client = None
