@@ -1,0 +1,54 @@
+name: Publish Docker image
+#
+# Publishes a ready-to-run image of the backend to GHCR so anyone
+# self-hosting (a reviewer testing the Moodle plugin, or an institution
+# deploying for real) can `docker pull` it directly, instead of cloning
+# and building from source. See docker-compose.selfhost.yml and
+# docs/REVIEWER_TESTING.md in the moodle-local_nexusai plugin repo.
+#
+# Lives here (this repo's own workflow, not the monorepo's) so publishing
+# doesn't depend on the monorepo's development -> staging -> main cadence,
+# which follows the team's internal deploy schedule, not "someone needs a
+# fresh self-host image right now". This repo's own `main` is exactly the
+# artifact meant for external consumption -- same reasoning as building
+# the plugin ZIP from moodle-local_nexusai instead of the monorepo.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/nexusai-backend
+
+jobs:
+  publish:
+    name: Build and push
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
