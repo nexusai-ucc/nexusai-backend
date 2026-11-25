@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from app.documents.chunker import chunk_text
 from app.documents.retriever import (
     RetrievedChunk,
     format_context_for_prompt,
@@ -115,8 +116,8 @@ def test_format_multiple_chunks_are_numbered_sequentially():
 
 
 def test_format_truncates_very_long_content():
-    """Defensa contra prompt-injection: chunks > 800 chars se truncan."""
-    long_content = "A" * 2000
+    """Tope de seguridad: un chunk anómalo (> 4000 chars) se trunca."""
+    long_content = "A" * 6000
     chunks = [
         RetrievedChunk(
             content=long_content,
@@ -126,9 +127,38 @@ def test_format_truncates_very_long_content():
         )
     ]
     output = format_context_for_prompt(chunks)
-    # No debe contener los 2000 chars, debe tener "..." al final del fragmento.
+    # No debe contener los 6000 chars, debe tener "..." al final del fragmento.
     assert "AAAA..." in output
-    assert "A" * 1500 not in output
+    assert "A" * 4500 not in output
+
+
+def test_format_keeps_full_chunker_chunk():
+    """Un chunk de tamaño máximo del chunker llega entero al prompt.
+
+    Regresión: con el tope de 800 chars el LLM veía menos de la mitad de cada
+    chunk (512 tokens ~ 1800+ chars) y respondía "no tengo información" sobre
+    datos que estaban al final, como la fila de una tabla.
+    """
+    parrafo = (
+        "La frontera de posibilidades de producción muestra las combinaciones "
+        "máximas de dos bienes que una economía puede producir con sus recursos. "
+    )
+    first = chunk_text(parrafo * 60)[0]
+    assert first.token_count == 512
+    content = first.content.rstrip() + " DATO_AL_FINAL_DEL_CHUNK"
+
+    output = format_context_for_prompt(
+        [
+            RetrievedChunk(
+                content=content,
+                document_filename="unidad-1.pdf",
+                chunk_index=0,
+                distance=0.1,
+            )
+        ]
+    )
+    assert "DATO_AL_FINAL_DEL_CHUNK" in output
+    assert "..." not in output
 
 
 # ============================================================

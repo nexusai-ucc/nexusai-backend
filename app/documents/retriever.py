@@ -148,7 +148,7 @@ async def retrieve_context(
 def format_context_for_prompt(
     chunks: List[RetrievedChunk],
     course_names: dict[int, str] | None = None,
-    max_chars_per_chunk: int = 800,
+    max_chars_per_chunk: int = 4000,
 ) -> str:
     """Formatea los chunks recuperados para inyectarlos al system prompt.
 
@@ -168,9 +168,11 @@ def format_context_for_prompt(
 
     parts = []
     for i, chunk in enumerate(chunks, start=1):
-        # Truncar contenido si es muy largo (defensa contra prompt injection
-        # via chunks ruidosos). 800 chars ~= 200 tokens, suficiente para
-        # contexto sin saturar.
+        # Tope de seguridad contra chunks anómalos, no un recorte normal: el
+        # chunker corta en 512 tokens (~1800-2200 chars en español), así que un
+        # chunk real tiene que llegar entero al LLM. Con el tope viejo de 800
+        # el modelo veía menos de la mitad de cada chunk y perdía tablas y
+        # desarrollos que quedaban al final.
         content = chunk.content.strip()
         if len(content) > max_chars_per_chunk:
             content = content[:max_chars_per_chunk] + "..."
