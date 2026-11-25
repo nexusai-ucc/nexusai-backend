@@ -116,10 +116,13 @@ class Settings(BaseSettings):
     # largas) y agotaría presupuesto real sin llegar nunca al límite de
     # requests. Docentes tienen un techo más alto porque generan quizzes,
     # exámenes y resúmenes de foro además de chatear.
-    token_budget_student_hourly: int = 8000
-    token_budget_student_daily: int = 40000
-    token_budget_teacher_hourly: int = 20000
-    token_budget_teacher_daily: int = 100000
+    # Mismos valores que usage_store::DEFAULT_LIMITS del plugin, que los manda
+    # en cada pregunta y pisa estos. Una pregunta con material cuesta ~4.400
+    # tokens (fragmentos completos): ~4 por hora y ~18 por día para un alumno.
+    token_budget_student_hourly: int = 20000
+    token_budget_student_daily: int = 80000
+    token_budget_teacher_hourly: int = 40000
+    token_budget_teacher_daily: int = 200000
 
     # Alertas mínimas (ver ADR-012 y app/shared/alerting.py).
     #
