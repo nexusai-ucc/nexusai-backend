@@ -134,10 +134,11 @@ class Settings(BaseSettings):
     #   automática. Nunca hardcodear la password acá: siempre por variable
     #   de entorno (`ALERT_SMTP_PASSWORD`).
     #
-    #   `alert_email_to` sí tiene default (el mail del responsable del
-    #   piloto) porque no es un secreto — solo el destino de una
-    #   notificación. Se puede pisar por env var (`ALERT_EMAIL_TO`) si
-    #   cambia quién recibe las alertas.
+    #   `alert_email_to` no tiene default: sin destinatario no se manda
+    #   nada. Antes tenía el mail del responsable del piloto, y una
+    #   institución que instalara NexusAI y configurara el SMTP sin
+    #   `ALERT_EMAIL_TO` le mandaba sus alertas a él. Los servidores del
+    #   proyecto lo ponen en su `.env`.
     #
     # error_rate_*: ventana fija (mismo patrón que rate_limit.py) para avisar
     #   si hay una ráfaga de respuestas 5xx.
@@ -154,7 +155,7 @@ class Settings(BaseSettings):
     alert_smtp_port: int = 465
     alert_smtp_user: Optional[str] = None
     alert_smtp_password: Optional[str] = None
-    alert_email_to: str = "santiagotricherri@gmail.com"
+    alert_email_to: Optional[str] = None
 
     # Cooldown global entre alertas del MISMO tipo (mismo key_prefix), ver
     # app.shared.alerting.record_event_and_maybe_alert. Hallazgo de audit

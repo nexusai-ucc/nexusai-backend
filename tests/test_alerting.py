@@ -11,6 +11,7 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.shared import alerting
+from app.shared.config import Settings
 
 
 def _fake_redis(incr_result: int, set_result: bool = True) -> MagicMock:
@@ -72,6 +73,24 @@ async def test_send_alert_without_smtp_config_only_logs():
         await alerting.send_alert("Título", "Mensaje")
 
     mock_send_sync.assert_not_called()
+
+
+async def test_send_alert_without_recipient_only_logs():
+    # SMTP configurado pero sin ALERT_EMAIL_TO: no hay destinatario por
+    # defecto, así que no se manda nada (antes iba al responsable del piloto).
+    settings = _configured_settings()
+    settings.alert_email_to = None
+
+    with patch("app.shared.alerting.get_settings", return_value=settings), patch(
+        "app.shared.alerting._send_email_sync"
+    ) as mock_send_sync:
+        await alerting.send_alert("Título", "Mensaje")
+
+    mock_send_sync.assert_not_called()
+
+
+def test_alert_email_to_has_no_default():
+    assert Settings.model_fields["alert_email_to"].default is None
 
 
 async def test_send_alert_smtp_failure_does_not_propagate():
