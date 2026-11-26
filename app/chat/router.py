@@ -43,7 +43,12 @@ from app.chat.schemas import (
 )
 from app.db.models import ChatSession, Message, MessageFeedback
 from app.db.session import get_db, get_session_factory
-from app.documents.retriever import format_context_for_prompt, retrieve_context
+from app.documents.retriever import (
+    CONTEXT_END_MARKER,
+    CONTEXT_START_MARKER,
+    format_context_for_prompt,
+    retrieve_context,
+)
 from app.gaps.recorder import (
     WEAK_MATCH_THRESHOLD,
     embed_gap_question,
@@ -361,9 +366,9 @@ def _build_system_prompt(retrieved_context: str, is_multicourse: bool = False) -
             "decilo explícitamente — no inventes."
             + "\n\n"
             + _meta_guard
-            + "\n\n--- MATERIAL DEL CURSO ---\n\n"
+            + f"\n\n{CONTEXT_START_MARKER}\n\n"
             + retrieved_context
-            + "\n\n--- FIN DEL MATERIAL ---"
+            + f"\n\n{CONTEXT_END_MARKER}"
         )
 
     return (
