@@ -19,6 +19,7 @@ indexados o de documents en estado 'error'.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import List, Optional
 from uuid import UUID
@@ -145,10 +146,22 @@ async def retrieve_context(
     return [c for c in chunks if c.similarity >= min_similarity]
 
 
+# Delimitadores del bloque de material en el system prompt (chat/router.py).
+# Viven acá porque format_context_for_prompt tiene que sacarlos del contenido:
+# si un documento los trae escritos, cerraría el bloque antes de tiempo y lo
+# que siga quedaría como instrucciones del sistema (prompt injection).
+CONTEXT_START_MARKER = "--- MATERIAL DEL CURSO ---"
+CONTEXT_END_MARKER = "--- FIN DEL MATERIAL ---"
+_MARKER_RE = re.compile(
+    r"-{2,}\s*(?:FIN\s+DEL\s+MATERIAL|MATERIAL\s+DEL\s+CURSO)\s*-{2,}",
+    re.IGNORECASE,
+)
+
+
 def format_context_for_prompt(
     chunks: List[RetrievedChunk],
     course_names: dict[int, str] | None = None,
-    max_chars_per_chunk: int = 800,
+    max_chars_per_chunk: int | None = None,
 ) -> str:
     """Formatea los chunks recuperados para inyectarlos al system prompt.
 
@@ -168,11 +181,15 @@ def format_context_for_prompt(
 
     parts = []
     for i, chunk in enumerate(chunks, start=1):
-        # Truncar contenido si es muy largo (defensa contra prompt injection
-        # via chunks ruidosos). 800 chars ~= 200 tokens, suficiente para
-        # contexto sin saturar.
-        content = chunk.content.strip()
-        if len(content) > max_chars_per_chunk:
+        # Sin recorte por defecto: el chunker ya limita cada chunk a 512 tokens
+        # y el chunk tiene que llegar entero al LLM. Un tope en caracteres no
+        # sirve como límite de tamaño: 512 tokens son ~1400 chars en una tabla
+        # numérica, ~2400 en prosa y ~4000-5000 en un índice con puntos guía o
+        # columnas alineadas. Con el tope viejo de 800 el modelo perdía tablas
+        # y desarrollos del final del chunk. `max_chars_per_chunk` queda para
+        # callers que necesiten acotar a propósito (ver forums/router.py).
+        content = _MARKER_RE.sub("[…]", chunk.content.strip())
+        if max_chars_per_chunk is not None and len(content) > max_chars_per_chunk:
             content = content[:max_chars_per_chunk] + "..."
 
         course_label = ""

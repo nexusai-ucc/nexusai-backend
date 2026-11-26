@@ -34,7 +34,7 @@ Variables de entorno:
     NEXUSAI_ALERT_SMTP_PORT          default: 465
     NEXUSAI_ALERT_SMTP_USER          default: "" (sin esto + password, solo loguea a stderr)
     NEXUSAI_ALERT_SMTP_PASSWORD      default: ""
-    NEXUSAI_ALERT_EMAIL_TO           default: santiagotricherri@gmail.com
+    NEXUSAI_ALERT_EMAIL_TO           default: "" (sin destinatario, solo loguea a stderr)
     NEXUSAI_HEALTH_FAILURE_THRESHOLD default: 3   (chequeos consecutivos fallidos antes de avisar)
     NEXUSAI_HEALTH_TIMEOUT_SEC       default: 5
     NEXUSAI_HEALTH_STATE_FILE        default: /tmp/nexusai_health_watch_state.json
@@ -58,7 +58,7 @@ def _env_config() -> dict:
         "smtp_port": int(os.environ.get("NEXUSAI_ALERT_SMTP_PORT", "465")),
         "smtp_user": os.environ.get("NEXUSAI_ALERT_SMTP_USER", ""),
         "smtp_password": os.environ.get("NEXUSAI_ALERT_SMTP_PASSWORD", ""),
-        "email_to": os.environ.get("NEXUSAI_ALERT_EMAIL_TO", "santiagotricherri@gmail.com"),
+        "email_to": os.environ.get("NEXUSAI_ALERT_EMAIL_TO", ""),
         "failure_threshold": int(os.environ.get("NEXUSAI_HEALTH_FAILURE_THRESHOLD", "3")),
         "timeout_sec": float(os.environ.get("NEXUSAI_HEALTH_TIMEOUT_SEC", "5")),
         "state_file": Path(
