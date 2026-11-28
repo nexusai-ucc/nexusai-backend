@@ -1,0 +1,126 @@
+# NexusAI backend — standalone self-host using the prebuilt image
+#
+# For anyone who wants to run the backend WITHOUT building the image
+# themselves (e.g. a Marketplace reviewer, or an institution self-hosting for
+# real). Needs only this file + a `.env` next to it (copy .env.example, fill
+# in the REPLACE_ME values).
+#
+# Usage (.env sets COMPOSE_FILE, so plain `docker compose` picks this file):
+#   cp .env.example .env
+#   docker compose up -d
+#   curl http://localhost:8001/health
+#
+# With HTTPS (Moodle on another server): point a domain at this machine and
+# uncomment COMPOSE_PROFILES=https and NEXUSAI_DOMAIN in .env. Caddy gets the
+# certificate on its own:
+#   docker compose up -d
+#   curl https://<NEXUSAI_DOMAIN>/health
+#
+# Full guide: https://nexusai-ucc.github.io/nexusAI/en/install/
+#
+# The image is built and published by the nexusai-backend repo's own
+# docker-publish.yml, on every push to ITS main
+# (https://github.com/nexusai-ucc/nexusai-backend) — it's the exact same
+# image the project's own staging/production deployments run.
+
+name: nexusai-selfhost
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER missing in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD missing in .env}
+      POSTGRES_DB: nexusai
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nexusai}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [nexusai-selfhost-net]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks: [nexusai-selfhost-net]
+
+  # The image has no /app/uploads and runs as uid 1001, so a fresh volume
+  # would be root-owned and the API could not keep the uploaded files (it
+  # needs them to reindex a document). This one-shot step, with the same
+  # image as root, hands the volume to the API user before it starts.
+  uploads-init:
+    image: ghcr.io/nexusai-ucc/nexusai-backend:latest
+    user: "0:0"
+    entrypoint: ["chown", "-R", "1001:1001", "/app/uploads"]
+    restart: "no"
+    volumes:
+      - uploads:/app/uploads
+    networks: [nexusai-selfhost-net]
+
+  api:
+    image: ghcr.io/nexusai-ucc/nexusai-backend:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      uploads-init:
+        condition: service_completed_successfully
+    env_file: .env
+    environment:
+      # Point at the services above, not localhost.
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/nexusai
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      # Original files of the uploaded material (needed to reindex them).
+      - uploads:/app/uploads
+    ports:
+      # API_BIND=127.0.0.1 keeps it reachable only from this machine (use it
+      # with the https profile: Docker skips ufw for published ports). Not in
+      # API_PORT: the backend reads that one too, and it must be a number.
+      - "${API_BIND:-0.0.0.0}:${API_PORT:-8001}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks: [nexusai-selfhost-net]
+
+  # Optional HTTPS in front of the API (profile "https"). Needs ports 80 and
+  # 443 open and NEXUSAI_DOMAIN pointing at this machine.
+  caddy:
+    image: caddy:2-alpine
+    profiles: [https]
+    restart: unless-stopped
+    depends_on: [api]
+    command: ["caddy", "reverse-proxy", "--from", "${NEXUSAI_DOMAIN:-}", "--to", "api:8000"]
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [nexusai-selfhost-net]
+
+networks:
+  nexusai-selfhost-net:
+
+volumes:
+  postgres_data:
+  redis_data:
+  uploads:
+  caddy_data:
+  caddy_config:
